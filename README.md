@@ -128,6 +128,8 @@ api_key  = 随便填（未设置鉴权时）
 
 ## 界面预览
 
+> 以下均为**实际运行截图**。账号名、邮箱与用量数字已做模糊处理。
+
 ### 管理 WorkBuddy 与 CodeBuddy 账号
 
 账号卡片集中展示登录状态、签到状态、积分余额和到期资源，支持切换 WorkBuddy 当前账号，并设置 CodeBuddy CLI 后续会话的默认账号。临期积分会直接标注在对应卡片内，并按紧迫程度优先排列。
@@ -147,29 +149,29 @@ api_key  = 随便填（未设置鉴权时）
   </tbody>
 </table>
 
-### 积分统计
+### API 反代
 
-积分统计页展示官方请求用量、每日趋势、模型分布、账号消耗和请求明细。数据来源和更新时间会明确显示。
+打开开关并**保存**即生效，之后每次启动 Switch 都会自动拉起本地网关。同页可按分组勾选参与轮转的账号，并查看经过反代的请求用量。
 
-<table>
-  <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/credit-statistics-light.png" alt="积分统计趋势页面（浅色模式）" /></td>
-      <td><img src="docs/images/credit-statistics-dark.png" alt="积分统计趋势页面（深色模式）" /></td>
-    </tr>
-  </tbody>
-</table>
+<img src="docs/images/api-proxy-light.png" alt="API 反代页面：接口开关、监听地址、API Key、按分组挑选账号与反代用量" />
 
 ### Token 统计
 
 Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、CodeBuddy CLI 与 CodeBuddy IDE：输入、输出、缓存读写使用 K/M/B 紧凑单位，趋势图用堆叠柱表示每日 Token 总量与构成，用虚线表示调用次数；同时提供 Token 构成占比、活跃热力图、项目/模型 Top 10 和会话排行，帮助快速定位主要消耗来源。
 
+<img src="docs/images/token-statistics-light.png" alt="Token 统计页面：总览指标、每日 Token 构成与调用次数趋势" />
+
+### 积分统计
+
+积分统计页展示官方请求用量、每日趋势、模型分布、账号消耗和请求明细。数据来源和更新时间会明确显示。
+
+<img src="docs/images/credit-statistics-light.png" alt="积分统计页面：总览、官方积分消耗趋势与按模型分类" />
+
+### 设置
+
+主题、macOS 授权引导、自动签到与保活参数集中在这一页，下方是最近 30 天的签到日志。
+
+<img src="docs/images/settings-light.png" alt="设置页：外观、权限检测、自动签到配置与签到日志" />
 
 ### 自动轮换策略
 
