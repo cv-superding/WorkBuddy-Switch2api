@@ -103,6 +103,15 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
+    # 发布类步骤（npm publish / updater 清单）在没配置 secrets 时必须能优雅跳过。
+    # 否则 build 失败 → 依赖它的 release 也会被跳过 → 打不出 Release。
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+      HAS_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+      # 桌面产物名 = src-tauri/tauri.conf.json 里的 productName。
+      # ⚠️ 改了 productName 必须同步改这里（以及 scripts/make-dmg.sh、scripts/fix-app.sh），
+      #    否则 Tauri 产出的文件名与下面 test -f / make-dmg 的期望对不上，CI 直接失败。
+      PRODUCT: WorkBuddy-Switch2api
     steps:
       - uses: actions/checkout@v4
 
@@ -165,7 +174,7 @@ jobs:
       # 打包本平台包并发布到 npm（CLI 二进制走 npm registry，Release 只留桌面 App）
       # 仅 tag 发布；手动触发（例如只打 Windows 试装包）不得 npm publish。
       - name: Publish platform package
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && env.HAS_NPM_TOKEN == 'true'
         shell: bash
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -200,13 +209,13 @@ jobs:
           echo "bundle after build:"
           find "$BUNDLE_ROOT" -type f | sort || true
           if [ "${{ matrix.bundles }}" = "nsis" ]; then
-            STALE=$(find "$BUNDLE_ROOT" -type f -name '*-setup.exe' ! -name "workbuddy-switch_${VER}_x64-setup.exe" || true)
+            STALE=$(find "$BUNDLE_ROOT" -type f -name '*-setup.exe' ! -name "${PRODUCT}_${VER}_x64-setup.exe" || true)
             if [ -n "$STALE" ]; then
               echo "error: stale Windows installer still present:" >&2
               printf '%s\n' "$STALE" >&2
               exit 1
             fi
-            test -f "$BUNDLE_ROOT/nsis/workbuddy-switch_${VER}_x64-setup.exe"
+            test -f "$BUNDLE_ROOT/nsis/${PRODUCT}_${VER}_x64-setup.exe"
           fi
           find "$BUNDLE_ROOT" -type f \
             \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' \
@@ -214,12 +223,12 @@ jobs:
             -exec cp {} dist-bin/ \;
           # mac：纯命令行打 dmg（CI 无 Finder，Tauri 自带的 bundle_dmg.sh 会失败）
           if [ "${{ matrix.bundles }}" = "app" ]; then
-            sh scripts/make-dmg.sh "$VER" "${{ matrix.update_arch }}" "target/${{ matrix.target }}/release/bundle/macos/workbuddy-switch.app"
-            cp "workbuddy-switch_${VER}_${{ matrix.update_arch }}.dmg" dist-bin/
+            sh scripts/make-dmg.sh "$VER" "${{ matrix.update_arch }}" "target/${{ matrix.target }}/release/bundle/macos/${PRODUCT}.app"
+            cp "${PRODUCT}_${VER}_${{ matrix.update_arch }}.dmg" dist-bin/
           fi
 
       - name: Generate updater manifest
-        if: matrix.update_arch != ''
+        if: matrix.update_arch != '' && env.HAS_SIGNING_KEY == 'true'
         shell: bash
         env:
           UPDATE_OS: ${{ matrix.update_os }}
@@ -234,7 +243,7 @@ jobs:
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
           if [ "$UPDATE_OS" = "windows" ]; then
-            ARCHIVE="$BUNDLE_DIR/workbuddy-switch_${VER}_x64-setup.exe"
+            ARCHIVE="$BUNDLE_DIR/${PRODUCT}_${VER}_x64-setup.exe"
           else
             ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.app.tar.gz' | sort)"
             COUNT=$(printf '%s\n' "$ARCHIVE" | sed '/^$/d' | wc -l | tr -d ' ')
@@ -251,7 +260,7 @@ jobs:
           cp "$ARCHIVE" "dist-bin/$UPDATE_ARCHIVE_NAME"
           cp "$ARCHIVE.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
           if [ "$UPDATE_OS" = "windows" ]; then
-            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/workbuddy-switch_${VER}_x64-setup.exe"
+            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/${PRODUCT}_${VER}_x64-setup.exe"
           fi
           UPDATE_VERSION="$VER" sh scripts/gen-update-json.sh
           MANIFEST="$BUNDLE_DIR/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
@@ -279,6 +288,10 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "NPM_TOKEN 未配置 → 跳过 npm 发布（自编译版不需要往 npm 发包）"
+            exit 0
+          fi
           cd npm
           printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
           npm publish --access public --registry=https://registry.npmjs.org
@@ -297,7 +310,12 @@ jobs:
           merge-multiple: true
 
       - name: Merge updater manifests
-        run: python3 scripts/merge-update-manifests.py artifacts
+        run: |
+          if ls artifacts/latest-*.json >/dev/null 2>&1; then
+            python3 scripts/merge-update-manifests.py artifacts
+          else
+            echo "没有 latest-*.json（未配置 updater 签名密钥）→ 跳过合并，只发布安装包"
+          fi
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
