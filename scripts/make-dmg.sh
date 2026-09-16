@@ -2,8 +2,12 @@
 # 纯命令行打 dmg（不依赖 Finder/AppleScript，CI 无头环境可用）
 # 用法：sh scripts/make-dmg.sh <版本> <arch> [.app 路径]
 #   arch: aarch64 | x64
-#   .app 路径默认 target/release/bundle/macos/workbuddy-switch.app
+#   .app 路径默认 target/release/bundle/macos/WorkBuddy-Switch2api.app
 #   DMG 内含「应用程序」文件夹链接，拖入即安装到 /Applications
+#
+# ⚠️ 这里的 .app 名和输出 dmg 名**必须与 tauri.conf.json 的 productName 一致**，
+#    改了 productName 就要同步改本文件与 .github/workflows/build.yml，
+#    否则 CI 会在 `test -f` / `ls` 一处报文件不存在。
 #
 # dmgbuild writes the Finder layout and invokes hdiutil under the hood.  Do
 # not fall back to a plain hdiutil image: that would silently lose the large
@@ -12,6 +16,8 @@
 # Keep this wrapper POSIX-shell compatible: CI invokes it with `sh`, and macOS
 # users commonly do the same when running the release script locally.
 set -eu
+
+PRODUCT="WorkBuddy-Switch2api"
 
 usage() {
   echo "用法: sh scripts/make-dmg.sh <版本> <arch> [.app 路径]" >&2
@@ -24,7 +30,7 @@ fi
 
 V=$1
 ARCH=$2
-APP=${3:-target/release/bundle/macos/workbuddy-switch.app}
+APP=${3:-target/release/bundle/macos/${PRODUCT}.app}
 
 if [ -z "$V" ] || [ -z "$ARCH" ]; then
   usage
@@ -50,8 +56,8 @@ if [ ! -f "$SETTINGS" ]; then
   exit 1
 fi
 
-OUT="workbuddy-switch_${V}_${ARCH}.dmg"
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/workbuddy-switch-dmg.XXXXXX")
+OUT="${PRODUCT}_${V}_${ARCH}.dmg"
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/wb-switch-dmg.XXXXXX")
 TMP_OUT="$TMP_DIR/$OUT"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -59,7 +65,7 @@ echo "打 dmg: $APP → $OUT"
 dmgbuild \
   -s "$SETTINGS" \
   -D "app=$APP" \
-  "workbuddy-switch" \
+  "$PRODUCT" \
   "$TMP_OUT"
 
 # Publish atomically after dmgbuild has completed.  A failed build therefore
