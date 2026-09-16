@@ -351,7 +351,7 @@ fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
     let _ = app
         .notification()
         .builder()
-        .title("workbuddy-switch")
+        .title("WorkBuddy-Switch2api")
         .body(body)
         .show();
 }
