@@ -1,0 +1,50 @@
+[package]
+name = "wb-switch-rust"
+version = "0.5.1"
+description = "wb-switch —— WorkBuddy / CodeBuddy 多账号切换 + OpenAI 兼容反代（Rust/Tauri 版）"
+authors = ["cv-superding"]
+edition = "2021"
+repository = "https://github.com/cv-superding/WorkBuddy-Switch2api"
+homepage = "https://github.com/cv-superding/WorkBuddy-Switch2api"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "wb_switch_rust_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# 默认启用 custom-protocol：不开该 feature 的 `cargo build --release` 会产出加载
+# devUrl http://localhost:1420 的开发模式 exe，vite 未运行时窗口即报
+# “localhost 拒绝连接”。`tauri dev` 传 --no-default-features 并过滤本 feature，
+# `tauri build` 显式传 tauri/custom-protocol，两者均不受影响。
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+wb-switch-core = { path = "../crates/wb-switch-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2.7.2"
+
+# 系统自启（开机静默启动）：仅桌面目标支持（macOS / Windows / Linux）。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-autostart = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSWorkspace"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString"] }

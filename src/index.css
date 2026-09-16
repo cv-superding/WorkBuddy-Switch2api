@@ -1,0 +1,169 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  color-scheme: light;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.21 0.01 264);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.01 264);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.01 264);
+  --primary: oklch(0.725 0.133 163.03);
+  --primary-foreground: oklch(0.99 0.002 247.839);
+  --secondary: oklch(0.96 0.004 264);
+  --secondary-foreground: oklch(0.32 0.01 264);
+  --muted: oklch(0.96 0.004 264);
+  --muted-foreground: oklch(0.52 0.012 264);
+  --accent: oklch(0.955 0.004 264);
+  --accent-foreground: oklch(0.24 0.01 264);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.99 0.002 270);
+  --border: oklch(0.91 0.006 264);
+  --input: oklch(0.91 0.006 264);
+  --ring: oklch(0.725 0.133 163.03);
+  --brand: oklch(0.725 0.133 163.03);
+  --brand-foreground: oklch(0.985 0.002 247.839);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --radius: 0.75rem;
+  --sidebar: oklch(0.973 0.003 264);
+  --sidebar-foreground: oklch(0.24 0.01 264);
+  --sidebar-primary: oklch(0.725 0.133 163.03);
+  --sidebar-primary-foreground: oklch(0.99 0.002 247.839);
+  --sidebar-accent: oklch(0.93 0.004 264);
+  --sidebar-accent-foreground: oklch(0.21 0.01 264);
+  --sidebar-border: oklch(0.91 0.006 264);
+  --sidebar-ring: oklch(0.725 0.133 163.03);
+  --data-series-emerald: oklch(0.62 0.13 163);
+  --data-series-teal: oklch(0.66 0.1 190);
+  --data-series-indigo: oklch(0.55 0.11 265);
+  --data-series-violet: oklch(0.63 0.11 300);
+  --data-series-amber: oklch(0.72 0.12 78);
+  --data-series-rose: oklch(0.64 0.12 20);
+  --data-series-sky: oklch(0.63 0.1 235);
+  --data-series-lime: oklch(0.67 0.11 125);
+}
+
+.dark {
+  color-scheme: dark;
+  --background: oklch(0.208 0.042 265.755);
+  --foreground: oklch(0.929 0.013 255.508);
+  --card: oklch(0.279 0.041 260.031);
+  --card-foreground: oklch(0.929 0.013 255.508);
+  --popover: oklch(0.279 0.041 260.031);
+  --popover-foreground: oklch(0.929 0.013 255.508);
+  --primary: oklch(0.696 0.17 162.48);
+  --primary-foreground: oklch(0.208 0.042 265.755);
+  --secondary: oklch(0.279 0.041 260.031);
+  --secondary-foreground: oklch(0.929 0.013 255.508);
+  --muted: oklch(0.279 0.041 260.031);
+  --muted-foreground: oklch(0.704 0.04 256.788);
+  --accent: oklch(0.279 0.041 260.031);
+  --accent-foreground: oklch(0.929 0.013 255.508);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0.002 247.839);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.696 0.17 162.48);
+  --brand: oklch(0.696 0.17 162.48);
+  --brand-foreground: oklch(0.208 0.042 265.755);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.279 0.041 260.031);
+  --sidebar-foreground: oklch(0.929 0.013 255.508);
+  --sidebar-primary: oklch(0.696 0.17 162.48);
+  --sidebar-primary-foreground: oklch(0.208 0.042 265.755);
+  --sidebar-accent: oklch(0.279 0.041 260.031);
+  --sidebar-accent-foreground: oklch(0.929 0.013 255.508);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.696 0.17 162.48);
+  --data-series-emerald: oklch(0.73 0.13 163);
+  --data-series-teal: oklch(0.76 0.1 190);
+  --data-series-indigo: oklch(0.77 0.11 265);
+  --data-series-violet: oklch(0.78 0.11 300);
+  --data-series-amber: oklch(0.81 0.12 78);
+  --data-series-rose: oklch(0.77 0.12 20);
+  --data-series-sky: oklch(0.76 0.1 235);
+  --data-series-lime: oklch(0.78 0.11 125);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    height: 100%;
+    overflow: hidden;
+  }
+  body {
+    @apply bg-background text-foreground;
+    min-width: 320px;
+    height: 100%;
+    overflow: hidden;
+    font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  #root {
+    height: 100%;
+    overflow: hidden;
+  }
+}
+
+@media (min-width: 900px) {
+  [aria-label="Token 总览"] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

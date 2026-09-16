@@ -1,0 +1,50 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust / Tauri 构建产物（workspace target）
+target/
+src-tauri/target/
+
+# npm 包 postinstall 下载的平台二进制
+npm/bin/wb-switch-*
+
+# 本地运行时数据
+accounts.json
+backups/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+npm/platform/*/bin/
+
+# 个人开发工作流（trellis）
+.trellis/
+
+# AI 工具本地配置
+.codebuddy/
+.cursor/
+.agents/
+.codex/
+.grok/
+/.workbuddy/
+
+# 换图标时保存的原始素材备份（本地用，不入库）
+icons-original/

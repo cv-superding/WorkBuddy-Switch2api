@@ -1,0 +1,33 @@
+[package]
+name = "wb-switch-core"
+version = "0.5.1"
+edition = "2021"
+authors = ["cv-superding"]
+repository = "https://github.com/cv-superding/WorkBuddy-Switch2api"
+license = "MIT"
+description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+chrono = "0.4"
+axum = "0.7"
+futures = "0.3"
+bytes = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CodeBuddy CN IDE Safe Storage (state.vscdb secret inject)
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
+aes-gcm = "0.10"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+

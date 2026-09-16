@@ -1,0 +1,212 @@
+--- a/crates/wb-switch-core/src/modules/session.rs
++++ b/crates/wb-switch-core/src/modules/session.rs
+@@ -384,6 +384,65 @@
+     Some(report)
+ }
+ 
++/// Claw 工作区判定（SQL 片段用）：Claw 绑定 IM 渠道账号，不参与共享。
++const SQL_NOT_CLAW: &str = "(LOWER(cwd) NOT LIKE '%\\claw' AND LOWER(cwd) NOT LIKE '%/claw' \
++                            AND LOWER(cwd) <> 'claw')";
++const SQL_IS_CLAW: &str = "(LOWER(cwd) LIKE '%\\claw' OR LOWER(cwd) LIKE '%/claw' \
++                           OR LOWER(cwd) = 'claw')";
++
++/// 把所有会话改成「多账号共享」（路径 C）。
++///
++/// 原理：WorkBuddy 侧栏的过滤条件是
++///     `user_id = 当前账号 OR user_id 为空`
++/// 把 `user_id` 置空后，**任何一个账号登录都能看到同一份会话**，
++/// 磁盘上仍然只有一份正文，不产生副本。
++///
++/// 与 `copy_sessions_for_switch`（复制成新 id，越切越多）不同，本路径**不新增任何行**，
++/// 因此可以放心地在每次切换时执行。
++///
++/// Claw 工作区绑定 IM 渠道账号，跳过不动。
++pub fn share_sessions_for_switch() -> Result<Value, String> {
++    share_sessions_in(&workbuddy_db_path())
++}
++
++/// `share_sessions_for_switch` 的实现（可传入 db 路径，便于单测）。
++fn share_sessions_in(db: &Path) -> Result<Value, String> {
++    if !db.is_file() {
++        return Err(format!("找不到 {db:?}"));
++    }
++    let Some(conn) = open_db(db, false) else {
++        return Err("无法打开 workbuddy.db".to_string());
++    };
++    if !table_exists(&conn, "sessions") {
++        return Err("sessions 表不存在".to_string());
++    }
++
++    let alive: i64 = conn
++        .query_row(
++            "SELECT COUNT(*) FROM sessions WHERE deleted_at IS NULL",
++            [],
++            |r| r.get(0),
++        )
++        .unwrap_or(0);
++
++    let sql_share = format!(
++        "UPDATE sessions SET user_id = '' \
++         WHERE deleted_at IS NULL AND user_id <> '' AND {SQL_NOT_CLAW}"
++    );
++    let shared = conn.execute(&sql_share, []).map_err(|e| e.to_string())?;
++
++    let sql_claw = format!(
++        "SELECT COUNT(*) FROM sessions WHERE deleted_at IS NULL AND user_id <> '' AND {SQL_IS_CLAW}"
++    );
++    let skipped_claw: i64 = conn.query_row(&sql_claw, [], |r| r.get(0)).unwrap_or(0);
++
++    Ok(json!({
++        "total": alive,
++        "shared": shared as i64,
++        "skippedClaw": skipped_claw,
++    }))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -404,6 +463,57 @@
+             "wb_switch_test_{}_{name}.db",
+             uuid::Uuid::new_v4().simple()
+         ))
++    }
++
++    #[test]
++    fn share_sessions_clears_user_id_and_skips_claw() {
++        let db = temp_db("share");
++        let conn = Connection::open(&db).unwrap();
++        conn.execute_batch(
++            "CREATE TABLE sessions (
++                id TEXT PRIMARY KEY, user_id TEXT, cwd TEXT, title TEXT,
++                created_at INTEGER, updated_at INTEGER, deleted_at INTEGER);",
++        )
++        .unwrap();
++        conn.execute(
++            "INSERT INTO sessions VALUES ('s1','uid-a','F:\\Code\\api','t',1,1,NULL)",
++            [],
++        )
++        .unwrap();
++        conn.execute(
++            "INSERT INTO sessions VALUES ('s2','uid-b','C:\\Users\\x\\WorkBuddy\\Claw','c',1,1,NULL)",
++            [],
++        )
++        .unwrap();
++        conn.execute(
++            "INSERT INTO sessions VALUES ('s3','uid-a','F:\\Code\\api','deleted',1,1,999)",
++            [],
++        )
++        .unwrap();
++        drop(conn);
++
++        let report = share_sessions_in(&db).unwrap();
++        assert_eq!(report["shared"], 1, "只应共享未删除的非 Claw 会话: {report}");
++        assert_eq!(report["skippedClaw"], 1, "Claw 应被跳过: {report}");
++
++        let conn = Connection::open(&db).unwrap();
++        let (s1, s2, s3): (String, String, String) = (
++            conn.query_row("SELECT user_id FROM sessions WHERE id='s1'", [], |r| r.get(0))
++                .unwrap(),
++            conn.query_row("SELECT user_id FROM sessions WHERE id='s2'", [], |r| r.get(0))
++                .unwrap(),
++            conn.query_row("SELECT user_id FROM sessions WHERE id='s3'", [], |r| r.get(0))
++                .unwrap(),
++        );
++        assert_eq!(s1, "", "普通会话应被置空");
++        assert_eq!(s2, "uid-b", "Claw 会话归属应保持不动");
++        assert_eq!(s3, "uid-a", "已删除的会话不该被动");
++    }
++
++    #[test]
++    fn share_sessions_missing_db_is_err_not_panic() {
++        let db = temp_db("share-missing");
++        assert!(share_sessions_in(&db).is_err());
+     }
+ 
+     #[test]
+--- a/crates/wb-switch-core/src/modules/switch.rs
++++ b/crates/wb-switch-core/src/modules/switch.rs
+@@ -1,4 +1,4 @@
+-//! 账号切换：备份 → 关进程 → 复制会话（可选）→ 写认证 → 启动。
++//! 账号切换：备份 → 关进程 → 共享会话（可选）→ 复制会话（可选）→ 写认证 → 启动。
+ //!
+ //! 对照 server.py `switch_account`。切换过程中通过进度回调向前端推送实时进度，
+ //! 避免界面长时间无反馈被误认为卡死。core 不依赖 Tauri，进度回调由宿主适配
+@@ -45,8 +45,12 @@
+             copy_report = session::copy_sessions_for_switch(&acc, copy_session_ids);
+         }
+         if share_sessions {
+-            // 旧的「全体转移」兼容路径（默认关闭），Rust 版暂未实现
+-            session_report = Some(json!({"error": "share_sessions 兼容路径暂未在 Rust 版实现"}));
++            // 路径 C：把 user_id 置空 → 任何账号登录都能看到同一份，不产生副本。
++            progress("正在把会话设为多账号共享…");
++            session_report = Some(match session::share_sessions_for_switch() {
++                Ok(r) => r,
++                Err(e) => json!({"error": e}),
++            });
+         }
+     }
+     progress("正在写入认证文件…");
+--- a/src/components/switch-account-dialog.tsx
++++ b/src/components/switch-account-dialog.tsx
+@@ -33,6 +33,8 @@
+   const [sessions, setSessions] = useState<Session[]>([]);
+   const [loadingSessions, setLoadingSessions] = useState(false);
+   const [copySessions, setCopySessions] = useState(false);
++  /** 共享全部会话（user_id 置空）→ 每个账号都能看到同一份。默认开，不产生任何副本。 */
++  const [shareSessions, setShareSessions] = useState(true);
+   const [selected, setSelected] = useState<Set<string>>(new Set());
+   /** 展开的节点：任务 / 空间 / 文件夹。默认全部收起。 */
+   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+@@ -117,10 +119,15 @@
+     try {
+       const res = await api.switchAccount({
+         accountId: account.id,
++        shareSessions,
+         copySessionIds: copySessions ? [...selected] : undefined,
+       });
+       const nickname = account.nickname || account.email || account.uid || "该账号";
+       const parts: string[] = [];
++      const shared = res.sessionShare?.shared;
++      if (typeof shared === "number" && shared > 0) {
++        parts.push(`已把 ${shared} 个会话设为多账号共享`);
++      }
+       if (res.sessionCopy?.copied.length) {
+         parts.push(`已复制 ${res.sessionCopy.copied.length} 个会话`);
+       }
+@@ -224,6 +231,19 @@
+         )}
+ 
+         <div className="min-h-0 space-y-3 overflow-x-hidden overflow-y-auto">
++          <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
++            <div className="min-w-0 flex-1">
++              <div className="text-sm font-medium">共享全部会话（推荐）</div>
++              <div className="text-xs text-muted-foreground">
++                把会话归属清空，切换后每个账号都能看到同一份，切换回来还能接着聊。
++              </div>
++              <div className="text-xs text-muted-foreground">
++                不新增任何副本，可以放心每次切换都开。
++              </div>
++            </div>
++            <Switch checked={shareSessions} onCheckedChange={setShareSessions} disabled={busy} />
++          </div>
++
+           <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+             <div className="min-w-0 flex-1">
+               <div className="text-sm font-medium">复制会话到目标账号</div>
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -95,6 +95,13 @@
+   ok: boolean;
+   account: string;
+   backup: string | null;
++  /** 路径 C：把 user_id 置空，让所有账号共享同一份会话。不产生副本。 */
++  sessionShare?: {
++    total: number;
++    shared: number;
++    skippedClaw: number;
++    error?: string;
++  };
+   sessionCopy?: {
+     sourceUid: string;
+     targetUid: string;
