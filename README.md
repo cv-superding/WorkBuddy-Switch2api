@@ -210,6 +210,18 @@ Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、
 - 以及 [Tauri](https://tauri.app)、[React](https://react.dev)、[axum](https://github.com/tokio-rs/axum)、
   [reqwest](https://github.com/seanmonstar/reqwest) 等开源项目。
 
+## 交流与反馈
+
+有问题、想反馈 bug，或者想聊聊用法，欢迎扫码进群。
+
+<p align="center">
+  <img src="docs/images/qq-group.png" alt="QQ 群 1124773537（dsh-ds-web-login）" width="380" />
+</p>
+
+<p align="center">
+  QQ 群：<strong>1124773537</strong>
+</p>
+
 ## 许可
 
 [MIT](./LICENSE)
