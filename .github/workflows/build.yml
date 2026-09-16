@@ -1,0 +1,305 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Which platform to build. win-x64 produces a test installer without a GitHub Release."
+        type: choice
+        default: all
+        options:
+          - all
+          - win-x64
+          - mac-arm64
+          - mac-x64
+          - linux-x64
+
+permissions:
+  contents: write
+
+jobs:
+  select-matrix:
+    name: Select platforms
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          all_platforms = [
+              {
+                  "name": "mac-arm64",
+                  "os": "macos-14",
+                  "target": "aarch64-apple-darwin",
+                  "cli_bin": "wb-switch-darwin-arm64",
+                  "platform_tag": "darwin-arm64",
+                  "bundles": "app",
+                  "update_os": "macos",
+                  "update_arch": "aarch64",
+                  "update_bundle": "macos",
+                  "update_archive_name": "workbuddy-switch-macos-aarch64.app.tar.gz",
+              },
+              {
+                  "name": "mac-x64",
+                  "os": "macos-14",
+                  "target": "x86_64-apple-darwin",
+                  "cli_bin": "wb-switch-darwin-x64",
+                  "platform_tag": "darwin-x64",
+                  "bundles": "app",
+                  "update_os": "macos",
+                  "update_arch": "x86_64",
+                  "update_bundle": "macos",
+                  "update_archive_name": "workbuddy-switch-macos-x86_64.app.tar.gz",
+              },
+              {
+                  "name": "win-x64",
+                  "os": "windows-latest",
+                  "target": "x86_64-pc-windows-msvc",
+                  "cli_bin": "wb-switch-win32-x64.exe",
+                  "platform_tag": "win32-x64",
+                  "bundles": "nsis",
+                  "update_os": "windows",
+                  "update_arch": "x86_64",
+                  "update_bundle": "nsis",
+                  "update_archive_name": "workbuddy-switch-windows-x86_64-setup.exe",
+              },
+              {
+                  "name": "linux-x64",
+                  "os": "ubuntu-latest",
+                  "target": "x86_64-unknown-linux-gnu",
+                  "cli_bin": "wb-switch-linux-x64",
+                  "platform_tag": "linux-x64",
+                  "bundles": "deb,appimage",
+                  "update_arch": "",
+              },
+          ]
+          event = os.environ.get("EVENT_NAME", "")
+          platform = (os.environ.get("PLATFORM") or "all").strip()
+          if event != "workflow_dispatch" or platform in ("", "all"):
+              selected = all_platforms
+          else:
+              selected = [p for p in all_platforms if p["name"] == platform]
+              if not selected:
+                  raise SystemExit(f"unknown platform: {platform}")
+          matrix = json.dumps({"include": selected})
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+              f.write("matrix<<EOF\n")
+              f.write(matrix + "\n")
+              f.write("EOF\n")
+          PY
+
+  build:
+    name: ${{ matrix.name }}
+    needs: select-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      # cargo 缓存：依赖 + 编译产物，增量编译大幅提速（Cargo.lock 不变时命中）
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      # dmgbuild writes Finder metadata without opening Finder, so DMGs keep
+      # their large icons and drag arrow in headless macOS runners.
+      - name: Set up Python for dmgbuild
+        if: runner.os == 'macOS'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dmgbuild (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          DMGBUILD_VENV="$RUNNER_TEMP/dmgbuild-venv"
+          python3 -m venv "$DMGBUILD_VENV"
+          "$DMGBUILD_VENV/bin/python" -m pip install --disable-pip-version-check --no-input \
+            "dmgbuild==1.6.7"
+          echo "$DMGBUILD_VENV/bin" >> "$GITHUB_PATH"
+
+      # 前端构建产物（CLI 二进制 rust-embed 嵌入 + Tauri App 使用）
+      - name: Build frontend
+        run: |
+          npm install
+          npm run build
+
+      # CLI 二进制
+      - name: Build server binary
+        shell: bash
+        run: |
+          cargo build -p wb-switch-server --release --target ${{ matrix.target }}
+          mkdir -p dist-bin
+
+      # 打包本平台包并发布到 npm（CLI 二进制走 npm registry，Release 只留桌面 App）
+      # 仅 tag 发布；手动触发（例如只打 Windows 试装包）不得 npm publish。
+      - name: Publish platform package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG_DIR="npm/platform/workbuddy-switch-${{ matrix.platform_tag }}"
+          # 用 tag 版本同步 platform 包版本（git 里的可能滞后）
+          VER="${GITHUB_REF_NAME#v}"
+          perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" "$PKG_DIR/package.json"
+          mkdir -p "$PKG_DIR/bin"
+          SRC="target/${{ matrix.target }}/release/wb-switch"
+          [ -f "$SRC.exe" ] && SRC="$SRC.exe"
+          cp "$SRC" "$PKG_DIR/bin/${{ matrix.cli_bin }}"
+          cd "$PKG_DIR"
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
+          npm publish --access public --registry=https://registry.npmjs.org
+
+      # 桌面 App（mac app / nsis exe / deb + AppImage）
+      - name: Build desktop app
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if ! [[ "$VER" =~ ^[0-9] ]]; then
+            VER=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          fi
+          BUNDLE_ROOT="target/${{ matrix.target }}/release/bundle"
+          # cargo cache 会保留旧 NSIS/DMG/AppImage；不清理就会把 0.1.17 一类产物带进 Release。
+          rm -rf "$BUNDLE_ROOT"
+          npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          echo "bundle after build:"
+          find "$BUNDLE_ROOT" -type f | sort || true
+          if [ "${{ matrix.bundles }}" = "nsis" ]; then
+            STALE=$(find "$BUNDLE_ROOT" -type f -name '*-setup.exe' ! -name "workbuddy-switch_${VER}_x64-setup.exe" || true)
+            if [ -n "$STALE" ]; then
+              echo "error: stale Windows installer still present:" >&2
+              printf '%s\n' "$STALE" >&2
+              exit 1
+            fi
+            test -f "$BUNDLE_ROOT/nsis/workbuddy-switch_${VER}_x64-setup.exe"
+          fi
+          find "$BUNDLE_ROOT" -type f \
+            \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' \
+            -o -name '*.AppImage' \) \
+            -exec cp {} dist-bin/ \;
+          # mac：纯命令行打 dmg（CI 无 Finder，Tauri 自带的 bundle_dmg.sh 会失败）
+          if [ "${{ matrix.bundles }}" = "app" ]; then
+            sh scripts/make-dmg.sh "$VER" "${{ matrix.update_arch }}" "target/${{ matrix.target }}/release/bundle/macos/workbuddy-switch.app"
+            cp "workbuddy-switch_${VER}_${{ matrix.update_arch }}.dmg" dist-bin/
+          fi
+
+      - name: Generate updater manifest
+        if: matrix.update_arch != ''
+        shell: bash
+        env:
+          UPDATE_OS: ${{ matrix.update_os }}
+          UPDATE_ARCH: ${{ matrix.update_arch }}
+          UPDATE_ARCHIVE_NAME: ${{ matrix.update_archive_name }}
+          BUNDLE_DIR: target/${{ matrix.target }}/release/bundle/${{ matrix.update_bundle }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if ! [[ "$VER" =~ ^[0-9] ]]; then
+            VER=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          fi
+          echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
+          ls -la "$BUNDLE_DIR" || true
+          if [ "$UPDATE_OS" = "windows" ]; then
+            ARCHIVE="$BUNDLE_DIR/workbuddy-switch_${VER}_x64-setup.exe"
+          else
+            ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.app.tar.gz' | sort)"
+            COUNT=$(printf '%s\n' "$ARCHIVE" | sed '/^$/d' | wc -l | tr -d ' ')
+            if [ "$COUNT" != 1 ]; then
+              echo "error: expected exactly 1 .app.tar.gz, found $COUNT" >&2
+              printf '%s\n' "$ARCHIVE" >&2
+              exit 1
+            fi
+          fi
+          if [ ! -f "$ARCHIVE" ] || [ ! -f "$ARCHIVE.sig" ]; then
+            echo "error: missing signed updater archive ($ARCHIVE)" >&2
+            exit 1
+          fi
+          cp "$ARCHIVE" "dist-bin/$UPDATE_ARCHIVE_NAME"
+          cp "$ARCHIVE.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
+          if [ "$UPDATE_OS" = "windows" ]; then
+            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/workbuddy-switch_${VER}_x64-setup.exe"
+          fi
+          UPDATE_VERSION="$VER" sh scripts/gen-update-json.sh
+          MANIFEST="$BUNDLE_DIR/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
+          test -f "$MANIFEST"
+          cp "$MANIFEST" dist-bin/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist-bin/
+          if-no-files-found: error
+
+  # 所有平台包发布成功后，发布主包（optionalDependencies 引用平台包）
+  publish-main:
+    name: Publish npm main package
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Publish main package
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
+          npm publish --access public --registry=https://registry.npmjs.org
+
+  release:
+    name: Publish release assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Merge updater manifests
+        run: python3 scripts/merge-update-manifests.py artifacts
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
