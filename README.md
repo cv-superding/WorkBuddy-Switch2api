@@ -1,44 +1,46 @@
 # WorkBuddy-Switch2api
 
-> WorkBuddy / CodeBuddy 多账号切换 + OpenAI 兼容反代。
->
-> 本仓库 fork 自 [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)（MIT），
-> 由 **cv-superding** 维护并二次开发：新增了独立的 API 反代页、账号分组与反代用量统计。
-
-WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），支持积分到期监控与自动签到。
-
-同时提供 npm / webui 版本，方便在浏览器中使用同一套账号管理能力。
-
-- **桌面 App**：从 GitHub Releases 下载 macOS、Windows 或 Linux 安装包（Tauri，推荐日常使用）
-- **npm / webui**：`npm i -g workbuddy-switch` 后运行 `workbuddy-switch`，浏览器打开操作界面
-
-多账号共享登录态（`workbuddy-desktop.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
-
 <p align="center">
-  <img src="public/icon-transparent.png" alt="WorkBuddy Switch 图标" width="128" />
+  <img src="public/icon-transparent.png" alt="WorkBuddy-Switch2api" width="128" />
 </p>
 
 <p align="center">
-  <strong>workbuddy-switch</strong><br />
-  WorkBuddy / CodeBuddy CLI 账号切换工具
+  <strong>WorkBuddy-Switch2api</strong><br />
+  WorkBuddy / CodeBuddy 多账号切换 + 本地 OpenAI 兼容反代
 </p>
 
+WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），并在同一个进程里内置了一个
+OpenAI 兼容的本地网关：多账号池轮转、按分组挑选出站账号、请求用量一目了然。
 
-### 在线演示
+- **账号切换** —— 多账号共享登录态，一键切换 WorkBuddy 登录账号，支持把当前会话复制给目标账号
+- **API 反代** —— 把账号库包装成 `http://127.0.0.1:7863/v1`，任何 OpenAI SDK 客户端都能直接用
+- **账号分组** —— 给账号标「桌面端 / 反代API」，两类用途互不抢号
+- **用量统计** —— 反代请求数、输入输出 Token、按账号与按模型分布，落盘可查历史
+- **积分与签到** —— 积分到期监控、自动签到、Token 保活、CodeBuddy CLI 自动轮换
 
-[打开 GitHub Pages 在线演示](https://cv-superding.github.io/WorkBuddy-Switch2api/)（只读演示；账号、积分与请求记录均为虚构数据，所有业务操作均已禁用。）
+> 反代和账号切换跑在**同一个进程**里，复用同一份账号库与刷新逻辑，
+> 不存在「两个进程各自刷新同一个 refresh token」的冲突。
+
+### 下载
+
+- **桌面 App** —— 从 [GitHub Releases](https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest) 下载 macOS / Windows / Linux 安装包（推荐日常使用）
+- **npm / webui** —— 浏览器操作界面，从本仓库自行构建安装，见下方「快速开始」
+- **在线演示** —— [GitHub Pages 只读演示](https://cv-superding.github.io/WorkBuddy-Switch2api/)（账号、积分与请求记录均为虚构数据，所有业务操作已禁用）
 
 ## 快速开始
 
-### npm 安装（webui）
+### npm / webui（本地构建）
+
+浏览器操作界面，与桌面 App 共用同一套账号管理能力。该 npm 包**尚未发布到 npm**，从本仓库构建安装：
 
 ```bash
-npm i -g workbuddy-switch
+cd npm
+npm i -g .
 workbuddy-switch              # 启动本地服务 + 自动打开浏览器
 workbuddy-switch status       # 终端查看当前账号
 ```
 
-webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账号切换、积分到期监控、自动签到、会话复制、Token 统计与 token 保活。
+webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账号切换、积分到期监控、自动签到、会话复制、API 反代、Token 统计与 token 保活。
 
 ### 桌面 App
 
@@ -46,15 +48,15 @@ webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账
 
 | 平台 | 安装包 | 安装方式 |
 | --- | --- | --- |
-| macOS Apple Silicon（M 系列，arm64） | `workbuddy-switch_<版本>_aarch64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
-| macOS Intel（x86_64） | `workbuddy-switch_<版本>_x86_64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
-| Windows x64 | `workbuddy-switch_<版本>_x64-setup.exe` | 运行安装程序并按提示完成安装 |
-| Linux x64 | `workbuddy-switch_<版本>_amd64.deb` / `workbuddy-switch_<版本>_amd64.AppImage` | Debian/Ubuntu 安装 `.deb`；其他发行版可给 AppImage 添加执行权限后直接运行 |
+| macOS Apple Silicon（M 系列，arm64） | `WorkBuddy-Switch2api_<版本>_aarch64.dmg` | 打开 DMG，将 `WorkBuddy-Switch2api.app` 拖入「应用程序」 |
+| macOS Intel（x86_64） | `WorkBuddy-Switch2api_<版本>_x86_64.dmg` | 打开 DMG，将 `WorkBuddy-Switch2api.app` 拖入「应用程序」 |
+| Windows x64 | `WorkBuddy-Switch2api_<版本>_x64-setup.exe` | 运行安装程序并按提示完成安装 |
+| Linux x64 | `WorkBuddy-Switch2api_<版本>_amd64.deb` / `WorkBuddy-Switch2api_<版本>_amd64.AppImage` | Debian/Ubuntu 安装 `.deb`；其他发行版可给 AppImage 添加执行权限后直接运行 |
 
 macOS 首次启动若提示无法验证开发者，先在 Finder 中按住 Control 点击应用并选择「打开」，或前往「系统设置 → 隐私与安全性」选择「仍要打开」。仅当安装包来自上述官方 Releases、且系统仍提示「已损坏」时，再执行：
 
 ```bash
-xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
+xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 ```
 
 应用能启动但切换账号时提示无权限，请参阅下方 [macOS 权限说明](#macos-权限说明)。
@@ -64,7 +66,10 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 | 模块 | 说明 |
 | --- | --- |
 | 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号 |
+| **账号分组** | 给账号标注「桌面端 / 反代API / 未分组」，账号卡片直接显示标签；反代页按分组挑选出站账号 |
 | 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
+| **API 反代** | 内置 OpenAI 兼容网关：账号池轮转与失败冷却、按分组挑号、流式与非流式、`/v1/chat/completions`、`/v1/models`、`/healthz`、`/usage-stats` |
+| **反代用量统计** | 经过反代的每一次请求都记录请求数、输入/输出 Token 与 credit，按账号、按模型汇总，并可查看最近请求明细 |
 | 会话复制 | 将当前账号勾选的会话以新 id 复制给目标账号（jsonl 正文 + `workbuddy.db` 索引 + edge-sync 注册） |
 | 自动签到 | 默认开启；启动时立即检查，运行期间每 30 分钟自动补签；一键全部签到；30 天签到日志 |
 | Token 保活 | 惰性刷新（操作前不足阈值刷新）+ 每日保活（默认每天无条件刷新一次，阈值 >0 时仅刷新剩余不足该天数的账号），避免 refresh token 过期 |
@@ -88,7 +93,38 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 7. **CodeBuddy CN IDE**：账号卡片可一键切换国内版桌面客户端（www.codebuddy.cn）。切换会关闭并重启 CodeBuddy CN，把所选账号写入本机 `~/Library/Application Support/CodeBuddy CN` 的登录态；首次使用前请先手动打开并登录一次以生成 Keychain Safe Storage。与下方 CLI 切换相互独立。
 8. **CodeBuddy CLI**：账号页可一键接入/更新认证。macOS/Linux 使用 `apiKeyHelper`，Windows 使用 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`（保留其他配置，不依赖 `.cmd` 跳板）。「切换 CodeBuddy」只更新后续加载会话使用的默认账号，当前运行会话不会切换；请由 ACP 重新加载会话，或重启 CodeBuddy CLI 后生效。普通 CLI 在同一进程中执行 `/resume` 不保证重新读取认证配置。
 9. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后后台按间隔检查，并把积分最紧迫的账号设为后续会话的默认账号（策略见下）；正在运行的当前会话不会被自动切换。Windows 会同步最新 Token 到 settings，但仍需重新加载会话或重启 CLI。
-10. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载。
+10. **API 反代**：侧栏进入「API 反代」，开启并保存后即可把 `http://127.0.0.1:7863/v1` 当作 OpenAI 基址使用；同页可按分组挑选参与轮转的账号，并查看请求用量。详见 [API 反代](#api-反代)。
+11. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载。
+
+## API 反代
+
+侧边栏的 **「API 反代」** 页把当前账号库包装成一个 OpenAI 兼容接口，任何支持 OpenAI SDK 的客户端都能直接用：
+
+```
+base_url = http://127.0.0.1:7863/v1
+api_key  = 随便填（未设置鉴权时）
+```
+
+1. 打开 Switch →「API 反代」→ 打开「启用 OpenAI 兼容接口」→ **保存**（保存即生效，无需重启）
+2. 之后每次启动 Switch 都会自动拉起（配置存在 `~/.wb-switch/proxy.json`）
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /v1/chat/completions` | 对话补全，支持 `stream: true` 流式 |
+| `GET /v1/models` | 可用模型列表 |
+| `GET /healthz` | 健康检查与可用账号数 |
+| `GET /usage-stats` | 反代用量统计（JSON） |
+
+**账号池**：健康账号轮转使用，失败的号冷却 120 秒后自动回到池子；标记了 `needs_relogin` 的账号不参与。
+**按分组挑号**：关掉「使用全部账号」后可按「反代API / 桌面端 / 未分组」分区勾选，或用「只选反代API 分组」一键把标记过的号全部选入。
+
+推荐用法：给日常聊天的 1~2 个号标「桌面端」，其余标「反代API」，反代页点「只选反代API 分组」——
+这样桌面端和 API 出站互不抢号。
+
+> 如果本机开着系统代理（梯子），部分客户端会把 `127.0.0.1` 也送去走代理而连不上，
+> 这时设置 `no_proxy=127.0.0.1,localhost`，或用 `curl --noproxy '*'` 验证。
+
+实现细节、源码位置与自行编译步骤见 [`API-PROXY.md`](./API-PROXY.md)。
 
 ## 界面预览
 
@@ -156,14 +192,21 @@ Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、
 切换账号需要写入 WorkBuddy 认证文件，macOS 要求授权「App 管理」（或「完全磁盘访问」）：
 
 1. 首次切换报「无权限」时，点「打开系统设置」
-2. 优先在 **App 管理** 里打开 workbuddy-switch 开关；若没有，则去 **完全磁盘访问** 把 workbuddy-switch 拖进带箭头的框
+2. 优先在 **App 管理** 里打开 WorkBuddy-Switch2api 开关；若没有，则去 **完全磁盘访问** 把 WorkBuddy-Switch2api 拖进带箭头的框
 3. 授权后重启本应用生效；设置页「权限检测」可随时验证
 
 > webui 模式：由启动服务的终端进程权限决定；若终端已授权完全磁盘访问则无需额外操作。
 
 ## 致谢
 
-感谢 [Linux.do](https://linux.do) 社区。
+本项目基于以下开源工作：
+
+- **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)** —— 账号切换、积分与 Token 统计、
+  自动签到、自动轮换等绝大部分功能的作者。本仓库在此之上做了改造与扩展（API 反代、账号分组、反代用量统计），
+  在此致谢。
+- **[Linux.do](https://linux.do)** 社区 —— 提供交流与反馈。
+- 以及 [Tauri](https://tauri.app)、[React](https://react.dev)、[axum](https://github.com/tokio-rs/axum)、
+  [reqwest](https://github.com/seanmonstar/reqwest) 等开源项目。
 
 ## 许可
 
