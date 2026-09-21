@@ -605,7 +605,10 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
 // 所以这里不再原样透传，改成有状态的重组：
 //   * 同一字段累积到阈值才发一帧；字段切换、流结束、收到末帧时强制 flush；
 //   * 顺手规范化上游不合规的地方：中间帧 finish_reason 用 null（上游给的是 `""`）、
-//     丢掉 extra_fields / refusal / function_call / 空 tool_calls，role 只在首帧出现。
+//     重组帧不带空字符串字段，role 只在首帧出现；
+//   * 🔴 **工具调用帧（`tool_calls` / `function_call` 非空）不参与合并，原样透传** ——
+//     它们的 delta 里既没有 reasoning 也没有 content，走合并分支会被整帧吞掉，
+//     客户端就永远收不到工具调用（agent 功能全废）。
 // 用量统计仍按原有方式在流结束时解析整段文本。
 //
 // 阈值为什么两个不一样：拿真实抓包跑过（glm-5.3-flash 一段思考 1082 帧、思考合计 2933 字），
@@ -637,6 +640,52 @@ fn finish_str(frame: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// `delta` 里是否带**实际内容**的工具调用（`tool_calls` 非空数组，或 `function_call` 非空对象）。
+///
+/// 🔴 这类帧必须**原样透传**，绝不能进重组逻辑：它们的 delta 里既没有 `reasoning_content`
+/// 也没有 `content`，会被"只处理这两种字段"的合并分支整帧吞掉 ——
+/// 结果是客户端收到 `finish_reason: "tool_calls"` 却拿不到任何工具数据，agent 功能全废。
+fn has_tool_delta(frame: &Value) -> bool {
+    let Some(delta) = frame
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+    else {
+        return false;
+    };
+    if let Some(tc) = delta.get("tool_calls") {
+        match tc {
+            Value::Array(a) => return !a.is_empty(),
+            Value::Null => {}
+            _ => return true,
+        }
+    }
+    if let Some(fc) = delta.get("function_call") {
+        match fc {
+            Value::Object(o) => return !o.is_empty(),
+            Value::Null => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// 上游会把中间帧的 `finish_reason` 填成空字符串 `""`（实测 1081/1082 帧），规范成 `null`。
+/// 只在**透传帧**上用；重组出来的帧由 `make_chunk` 直接写 `null`。
+fn normalize_finish(frame: &mut Value) {
+    let Some(choice) = frame
+        .get_mut("choices")
+        .and_then(|c| c.as_array_mut())
+        .and_then(|a| a.first_mut())
+        .and_then(|c| c.as_object_mut())
+    else {
+        return;
+    };
+    if matches!(choice.get("finish_reason"), Some(Value::String(s)) if s.is_empty()) {
+        choice.insert("finish_reason".to_string(), Value::Null);
+    }
 }
 
 /// 以上游首帧为模板，重造一帧规范的 OpenAI 流式 chunk。
@@ -759,6 +808,28 @@ async fn sse_pump<S>(
                 template = Some(frame.clone());
             }
 
+            // 🔴 工具调用帧优先原样透传（必须在合并分支之前判断）。
+            // 它们的 delta 里没有 reasoning_content / content，走下面的分支会被整帧吞掉，
+            // 客户端只能收到 finish_reason="tool_calls" 却拿不到工具数据。
+            if has_tool_delta(&frame) {
+                if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
+                    if tx.send(Ok(b)).await.is_err() {
+                        break 'outer;
+                    }
+                }
+                field.clear();
+                let mut fwd = frame.clone();
+                normalize_finish(&mut fwd);
+                if let Some(b) = sse_bytes(&fwd) {
+                    if tx.send(Ok(b)).await.is_err() {
+                        break 'outer;
+                    }
+                }
+                // 这帧已带着自己的 finish_reason 原样发出，不能再进 last_frame
+                // （那里会把 delta 清空，工具调用就没了）。
+                continue;
+            }
+
             let reasoning = delta_str(&frame, "reasoning_content");
             let content = delta_str(&frame, "content");
             if !reasoning.is_empty() || !content.is_empty() {
@@ -801,12 +872,16 @@ async fn sse_pump<S>(
         let _ = tx.send(Ok(b)).await;
     }
     if let Some(mut frame) = last_frame {
-        // 末帧的 delta 已经并入上面的累积了，这里清空以免重复输出
-        if let Some(obj) = frame.as_object_mut() {
-            if let Some(cv) = obj.get_mut("choices") {
-                if let Some(choices) = cv.as_array_mut() {
-                    if let Some(choice) = choices.first_mut().and_then(|c| c.as_object_mut()) {
-                        choice.insert("delta".to_string(), json!({}));
+        normalize_finish(&mut frame);
+        // 末帧的 delta 已经并入上面的累积了，这里清空以免重复输出。
+        // ⚠️ 但如果这帧本身带工具调用，就不能清 —— 那是唯一的数据来源。
+        if !has_tool_delta(&frame) {
+            if let Some(obj) = frame.as_object_mut() {
+                if let Some(cv) = obj.get_mut("choices") {
+                    if let Some(choices) = cv.as_array_mut() {
+                        if let Some(choice) = choices.first_mut().and_then(|c| c.as_object_mut()) {
+                            choice.insert("delta".to_string(), json!({}));
+                        }
                     }
                 }
             }
