@@ -788,7 +788,7 @@ async fn sse_pump<S>(
         if let Some(obj) = frame.as_object_mut() {
             if let Some(cv) = obj.get_mut("choices") {
                 if let Some(choices) = cv.as_array_mut() {
-                    if let Some(choice) = choices[0].as_object_mut() {
+                    if let Some(choice) = choices.first_mut().and_then(|c| c.as_object_mut()) {
                         choice.insert("delta".to_string(), json!({}));
                     }
                 }
