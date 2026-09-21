@@ -659,8 +659,14 @@ fn make_chunk(template: &Value, reasoning: &str, content: &str, with_role: bool)
                     if with_role {
                         delta.insert("role".to_string(), json!("assistant"));
                     }
-                    delta.insert("reasoning_content".to_string(), json!(reasoning));
-                    delta.insert("content".to_string(), json!(content));
+                    // 只在非空时插入字段：某些客户端按「delta 里出现了 reasoning_content 键」
+                    // 来判断是否开启新的思考块，若正文帧也携带空串，会凭空多出一堆空思考块。
+                    if !reasoning.is_empty() {
+                        delta.insert("reasoning_content".to_string(), json!(reasoning));
+                    }
+                    if !content.is_empty() {
+                        delta.insert("content".to_string(), json!(content));
+                    }
                     choice.insert("delta".to_string(), Value::Object(delta));
                 }
             }
