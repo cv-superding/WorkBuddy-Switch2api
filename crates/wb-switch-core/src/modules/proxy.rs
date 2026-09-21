@@ -593,42 +593,217 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
 }
 
 /// 边转发边累积 SSE 原文，流结束时把用量记进统计。
-struct UsageTap<S> {
-    inner: S,
-    buf: Arc<Mutex<String>>,
-    meta: UsageMeta,
+// ---------------------------------------------------------------- 流式重组
+//
+// 上游会把思考与正文拆成**非常碎**的小帧：实测 `glm-5.3-flash` 一段思考 750 帧、
+// 每帧 1~5 个字符（形如 `'The'` `' user'` `' is'`），`kimi-k3-1` 同量级。
+//
+// 而部分客户端会把**每一帧都当成一个独立的思考段**（ZCode 就是如此，它内部用
+// Vercel AI SDK），于是界面上出现几十上百个「思考」小块、每块只有一两个词；
+// 正文却正常，因为正文走的是另一套会累积合并的逻辑。
+//
+// 所以这里不再原样透传，改成有状态的重组：
+//   * 同一字段（reasoning_content / content）累积到 MERGE_MIN_CHARS 才发一帧；
+//   * 字段切换、流结束、收到末帧时强制 flush；
+//   * 顺手规范化上游不合规的地方：中间帧 finish_reason 用 null（上游给的是 `""`）、
+//     丢掉 extra_fields / refusal / function_call / 空 tool_calls，role 只在首帧出现。
+// 用量统计仍按原有方式在流结束时解析整段文本。
+const MERGE_MIN_CHARS: usize = 24;
+
+/// 取 `choices[0].delta.<key>` 的字符串（缺失或 null 都当空串）。
+fn delta_str(frame: &Value, key: &str) -> String {
+    frame
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
-impl<S> futures::Stream for UsageTap<S>
-where
-    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
-{
-    type Item = Result<bytes::Bytes, std::io::Error>;
+/// 取 `choices[0].finish_reason`（缺失或 null 都当空串）。
+fn finish_str(frame: &Value) -> String {
+    frame
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
 
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
-            std::task::Poll::Ready(Some(Ok(bytes))) => {
-                if let Ok(mut b) = this.buf.lock() {
-                    b.push_str(&String::from_utf8_lossy(&bytes));
+/// 以上游首帧为模板，重造一帧规范的 OpenAI 流式 chunk。
+fn make_chunk(template: &Value, reasoning: &str, content: &str, with_role: bool) -> Value {
+    let mut frame = template.clone();
+    if let Some(obj) = frame.as_object_mut() {
+        obj.insert("usage".to_string(), Value::Null);
+        if !obj.contains_key("choices") {
+            obj.insert("choices".to_string(), json!([{}]));
+        }
+        if let Some(cv) = obj.get_mut("choices") {
+            if let Some(choices) = cv.as_array_mut() {
+                if choices.is_empty() {
+                    choices.push(json!({}));
                 }
-                std::task::Poll::Ready(Some(Ok(bytes)))
+                if let Some(choice) = choices[0].as_object_mut() {
+                    choice.insert("finish_reason".to_string(), Value::Null);
+                    choice.insert("logprobs".to_string(), Value::Null);
+                    let mut delta = serde_json::Map::new();
+                    if with_role {
+                        delta.insert("role".to_string(), json!("assistant"));
+                    }
+                    delta.insert("reasoning_content".to_string(), json!(reasoning));
+                    delta.insert("content".to_string(), json!(content));
+                    choice.insert("delta".to_string(), Value::Object(delta));
+                }
             }
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-            ))),
-            std::task::Poll::Ready(None) => {
-                let text = this.buf.lock().map(|b| b.clone()).unwrap_or_default();
-                let usage = usage_from_sse(&text);
-                record_usage(&this.meta, usage.as_ref(), true);
-                std::task::Poll::Ready(None)
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
+    frame
+}
+
+fn sse_bytes(frame: &Value) -> Option<bytes::Bytes> {
+    let text = serde_json::to_string(frame).ok()?;
+    Some(bytes::Bytes::from(format!("data: {text}\n\n")))
+}
+
+/// 把累积内容合成一帧发出去；返回 None 表示当前没有可发的累积。
+fn take_flush(
+    template: Option<&Value>,
+    field: &str,
+    acc: &mut String,
+    role_done: &mut bool,
+) -> Option<bytes::Bytes> {
+    if acc.is_empty() {
+        return None;
+    }
+    let t = template?;
+    let (reasoning, content) = if field == "reasoning_content" {
+        (acc.as_str(), "")
+    } else {
+        ("", acc.as_str())
+    };
+    let out = sse_bytes(&make_chunk(t, reasoning, content, !*role_done));
+    *role_done = true;
+    acc.clear();
+    out
+}
+
+/// 读完整条上游流，边重组边推给客户端；结束时补末帧与 `[DONE]`，并记录用量。
+async fn sse_pump<S>(
+    mut upstream: S,
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    meta: UsageMeta,
+) where
+    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    let mut raw = String::new();
+    let mut tail = String::new();
+    let mut template: Option<Value> = None;
+    let mut last_frame: Option<Value> = None;
+    let mut role_done = false;
+    let mut field = String::new();
+    let mut acc = String::new();
+
+    'outer: while let Some(item) = upstream.next().await {
+        match item {
+            Ok(chunk) => {
+                let text = String::from_utf8_lossy(&chunk).to_string();
+                raw.push_str(&text);
+                tail.push_str(&text);
+            }
+            Err(e) => {
+                record_usage(&meta, None, false);
+                let _ = tx
+                    .send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )))
+                    .await;
+                return;
+            }
+        }
+
+        // 按空行切出完整事件；不足一个事件的留在 tail 里等下一块
+        while let Some(idx) = tail.find("\n\n") {
+            let event = tail[..idx].to_string();
+            tail.drain(..idx + 2);
+
+            // SSE 规范允许一个事件里有多行 data:，拼接后才是完整 JSON
+            let mut data = String::new();
+            for line in event.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    data.push_str(rest.trim_start());
+                }
+            }
+            if data.is_empty() || data.trim() == "[DONE]" {
+                continue;
+            }
+            let Ok(frame) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if template.is_none() {
+                template = Some(frame.clone());
+            }
+
+            let reasoning = delta_str(&frame, "reasoning_content");
+            let content = delta_str(&frame, "content");
+            if !reasoning.is_empty() || !content.is_empty() {
+                let (next_field, piece) = if !reasoning.is_empty() {
+                    ("reasoning_content", reasoning)
+                } else {
+                    ("content", content)
+                };
+                if field != next_field {
+                    if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
+                        if tx.send(Ok(b)).await.is_err() {
+                            break 'outer;
+                        }
+                    }
+                    field = next_field.to_string();
+                }
+                acc.push_str(&piece);
+                if acc.chars().count() >= MERGE_MIN_CHARS {
+                    if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
+                        if tx.send(Ok(b)).await.is_err() {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            // 末帧要留着最后发：先把它手里的 delta 并入累积，避免丢结尾
+            if !finish_str(&frame).is_empty() {
+                last_frame = Some(frame);
+            }
+        }
+    }
+
+    if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
+        let _ = tx.send(Ok(b)).await;
+    }
+    if let Some(mut frame) = last_frame {
+        // 末帧的 delta 已经并入上面的累积了，这里清空以免重复输出
+        if let Some(obj) = frame.as_object_mut() {
+            if let Some(cv) = obj.get_mut("choices") {
+                if let Some(choices) = cv.as_array_mut() {
+                    if let Some(choice) = choices[0].as_object_mut() {
+                        choice.insert("delta".to_string(), json!({}));
+                    }
+                }
+            }
+        }
+        if let Some(b) = sse_bytes(&frame) {
+            let _ = tx.send(Ok(b)).await;
+        }
+    }
+    let _ = tx
+        .send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+        .await;
+
+    let usage = usage_from_sse(&raw);
+    record_usage(&meta, usage.as_ref(), true);
 }
 
 async fn chat_completions(
@@ -701,23 +876,27 @@ async fn chat_completions(
             .into_response();
     }
 
-    let stream = Box::pin(resp.bytes_stream());
     if want_stream {
-        // 原样转发 SSE，同时在流结束时把用量记进统计。
-        let tap = UsageTap {
-            inner: stream,
-            buf: Arc::new(Mutex::new(String::new())),
-            meta,
-        };
+        // 不再原样透传：先过一层 SSE 重组器（见 sse_pump 的说明），
+        // 否则上游「一两个词一帧」的粒度会让客户端把思考渲染成一片小方块。
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        // bytes_stream() 返回的 impl Stream 不保证 Unpin，必须 Box::pin 一下
+        let upstream = Box::pin(resp.bytes_stream());
+        tokio::spawn(async move {
+            sse_pump(upstream, tx, meta).await;
+        });
+        let body = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
         Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream; charset=utf-8")
             .header("Cache-Control", "no-cache")
             .header("X-Accel-Buffering", "no")
-            .body(axum::body::Body::from_stream(tap))
+            .body(axum::body::Body::from_stream(body))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     } else {
-        match aggregate(stream, &model).await {
+        match aggregate(Box::pin(resp.bytes_stream()), &model).await {
             Ok(json) => {
                 let usage = json.get("usage").cloned();
                 record_usage(&meta, usage.as_ref(), true);
