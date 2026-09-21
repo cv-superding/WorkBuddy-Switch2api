@@ -603,12 +603,18 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
 // 正文却正常，因为正文走的是另一套会累积合并的逻辑。
 //
 // 所以这里不再原样透传，改成有状态的重组：
-//   * 同一字段（reasoning_content / content）累积到 MERGE_MIN_CHARS 才发一帧；
-//   * 字段切换、流结束、收到末帧时强制 flush；
+//   * 同一字段累积到阈值才发一帧；字段切换、流结束、收到末帧时强制 flush；
 //   * 顺手规范化上游不合规的地方：中间帧 finish_reason 用 null（上游给的是 `""`）、
 //     丢掉 extra_fields / refusal / function_call / 空 tool_calls，role 只在首帧出现。
 // 用量统计仍按原有方式在流结束时解析整段文本。
-const MERGE_MIN_CHARS: usize = 24;
+//
+// 阈值为什么两个不一样：拿真实抓包跑过（glm-5.3-flash 一段思考 1082 帧、思考合计 2933 字），
+// 阈值 24 时思考仍会拆成 112 帧 —— 客户端按帧开块的话就是 112 个方块，等于没修。
+// 实测（思考阈值 → 思考帧数）：24→112、96→30、160→19、240→13、400→8。
+// 正文必须保持小阈值以维持逐字出字的观感；思考块在被折叠的情况下大一点反而更好读。
+// 若你的客户端仍碎得厉害，把 MERGE_MIN_REASONING 调大即可（调到 usize::MAX 就是整段一次出）。
+const MERGE_MIN_REASONING: usize = 256;
+const MERGE_MIN_CONTENT: usize = 32;
 
 /// 取 `choices[0].delta.<key>` 的字符串（缺失或 null 都当空串）。
 fn delta_str(frame: &Value, key: &str) -> String {
@@ -764,7 +770,12 @@ async fn sse_pump<S>(
                     field = next_field.to_string();
                 }
                 acc.push_str(&piece);
-                if acc.chars().count() >= MERGE_MIN_CHARS {
+                let limit = if field == "reasoning_content" {
+                    MERGE_MIN_REASONING
+                } else {
+                    MERGE_MIN_CONTENT
+                };
+                if acc.chars().count() >= limit {
                     if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
                         if tx.send(Ok(b)).await.is_err() {
                             break 'outer;
