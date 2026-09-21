@@ -31,6 +31,14 @@ function num(v?: number): string {
   return (v ?? 0).toLocaleString("zh-CN");
 }
 
+/** credit 是浮点累加值，直接 String() 会漏出 603.9699999999999 这种尾数，固定三位小数。 */
+function num3(v?: number): string {
+  return new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: 3,
+    maximumFractionDigits: 3,
+  }).format(v ?? 0);
+}
+
 function StatCard({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="rounded-xl border border-border bg-muted/25 px-4 py-3">
@@ -328,7 +336,7 @@ export default function ApiProxyPage() {
               <StatCard label="总请求" value={num(usage.total.requests)} hint={usage.total.errors ? `失败 ${num(usage.total.errors)}` : undefined} />
               <StatCard label="输入 tokens" value={num(usage.total.promptTokens)} />
               <StatCard label="输出 tokens" value={num(usage.total.completionTokens)} />
-              <StatCard label="累计消耗" value={String(usage.total.credit ?? 0)} hint="上游返回的 credit" />
+              <StatCard label="累计消耗" value={num3(usage.total.credit)} hint="上游返回的 credit" />
             </div>
 
             {Object.keys(usage.byAccount ?? {}).length > 0 ? (
