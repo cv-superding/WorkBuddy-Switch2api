@@ -48,3 +48,9 @@ npm/platform/*/bin/
 
 # 换图标时保存的原始素材备份（本地用，不入库）
 icons-original/
+
+# 本机专用的一键构建脚本（里面写死了本机路径，不入库）
+build-and-deploy.bat
+
+# 构建前端时被改名移走的临时 dist（删除拦截器绕行产物，见构建说明）
+dist-*
