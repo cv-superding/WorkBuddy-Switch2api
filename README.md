@@ -79,7 +79,7 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 | CodeBuddy CLI | 与 WorkBuddy 复用同一账号库，但默认账号独立；macOS/Linux 通过 `apiKeyHelper`，Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置后续会话使用的账号；任何平台都不会修改正在运行的当前会话 |
 | CodeBuddy CN IDE | 复用同一账号库，向 `CodeBuddy CN` 桌面客户端注入 Safe Storage 凭证（`state.vscdb` / `planning-genie.new.accessTokencn`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 无关 |
 | 自动轮换 | 后台定时把 CodeBuddy CLI 的后续启动账号设为积分最紧迫（最早到期）的账号；当前会话保持原账号，重新加载会话或重启 CLI 后使用新的账号 |
-| 自动更新 | 配置 GitHub Releases 源检查新版本；整包更新经签名校验（tauri-updater） |
+| 更新提示 | 启动时检查公开 GitHub Releases 是否有新版本并提示；当前发布包未附带签名更新清单，升级需到 Release 页面手动下载 |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
 
 ## 使用
@@ -94,7 +94,7 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 8. **CodeBuddy CLI**：账号页可一键接入/更新认证。macOS/Linux 使用 `apiKeyHelper`，Windows 使用 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`（保留其他配置，不依赖 `.cmd` 跳板）。「切换 CodeBuddy」只更新后续加载会话使用的默认账号，当前运行会话不会切换；请由 ACP 重新加载会话，或重启 CodeBuddy CLI 后生效。普通 CLI 在同一进程中执行 `/resume` 不保证重新读取认证配置。
 9. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后后台按间隔检查，并把积分最紧迫的账号设为后续会话的默认账号（策略见下）；正在运行的当前会话不会被自动切换。Windows 会同步最新 Token 到 settings，但仍需重新加载会话或重启 CLI。
 10. **API 反代**：侧栏进入「API 反代」，开启并保存后即可把 `http://127.0.0.1:7863/v1` 当作 OpenAI 基址使用；同页可按分组挑选参与轮转的账号，并查看请求用量。详见 [API 反代](#api-反代)。
-11. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载。
+11. **更新**：应用启动时会检查公开 GitHub Releases，发现新版本在左下角提示；点击后打开对应 Release 页面手动下载安装。当前发布包未附带 tauri-updater 签名清单，因此暂不支持应用内一键升级。
 
 ## API 反代
 
