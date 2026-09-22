@@ -17,7 +17,7 @@ use std::{
 };
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -38,6 +38,12 @@ const DEFAULT_CLI_VERSION: &str = "2.137.1";
 const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
+/// 单次请求体上限。
+///
+/// axum 默认只给 2 MB（`DEFAULT_LIMIT`），长上下文会话（几十万 token）序列化后
+/// 很容易超过，会被直接 413 掉、且报错信息里看不到原因。这里显式放宽到 64 MB：
+/// 足以容纳百万级 token 的上下文，同时仍留一个防止内存被打爆的上界。
+const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------- 配置
 
@@ -1110,6 +1116,8 @@ fn router(st: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/status", get(proxy_status))
         .route("/usage-stats", get(usage_stats))
+        // 必须在 with_state 之前挂：layer 只对「它之前注册的路由」生效。
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .with_state(st)
 }
 
