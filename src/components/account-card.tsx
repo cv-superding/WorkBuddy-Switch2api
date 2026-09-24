@@ -144,6 +144,8 @@ function travelTooltip(status: TravelStatus): string {
 /** 按旅行状态渲染标签：无 Buddy / 未旅行 / 旅行中 / 已结束。 */
 function travelChip(status: TravelStatus | undefined) {
   if (!status) return null;
+  // 该档位不支持成长中心（国际版）：不显示任何旅行标签，避免误导
+  if (status.supported === false) return null;
   switch (status.label) {
     case "no-buddy":
       return <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>无 Buddy</Badge>;
@@ -241,6 +243,8 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
     .map(({ resource }) => resource);
 
   const activeProductCount = [workbuddyActive, codebuddyCliActive, codebuddyCnIdeActive].filter(Boolean).length;
+  /** 国际版没有签到接口（后端也会短路），这里同步隐藏签到相关 UI。 */
+  const checkinSupported = !isInternational(account);
 
   const statusChips = (
     <>
@@ -257,7 +261,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
           {accountGroupLabel(account.group)}
         </Badge>
       )}
-      {todayCheckedIn !== undefined && (
+      {checkinSupported && todayCheckedIn !== undefined && (
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
       )}
       {travelChip(travelStatus)}
@@ -324,7 +328,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
                   <RefreshCw />刷新 Token
                 </DropdownMenuItem>
-                {todayCheckedIn === false && (
+                {checkinSupported && todayCheckedIn === false && (
                   <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
                     <CircleCheck />手动签到
                   </DropdownMenuItem>

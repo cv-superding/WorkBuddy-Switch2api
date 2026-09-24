@@ -85,6 +85,8 @@ pub fn account_meta(acc: &Value) -> Value {
         "needsReloginReason": acc.get("needs_relogin_reason"),
         // 账号分组："desktop"=桌面端 / "proxy"=反代API / 缺失=未分组
         "group": acc.get("group"),
+        // 客户端档位："domestic"=国内版（缺失时视为国内版）/ "international"=国际版
+        "edition": acc.get("edition"),
     })
 }
 
@@ -114,10 +116,19 @@ fn identity_email(account: &Value) -> Option<String> {
 ///
 /// 非空 UID 始终优先；仅当新账号没有 UID 时，才使用真实邮箱兜底。
 /// 命中已有身份时保留本地 id，避免调用方持有的账号引用失效。
+///
+/// **档位参与身份判定**：国内版与国际版是两套独立登录态（不同域名、不同认证文件），
+/// 同一个 uid 在两个档位下必须存成两条记录，否则切换会互相覆盖。
 pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value) -> Value {
+    use crate::modules::edition::edition_of;
+
+    let collected_edition = edition_of(&collected);
     let collected_uid = get_str(&collected, "uid");
     let collected_email = identity_email(&collected);
     let matches_identity = |existing: &Value| {
+        if edition_of(existing) != collected_edition {
+            return false;
+        }
         if let Some(uid) = collected_uid.as_deref() {
             return get_str(existing, "uid").as_deref() == Some(uid);
         }

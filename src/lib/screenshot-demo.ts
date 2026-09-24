@@ -24,7 +24,8 @@ interface AccountUsageSeed {
 const accounts: AccountMeta[] = [
   { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
   { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
-  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
+  // 国际版：账号页的国际版标签页靠 edition 字段过滤，演示数据里保留一个以便展示分档位 UI
+  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, edition: "international" },
 ];
 
 /** 演示模式中的临时 CLI 当前账号，仅存在于本次页面会话。 */
@@ -333,6 +334,11 @@ function travelConfig(): TravelConfig {
 
 function travelStatus(accountId: string): TravelStatus {
   const index = Math.max(0, accounts.findIndex((account) => account.id === accountId));
+  const account = accounts[index];
+  // 国际版没有成长中心，后端会返回 supported=false，演示数据保持一致
+  if (account?.edition === "international") {
+    return { label: "untraveled", rewardCredit: null, locationName: null, supported: false };
+  }
   // 演示三种状态：旅行中 / 已结束 / 无 Buddy
   if (index % 3 === 0) return { label: "traveling", rewardCredit: 7, locationName: "咖啡馆", arriveAt: Math.floor(Date.now() / 1000) + 2 * 3600 + 40 * 60 };
   if (index % 3 === 1) return { label: "finished", rewardCredit: 20, locationName: "健身房" };

@@ -75,6 +75,8 @@ export interface OAuthStartResult {
   loginId: string;
   verificationUri: string;
   expiresIn: number;
+  /** 本次登录使用的档位：`domestic` / `international`。 */
+  edition?: string;
 }
 
 export interface OAuthPollResult {
@@ -234,6 +236,11 @@ export interface TravelStatus {
   rewardCredit: number | null;
   locationName?: string | null;
   arriveAt?: number | null;
+  /**
+   * 该账号所在档位是否支持成长中心。
+   * 国际版为 `false`（后端返回，前端据此隐藏旅行标签）。
+   */
+  supported?: boolean;
 }
 
 export interface AutoRotateConfig {

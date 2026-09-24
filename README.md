@@ -68,6 +68,7 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 | 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号 |
 | **账号分组** | 给账号标注「桌面端 / 反代API / 未分组」，账号卡片直接显示标签；反代页按分组挑选出站账号 |
 | 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
+| **国内版 / 国际版** | 账号按客户端档位分开管理。国内版 = `WorkBuddy` + `workbuddy-desktop.info` + `www.codebuddy.cn`；国际版 = `WorkBuddyAI` + `workbuddy-desktop-ai.info` + `www.workbuddy.ai`。扫码登录、从本机导入、切换、Token 刷新、积分查询都按档位走对应域名与进程；账号页用「国内版 / 国际版」标签页分开显示。国际版暂不支持每日签到、成长中心与会话复制 |
 | **API 反代** | 内置 OpenAI 兼容网关：账号池轮转与失败冷却、按分组挑号、流式与非流式、`/v1/chat/completions`、`/v1/models`、`/healthz`、`/usage-stats` |
 | **反代用量统计** | 经过反代的每一次请求都记录请求数、输入/输出 Token 与 credit，按账号、按模型汇总，并可查看最近请求明细 |
 | 会话复制 | 将当前账号勾选的会话以新 id 复制给目标账号（jsonl 正文 + `workbuddy.db` 索引 + edge-sync 注册） |
@@ -84,8 +85,9 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 
 ## 使用
 
-1. **添加账号**：账号页 →「扫码登录」（OAuth device flow）或「从本机导入」「手动添加」
-2. **切换账号**：账号卡片 →「切换」，可勾选复制当前会话
+1. **添加账号**：账号页 →「扫码登录」（OAuth device flow）或「从本机导入」「手动添加」。
+   账号页顶部有 **国内版 / 国际版** 标签，扫码与导入都作用在当前标签对应的版本上
+2. **切换账号**：账号卡片 →「切换」，可勾选复制当前会话（国际版不支持会话复制，会自动跳过）
 3. **自动签到**：账号页可直接开关；设置页可调整保活参数、立即签到并查看日志
 4. **查看积分到期**：账号页会自动查询各账号积分资源；点击「刷新积分」可手动更新，临近到期的资源会高亮，并把快过期账号按最近到期时间排序，最前面的标记为「建议优先使用」
 5. **查看积分统计**：侧栏进入「积分统计」，查看总览、近 30 天趋势、模型分类、账号消耗与请求明细；筛选账号或时间范围不会重复请求官方接口，点击「刷新统计」才会重新采集
@@ -204,8 +206,11 @@ Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、
 本项目基于以下开源工作：
 
 - **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)** —— 账号切换、积分与 Token 统计、
-  自动签到、自动轮换等绝大部分功能的作者。本仓库在此之上做了改造与扩展（API 反代、账号分组、反代用量统计），
-  在此致谢。
+  自动签到、自动轮换等绝大部分功能的作者。本仓库在此之上做了改造与扩展（API 反代、账号分组、反代用量统计、
+  国内版 / 国际版双档位），在此致谢。
+- **[Harvey-Will/workbuddy-tools](https://github.com/Harvey-Will/workbuddy-tools)**（MIT）—— 国际版（WorkBuddy AI）
+  的数据目录划分与客户端 `account-snapshot.json` 切换机制参考了该项目的 `core/editions.py` 与 `core/accounts.py`。
+  相关代码为独立重写，特此声明来源，遵循 MIT 许可。
 - **[Linux.do](https://linux.do)** 社区 —— 提供交流与反馈。
 - 以及 [Tauri](https://tauri.app)、[React](https://react.dev)、[axum](https://github.com/tokio-rs/axum)、
   [reqwest](https://github.com/seanmonstar/reqwest) 等开源项目。

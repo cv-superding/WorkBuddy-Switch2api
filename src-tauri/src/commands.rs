@@ -152,9 +152,13 @@ pub fn delete_account(account_id: String) -> Result<Value, String> {
 }
 
 /// POST /api/oauth/start —— 发起 OAuth 扫码登录。
+///
+/// `edition` 缺省 = 国内版。**国际版必须显式传 `international`**：
+/// 两档位走不同域名与 `platform` 参数（`workbuddy` / `workbuddy-ai`）。
 #[tauri::command]
-pub async fn oauth_start() -> Result<Value, String> {
-    oauth::oauth_start().await
+pub async fn oauth_start(edition: Option<String>) -> Result<Value, String> {
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
+    oauth::oauth_start_for(edition).await
 }
 
 /// GET /api/oauth/status —— 轮询采集结果。

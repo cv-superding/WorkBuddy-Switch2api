@@ -297,8 +297,14 @@ async fn api_import(Json(body): Json<Value>) -> Response {
 // OAuth 登录
 // ---------------------------------------------------------------------------
 
-async fn api_oauth_start() -> Response {
-    match oauth::oauth_start().await {
+async fn api_oauth_start(Json(body): Json<Value>) -> Response {
+    // 缺省国内版；传 international 走国际版域名与 platform=workbuddy-ai
+    let edition = body
+        .get("edition")
+        .and_then(|v| v.as_str())
+        .map(wb_switch_core::modules::edition::parse_lenient)
+        .unwrap_or_default();
+    match oauth::oauth_start_for(edition).await {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }

@@ -34,7 +34,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
-import { accountGroupLabel, type AccountMeta, type AppStatus, type CheckinConfig, type CodeBuddyCliStatus, type CodeBuddyCnIdeStatus, type CreditExpiry, type TravelConfig, type TravelStatus } from "@/lib/types";
+import { EDITIONS, editionLabel, isInternational, accountGroupLabel, type AccountMeta, type AppStatus, type CheckinConfig, type CodeBuddyCliStatus, type CodeBuddyCnIdeStatus, type CreditExpiry, type TravelConfig, type TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -166,6 +166,31 @@ export default function AccountsPage() {
       return true;
     }
   });
+
+  /**
+   * 档位标签页：国内版 / 国际版。
+   *
+   * 两个版本是**两套独立登录态**（不同认证文件、不同进程、不同域名），
+   * 混在一列里看会互相干扰（账号数、签到状态、可做的操作都不一样），
+   * 所以按档位分开展示。默认国内版，持久化到 localStorage。
+   */
+  const [editionTab, setEditionTab] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem("wb-switch.edition-tab");
+      return saved === "international" ? "international" : "domestic";
+    } catch {
+      return "domestic";
+    }
+  });
+
+  function switchEditionTab(next: string) {
+    setEditionTab(next);
+    try {
+      localStorage.setItem("wb-switch.edition-tab", next);
+    } catch {
+      /* 存储不可用时静默 */
+    }
+  }
 
   function toggleCompact() {
     setCompact((value) => {
@@ -311,10 +336,13 @@ export default function AccountsPage() {
   async function onImport() {
     setImporting(true);
     try {
-      const acc = await importLocal();
-      toast.success("账号已导入", { description: acc.nickname || acc.email || acc.id });
+      // 按当前标签页导入，避免在国际版页签下导入国内版登录态造成困惑
+      const acc = await importLocal(editionTab);
+      toast.success(`${editionLabel(editionTab)}账号已导入`, {
+        description: acc.nickname || acc.email || acc.id,
+      });
     } catch (e) {
-      toast.error("导入失败", { description: api.asError(e) });
+      toast.error(`${editionLabel(editionTab)}导入失败`, { description: api.asError(e) });
     } finally {
       setImporting(false);
     }
@@ -444,38 +472,52 @@ export default function AccountsPage() {
     }
   }
 
-  /** 刷新按钮：先跑一轮批量签到并重查今日签到状态，再强制刷新全部积分。 */
+  /**
+   * 刷新按钮：先跑一轮批量签到并重查今日签到状态，再强制刷新**当前档位**账号积分。
+   *
+   * 国际版没有签到接口，所以国际版标签页下跳过签到，只刷新积分。
+   */
   async function onRefreshCredits() {
-    if (!accounts.length || refreshingCredits || checkinAllRunning) return;
+    const scope = editionAccounts;
+    if (!scope.length || refreshingCredits || checkinAllRunning) return;
+    const checkinAvailable = editionTab !== "international";
     setCheckinAllRunning(true);
     try {
-      try {
-        const res = await api.checkinAll();
-        const entries = res.accounts ?? [];
-        const success = entries.filter((e) => e.result === "success").length;
-        const already = entries.filter((e) => e.result === "already").length;
-        const failed = entries.filter((e) => e.result === "error").length;
-        const parts: string[] = [];
-        if (success > 0) parts.push(`${success} 个签到成功`);
-        if (already > 0) parts.push(`${already} 个已签到`);
-        if (failed > 0) parts.push(`${failed} 个失败`);
-        const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
-        if (entries.length > 0 && failed === entries.length) {
-          toast.error("签到失败", { description: summary });
-        } else {
-          toast.success("签到完成", { description: summary });
+      if (checkinAvailable) {
+        try {
+          const res = await api.checkinAll();
+          const entries = res.accounts ?? [];
+          const success = entries.filter((e) => e.result === "success").length;
+          const already = entries.filter((e) => e.result === "already").length;
+          const failed = entries.filter((e) => e.result === "error").length;
+          // 国际版账号会被后端标记为 unsupported，不计入失败
+          const considered = entries.filter((e) => e.result !== "unsupported").length;
+          const parts: string[] = [];
+          if (success > 0) parts.push(`${success} 个签到成功`);
+          if (already > 0) parts.push(`${already} 个已签到`);
+          if (failed > 0) parts.push(`${failed} 个失败`);
+          const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
+          if (considered > 0 && failed === considered) {
+            toast.error("签到失败", { description: summary });
+          } else {
+            toast.success("签到完成", { description: summary });
+          }
+          // 批量签到后重查全部账号的今日签到状态，无需切换页面即反映最新结果
+          const next = await fetchTodayCheckinMap(accounts.map((account) => account.id));
+          if (Object.keys(next).length > 0) {
+            setCheckinMap((prev) => ({ ...prev, ...next }));
+          }
+        } catch (e) {
+          toast.error("批量签到失败", { description: api.asError(e) });
         }
-        // 批量签到后重查全部账号的今日签到状态，无需切换页面即反映最新结果
-        const next = await fetchTodayCheckinMap(accounts.map((account) => account.id));
-        if (Object.keys(next).length > 0) {
-          setCheckinMap((prev) => ({ ...prev, ...next }));
-        }
-      } catch (e) {
-        toast.error("批量签到失败", { description: api.asError(e) });
       }
-      await refreshCredits(accounts.map((account) => account.id));
-      await loadTravelMap(accounts.map((account) => account.id));
-      toast.success("积分到期情况已刷新");
+      await refreshCredits(scope.map((account) => account.id));
+      if (checkinAvailable) {
+        await loadTravelMap(scope.map((account) => account.id));
+        toast.success("积分到期情况已刷新");
+      } else {
+        toast.success("国际版积分已刷新");
+      }
     } finally {
       setCheckinAllRunning(false);
     }
@@ -547,11 +589,20 @@ export default function AccountsPage() {
   }
 
   const current = status?.current;
+  /** 各档位账号数（标签页角标）。 */
+  const editionCounts: Record<string, number> = { domestic: 0, international: 0 };
+  for (const a of accounts) {
+    editionCounts[isInternational(a) ? "international" : "domestic"] += 1;
+  }
+  /** 当前标签页展示的账号；排序与「建议优先」都只看本档位，避免跨版本干扰。 */
+  const editionAccounts = accounts.filter(
+    (a) => isInternational(a) === (editionTab === "international"),
+  );
   const creditOrderingReady =
-    accounts.length > 0 &&
-    accounts.every((account) => Boolean(creditMap[account.id]) && !creditLoadingMap[account.id]);
+    editionAccounts.length > 0 &&
+    editionAccounts.every((account) => Boolean(creditMap[account.id]) && !creditLoadingMap[account.id]);
   const orderedAccounts = creditOrderingReady
-    ? accounts
+    ? editionAccounts
         .map((account, index) => ({ account, index }))
         .sort((left, right) => {
           const leftCredit = creditMap[left.account.id];
@@ -568,7 +619,7 @@ export default function AccountsPage() {
           return left.index - right.index;
         })
         .map(({ account }) => account)
-    : accounts;
+    : editionAccounts;
   const priorityAccountId =
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
@@ -592,7 +643,7 @@ export default function AccountsPage() {
           <div className="min-w-0">
             <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              统一管理 WorkBuddy、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
+              统一管理 WorkBuddy（国内版 / 国际版）、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-4 pt-1">
@@ -651,7 +702,9 @@ export default function AccountsPage() {
         <div className="relative flex flex-wrap items-center gap-x-5 gap-y-4">
           <div className="min-w-[190px] flex-1">
             <h2 className="text-sm font-semibold text-foreground">添加与迁移账号</h2>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">快速接入新账号，或从已有环境恢复</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              当前目标版本：<span className="font-medium text-foreground">{editionLabel(editionTab)}</span>
+            </p>
           </div>
           <div className="flex flex-wrap items-center gap-2.5">
             <DemoAction>
@@ -659,12 +712,13 @@ export default function AccountsPage() {
                 className="h-10 bg-primary px-4 text-primary-foreground shadow-sm hover:bg-primary/90"
                 onClick={() => setOauthOpen(true)}
               >
-                <QrCode />OAuth 扫码添加
+                <QrCode />扫码添加（{editionLabel(editionTab)}）
               </Button>
             </DemoAction>
             <DemoAction>
               <Button className="h-10 px-4" onClick={onImport} disabled={importing} variant="outline">
-                {importing ? <Loader2 className="animate-spin" /> : <Download />}导入本机账号
+                {importing ? <Loader2 className="animate-spin" /> : <Download />}
+                导入{editionLabel(editionTab)}账号
               </Button>
             </DemoAction>
           </div>
@@ -733,14 +787,49 @@ export default function AccountsPage() {
       )}
       <section className="mt-7 min-w-0" aria-labelledby="accounts-list-title">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <h2 id="accounts-list-title" className="text-base font-semibold tracking-tight">账号</h2>
+            {/* 档位切换：国内版 / 国际版 是两套独立登录态，分开展示 */}
+            <div
+              role="tablist"
+              aria-label="客户端版本"
+              className="ml-1 inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/40 p-0.5"
+            >
+              {EDITIONS.map((e) => {
+                const active = editionTab === e.value;
+                return (
+                  <button
+                    key={e.value}
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => switchEditionTab(e.value)}
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                      active
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {e.label}
+                    <span
+                      className={cn(
+                        "rounded-full px-1.5 text-[10px] tabular-nums",
+                        active ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground",
+                      )}
+                    >
+                      {editionCounts[e.value] ?? 0}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
             <Badge
               variant="secondary"
               className="h-6 min-w-6 rounded-full border-0 px-1.5 text-[11px] tabular-nums text-muted-foreground shadow-none"
-              aria-label={`${accounts.length} 个账号`}
+              aria-label={`${editionAccounts.length} 个账号`}
             >
-              {accounts.length}
+              {editionAccounts.length}
             </Badge>
           </div>
           <TooltipProvider delayDuration={400}>
@@ -798,28 +887,44 @@ export default function AccountsPage() {
                         variant="ghost"
                         size="icon"
                         className="size-9 rounded-lg"
-                        disabled={refreshingCredits || checkinAllRunning || accounts.length === 0}
+                        disabled={refreshingCredits || checkinAllRunning || editionAccounts.length === 0}
                         onClick={() => void onRefreshCredits()}
-                        aria-label="签到并刷新全部账号积分"
+                        aria-label={editionTab === "international" ? "刷新国际版账号积分" : "签到并刷新全部账号积分"}
                       >
                         <RefreshCw className={refreshingCredits || checkinAllRunning ? "animate-spin" : undefined} />
                       </Button>
                     </DemoAction>
                   </span>
                 </TooltipTrigger>
-                <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : "签到并刷新全部账号积分"}</TooltipContent>
+                <TooltipContent side="top">
+                  {api.isDemoMode()
+                    ? "演示模式下不可操作"
+                    : editionTab === "international"
+                      ? "国际版无签到接口，此处只刷新积分"
+                      : "签到并刷新全部账号积分"}
+                </TooltipContent>
               </Tooltip>
             </div>
           </TooltipProvider>
         </div>
+        {/* 国际版能力说明：这些限制在后端也有对应的档位门控 */}
+        {editionTab === "international" && accounts.length > 0 && (
+          <p className="mb-3 rounded-lg border border-border bg-muted/30 px-3.5 py-2.5 text-xs leading-5 text-muted-foreground">
+            国际版（WorkBuddy AI）使用独立的认证文件与进程，切换只影响该版本。
+            该档位<span className="font-medium text-foreground">暂不支持</span>每日签到、成长中心（派猫猫）与会话复制/共享；积分与 Token 刷新走
+            <code className="mx-1 rounded bg-background px-1">www.workbuddy.ai</code>。
+          </p>
+        )}
         {loading && accounts.length === 0 ? (
           <div className="flex items-center gap-2 py-16 text-sm text-muted-foreground">
             <Loader2 className="animate-spin" />
             加载账号…
           </div>
-        ) : accounts.length === 0 ? (
+        ) : editionAccounts.length === 0 ? (
           <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-            暂无账号。点击上方按钮导入本机账号或扫码登录。
+            {accounts.length === 0
+              ? "暂无账号。点击上方按钮导入本机账号或扫码登录。"
+              : `暂无${editionLabel(editionTab)}账号。切换上方版本标签查看另一版本，或点击「导入${editionLabel(editionTab)}账号」/「OAuth 扫码添加」。`}
           </div>
         ) : (
           <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
@@ -857,7 +962,7 @@ export default function AccountsPage() {
         )}
       </section>
 
-      <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} />
+      <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} edition={editionTab} />
       <ExportAccountsDialog
         open={exportOpen}
         onOpenChange={setExportOpen}

@@ -16,7 +16,23 @@ use crate::modules::config::{
     add_checkin_log, http_request, load_checkin_config, load_checkin_logs, now_ms, RunFlagGuard,
     CHECKIN_API_PREFIX, WORKBUDDY_API_ENDPOINT,
 };
+use crate::modules::edition::edition_of;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
+
+/// 该账号所在档位是否支持每日签到。**国际版没有签到接口**。
+///
+/// 对照上游 `changexbc/workbuddy-switch` 的 `WbVariant::supports_checkin`。
+pub fn checkin_supported(account: &Value) -> bool {
+    edition_of(account).supports_checkin()
+}
+
+/// 统一的「不支持」结果，供单账号与批量路径复用。
+pub(crate) fn unsupported_checkin_result(account: &Value) -> Value {
+    json!({
+        "result": "unsupported",
+        "error": format!("{}暂不支持签到", edition_of(account).label()),
+    })
+}
 
 static CHECKIN_RUNNING: AtomicBool = AtomicBool::new(false);
 static CHECKIN_ACCOUNTS_RUNNING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -108,6 +124,14 @@ async fn checkin_request(path: &str, account: &Value) -> Value {
 
 /// 查询签到状态：新接口 checkin-activity-status，失败回退 checkin-status。
 pub async fn get_checkin_status(account: &Value) -> Value {
+    if !checkin_supported(account) {
+        return json!({
+            "ok": false,
+            "todayCheckedIn": false,
+            "unsupported": true,
+            "error": format!("{}暂不支持签到", edition_of(account).label()),
+        });
+    }
     let resp = checkin_request(
         &format!("{CHECKIN_API_PREFIX}/checkin-activity-status"),
         account,
@@ -186,6 +210,10 @@ fn decide_from_status(status: &Value) -> StatusDecision {
 
 /// 对单个账号执行完整签到流程：惰性刷新 → 查状态 → 未签到时提交 → 写提交日志。
 pub async fn checkin_account(account: &Value) -> Value {
+    // 国际版没有签到接口，直接短路，避免拿错域名去打请求
+    if !checkin_supported(account) {
+        return unsupported_checkin_result(account);
+    }
     let Some(_account_guard) = AccountRunGuard::try_acquire(account) else {
         return json!({"result": "error", "error": "该账号正在签到，请稍后再试"});
     };
@@ -279,15 +307,17 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
 /// True when every stored account has a today's log of `success` or `already`.
 ///
 /// Empty account list is false so the tray keeps offering 一键签到.
+/// 不支持签到的档位（国际版）不参与判定，否则托盘会永远停在「待签到」。
 pub fn all_accounts_checked_in_today() -> bool {
     accounts_checked_in_today(&load_accounts(), &load_checkin_logs(), &date_str(None))
 }
 
 pub fn accounts_checked_in_today(accounts: &[Value], logs: &[Value], today: &str) -> bool {
-    if accounts.is_empty() {
+    let checkable: Vec<&Value> = accounts.iter().filter(|a| checkin_supported(a)).collect();
+    if checkable.is_empty() {
         return false;
     }
-    accounts.iter().all(|account| {
+    checkable.iter().all(|account| {
         let Some(id) = account.get("id").and_then(Value::as_str) else {
             return false;
         };
@@ -361,6 +391,48 @@ mod tests {
         assert!(AccountRunGuard::try_acquire(&account).is_none());
         drop(first);
         assert!(AccountRunGuard::try_acquire(&account).is_some());
+    }
+
+    #[test]
+    fn only_domestic_accounts_support_checkin() {
+        assert!(checkin_supported(&json!({"id": "a", "edition": "domestic"})));
+        assert!(checkin_supported(&json!({"id": "a"})));
+        assert!(checkin_supported(&json!({"id": "a", "domain": "www.codebuddy.cn"})));
+        assert!(!checkin_supported(&json!({"id": "a", "edition": "international"})));
+        // 无显式档位时按域名后缀兜底
+        assert!(!checkin_supported(&json!({"id": "a", "domain": "www.workbuddy.ai"})));
+    }
+
+    #[test]
+    fn international_accounts_are_ignored_by_daily_completion_check() {
+        let today = "2026-09-24";
+        let accounts = vec![
+            json!({"id": "cn", "edition": "domestic"}),
+            json!({"id": "ai", "edition": "international"}),
+        ];
+        let logs = vec![json!({"accountId": "cn", "result": "success", "ts": 0})];
+        // 国际版不参与判定：国内版签了就算全部完成
+        let logs_with_today = vec![json!({
+            "accountId": "cn",
+            "result": "success",
+            "ts": date_ts_for(today),
+        })];
+        assert!(accounts_checked_in_today(&accounts, &logs_with_today, today));
+        assert!(!accounts_checked_in_today(&accounts, &logs, today));
+        // 只有国际版账号时视为「无可签」→ false，托盘保留一键签到入口
+        let only_ai = vec![json!({"id": "ai", "edition": "international"})];
+        assert!(!accounts_checked_in_today(&only_ai, &logs_with_today, today));
+    }
+
+    /// 指定日期当天中午的毫秒时间戳，用于构造「今天」的签到日志。
+    fn date_ts_for(day: &str) -> i64 {
+        let date = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").expect("valid date");
+        date.and_hms_opt(12, 0, 0)
+            .expect("valid time")
+            .and_local_timezone(Local)
+            .single()
+            .expect("local time")
+            .timestamp_millis()
     }
 
     #[tokio::test]

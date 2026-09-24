@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::account::{load_accounts, upsert_account};
-use super::config::{home_dir, now_ms, WORKBUDDY_API_ENDPOINT};
+use super::config::{home_dir, now_ms};
+use super::edition::edition_of;
 use super::refresh::refresh_account_token;
 
 const CONFIG_FILE: &str = "proxy.json";
@@ -204,12 +205,20 @@ async fn take_account(pool: &Pool, _cfg: &ProxyConfig) -> Option<Value> {
 
 // ---------------------------------------------------------------- 上游
 
-fn chat_url() -> String {
-    format!("{WORKBUDDY_API_ENDPOINT}/v2/chat/completions")
+fn chat_url(acc: &Value) -> String {
+    format!("{}/v2/chat/completions", upstream_endpoint(acc))
 }
 
-fn models_url() -> String {
-    format!("{WORKBUDDY_API_ENDPOINT}/v2/enterprises/personal/models")
+fn models_url(acc: &Value) -> String {
+    format!("{}/v2/enterprises/personal/models", upstream_endpoint(acc))
+}
+
+/// 该账号所在档位的上游基址。
+///
+/// **国际版必须用 `https://www.workbuddy.ai`**——把国际版 token 发到
+/// `codebuddy.cn` 会被网关拒掉。对照上游 `WbVariant::api_endpoint`。
+fn upstream_endpoint(acc: &Value) -> &'static str {
+    edition_of(acc).api_endpoint()
 }
 
 fn hex_id() -> String {
@@ -233,8 +242,9 @@ fn chat_headers(acc: &Value) -> HashMap<String, String> {
         "application/json, text/event-stream".into(),
     );
     h.insert("X-Requested-With".into(), "XMLHttpRequest".into());
-    h.insert("Origin".into(), WORKBUDDY_API_ENDPOINT.into());
-    h.insert("Referer".into(), format!("{WORKBUDDY_API_ENDPOINT}/"));
+    let endpoint = upstream_endpoint(acc);
+    h.insert("Origin".into(), endpoint.into());
+    h.insert("Referer".into(), format!("{endpoint}/"));
     h.insert(
         "User-Agent".into(),
         format!(
@@ -369,7 +379,7 @@ async fn list_models(State(st): State<AppState>) -> Response {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let mut req = client.get(models_url());
+    let mut req = client.get(models_url(&acc));
     for (k, v) in chat_headers(&acc) {
         req = req.header(k, v);
     }
@@ -950,7 +960,7 @@ async fn chat_completions(
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let mut req = client.post(chat_url());
+    let mut req = client.post(chat_url(&acc));
     for (k, v) in chat_headers(&acc) {
         req = req.header(k, v);
     }

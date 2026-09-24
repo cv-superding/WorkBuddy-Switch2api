@@ -16,6 +16,7 @@ use crate::modules::config::{
     save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX,
     WORKBUDDY_API_ENDPOINT,
 };
+use crate::modules::edition::edition_of;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
 static TRAVEL_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -358,8 +359,28 @@ fn classify_depart_error(_code: i64, message: &str) -> DepartClass {
     }
 }
 
+/// 该账号所在档位是否支持成长中心（派猫猫旅行）。**仅国内版有**。
+///
+/// 对照上游 `changexbc/workbuddy-switch` 的 `WbVariant::supports_travel`。
+pub fn travel_supported(account: &Value) -> bool {
+    edition_of(account).supports_travel()
+}
+
 /// 对单个账号执行派猫猫旅行：依次尝试地点列表，报错分类处理。
 pub async fn depart_travel_for_account(account: &Value) -> Value {
+    // 国际版没有成长中心接口，直接短路，避免拿错域名去打请求
+    if !travel_supported(account) {
+        let uid = account.get("uid").and_then(Value::as_str);
+        return depart_result(
+            account,
+            uid,
+            false,
+            false,
+            Some("unsupported"),
+            None,
+            "国际版暂不支持成长中心",
+        );
+    }
     let cfg = load_checkin_config();
     let acc = ensure_fresh_token(account.clone(), &cfg).await;
     let uid = acc.get("uid").and_then(Value::as_str).map(String::from);
@@ -736,6 +757,19 @@ async fn apply_claim_response(account: &Value, result: &mut Value, record_id: i6
 }
 
 async fn sync_account_for_dispatch(account: &Value, prior: Option<&Value>) -> Value {
+    // 国际版无成长中心；这里是派发/领取/对账三条链路的共同入口
+    if !travel_supported(account) {
+        let uid = account.get("uid").and_then(Value::as_str);
+        return depart_result(
+            account,
+            uid,
+            false,
+            false,
+            Some("unsupported"),
+            None,
+            "国际版暂不支持成长中心",
+        );
+    }
     let cfg = load_checkin_config();
     let acc = ensure_fresh_token(account.clone(), &cfg).await;
     let uid = acc.get("uid").and_then(Value::as_str).map(String::from);
@@ -924,6 +958,19 @@ fn display_record(label: &str, result: &Value) -> Value {
         "locationName": nonempty_str(result.get("locationName").unwrap_or(&Value::Null))
             .map(str::to_string),
         "arriveAt": if arrive_at > 0 { json!(arrive_at) } else { Value::Null },
+        // 档位是否支持成长中心；前端据此隐藏旅行标签
+        "supported": true,
+    })
+}
+
+/// 该档位不支持成长中心时的展示值（前端据此隐藏旅行相关 UI）。
+fn unsupported_display_record() -> Value {
+    json!({
+        "label": "untraveled",
+        "rewardCredit": Value::Null,
+        "locationName": Value::Null,
+        "arriveAt": Value::Null,
+        "supported": false,
     })
 }
 
@@ -991,6 +1038,15 @@ pub async fn reconcile_due_travel(account_id: Option<&str>) {
 /// label 取值：`untraveled`（未旅行）、`no-buddy`、`traveling`（旅行中）、
 /// `finished`（已结束，含官网「累了，明天再来吧」）。跨日未领的 traveling/arrived 仍显示旅行中。
 pub fn travel_display(account_id: &str) -> Value {
+    // 国际版无成长中心：直接返回 supported=false，前端隐藏旅行标签
+    let account = load_accounts()
+        .into_iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(account_id));
+    if let Some(acc) = account {
+        if !travel_supported(&acc) {
+            return unsupported_display_record();
+        }
+    }
     let today = today_str();
     let cache = load_travel_cache();
     let Some(r) = cache_results(&cache).and_then(|results| results.get(account_id)) else {

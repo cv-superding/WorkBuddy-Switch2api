@@ -12,16 +12,21 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
-import type { AccountMeta } from "@/lib/types";
+import { editionLabel, type AccountMeta } from "@/lib/types";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /**
+   * 目标档位：`"domestic"`（缺省）或 `"international"`。
+   * 两档位走不同域名与 `platform` 参数，登录态不通用。
+   */
+  edition?: string;
 }
 
 /** OAuth 扫码登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
-export function OAuthLoginDialog({ open, onOpenChange }: Props) {
+export function OAuthLoginDialog({ open, onOpenChange, edition = "domestic" }: Props) {
   const reconcileAccounts = useAccountsStore((s) => s.reconcileAccounts);
 
   const [busy, setBusy] = useState(false);
@@ -29,6 +34,8 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
   const [uri, setUri] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState<AccountMeta | null>(null);
+
+  const targetLabel = editionLabel(edition);
 
   // 打开时重置
   useEffect(() => {
@@ -78,7 +85,7 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
     setBusy(true);
     setError("");
     try {
-      const res = await api.oauthStart();
+      const res = await api.oauthStart(edition);
       setLoginId(res.loginId);
       setUri(res.verificationUri);
       // 按当前宿主能力打开验证页
@@ -94,16 +101,18 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>OAuth 扫码登录</DialogTitle>
+          <DialogTitle>OAuth 扫码登录 · {targetLabel}</DialogTitle>
           <DialogDescription>
             在浏览器中打开验证链接，扫码授权后将自动采集账号并入库。
+            当前档位为 <span className="font-medium text-foreground">{targetLabel}</span>，
+            登录态与另一个版本不通用。
           </DialogDescription>
         </DialogHeader>
 
         {!loginId && !result && (
           <div className="space-y-3">
             <Button onClick={start} disabled={busy} className="w-full">
-              {busy ? "正在发起登录…" : "开始扫码登录"}
+              {busy ? "正在发起登录…" : `开始扫码登录（${targetLabel}）`}
             </Button>
           </div>
         )}

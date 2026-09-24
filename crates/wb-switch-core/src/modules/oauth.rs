@@ -1,20 +1,32 @@
 //! OAuth 扫码登录采集（复刻 cockpit 流程）。
 //!
 //! 对照 server.py `oauth_start` / `oauth_poll`。
+//!
+//! ## 档位（国内版 / 国际版）
+//!
+//! 两个版本的登录**走不同域名、不同 `platform` 参数**，必须按档位发起：
+//!
+//! | 项 | 国内版 | 国际版 |
+//! |---|---|---|
+//! | API 基址 | `https://www.codebuddy.cn` | `https://www.workbuddy.ai` |
+//! | `platform` 查询参数 | `workbuddy` | `workbuddy-ai` |
+//!
+//! 用错档位的参数会拿到不属于该档位的登录态。对照上游
+//! `changexbc/workbuddy-switch` 的 `WbVariant::api_endpoint` / `oauth_platform`。
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::account;
-use crate::modules::config::{
-    http_request, norm_ts, now_ms, now_secs, OAUTH_TIMEOUT_SECONDS, WORKBUDDY_API_ENDPOINT,
-    WORKBUDDY_API_PREFIX, WORKBUDDY_PLATFORM,
-};
+use crate::modules::config::{http_request, norm_ts, now_ms, now_secs, OAUTH_TIMEOUT_SECONDS};
+use crate::modules::edition::Edition;
 
 #[derive(Default)]
 struct OAuthInfo {
     state: String,
+    /// 发起本次登录用的档位；轮询必须沿用同一档位，否则域名/platform 对不上。
+    edition: Edition,
     expires_at: i64,
     done: bool,
     result: Option<Value>,
@@ -27,11 +39,22 @@ fn oauth_states() -> &'static Mutex<HashMap<String, OAuthInfo>> {
     OAUTH_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 发起登录：向官方申请 state，返回 loginId / verificationUri / expiresIn。
+/// 发起登录（国内版）。保留旧签名，老调用点行为不变。
 pub async fn oauth_start() -> Result<Value, String> {
+    oauth_start_for(Edition::Domestic).await
+}
+
+/// 按档位发起登录：向官方申请 state，返回 loginId / verificationUri / expiresIn。
+///
+/// **国际版必须用 `platform=workbuddy-ai` + `www.workbuddy.ai`**，否则拿到的是
+/// 国内版登录态。
+pub async fn oauth_start_for(edition: Edition) -> Result<Value, String> {
     let login_id = format!("wb_{}", uuid::Uuid::new_v4().simple());
     let url = format!(
-        "{WORKBUDDY_API_ENDPOINT}{WORKBUDDY_API_PREFIX}/auth/state?platform={WORKBUDDY_PLATFORM}"
+        "{}{}/auth/state?platform={}",
+        edition.api_endpoint(),
+        edition.api_prefix(),
+        edition.oauth_platform()
     );
     let resp = http_request(&url, "POST", Some(json!({})), None).await;
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -54,13 +77,14 @@ pub async fn oauth_start() -> Result<Value, String> {
         .or_else(|| data.get("auth_url").and_then(|v| v.as_str()))
         .or_else(|| data.get("url").and_then(|v| v.as_str()))
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{WORKBUDDY_API_ENDPOINT}/login?state={state}"));
+        .unwrap_or_else(|| format!("{}/login?state={state}", edition.api_endpoint()));
 
     let mut map = oauth_states().lock().unwrap();
     map.insert(
         login_id.clone(),
         OAuthInfo {
             state,
+            edition,
             expires_at: now_secs() + OAUTH_TIMEOUT_SECONDS,
             ..Default::default()
         },
@@ -71,12 +95,13 @@ pub async fn oauth_start() -> Result<Value, String> {
         "loginId": login_id,
         "verificationUri": auth_url,
         "expiresIn": OAUTH_TIMEOUT_SECONDS,
+        "edition": edition.key(),
     }))
 }
 
 /// 轮询一次官方 token 接口。成功则拉取账号信息并入库。
 pub async fn oauth_poll(login_id: &str) -> Value {
-    let state = {
+    let (state, endpoint) = {
         let mut map = oauth_states().lock().unwrap();
         let Some(info) = map.get_mut(login_id) else {
             return json!({"done": true, "error": "登录请求不存在"});
@@ -89,10 +114,14 @@ pub async fn oauth_poll(login_id: &str) -> Value {
             info.error = Some("登录超时".to_string());
             return json!({"done": true, "error": "登录超时"});
         }
-        info.state.clone()
+        // 轮询必须沿用发起时那个档位，否则域名对不上
+        (info.state.clone(), info.edition)
     };
-
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{WORKBUDDY_API_PREFIX}/auth/token?state={state}");
+    let url = format!(
+        "{}{}/auth/token?state={state}",
+        endpoint.api_endpoint(),
+        endpoint.api_prefix()
+    );
     let resp = http_request(&url, "GET", None, None).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
@@ -109,9 +138,12 @@ pub async fn oauth_poll(login_id: &str) -> Value {
         return json!({"done": false});
     }
 
-    // 拉取账号信息
-    let account_url =
-        format!("{WORKBUDDY_API_ENDPOINT}{WORKBUDDY_API_PREFIX}/login/account?state={state}");
+    // 拉取账号信息（同一档位域名）
+    let account_url = format!(
+        "{}{}/login/account?state={state}",
+        endpoint.api_endpoint(),
+        endpoint.api_prefix()
+    );
     let mut headers = HashMap::new();
     headers.insert(
         "Authorization".to_string(),
@@ -170,6 +202,8 @@ pub async fn oauth_poll(login_id: &str) -> Value {
             .unwrap_or("Bearer")
             .to_string(),
         "domain": domain.to_string(),
+        // 标记来源档位：后续刷新/切换都据此选域名与认证文件
+        "edition": endpoint.key(),
         "expiresAt": expires_at,
         "refreshExpiresAt": refresh_expires_at,
         "auth_raw": data,

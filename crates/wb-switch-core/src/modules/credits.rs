@@ -15,6 +15,8 @@ use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
 const USER_RESOURCE_PATH: &str = "/v2/billing/meter/get-user-resource";
 const WORKBUDDY_WEB_ENDPOINT: &str = "https://www.workbuddy.cn";
+/// 国际版 origin。国际版 token 由该域名签发，billing 请求必须回这里。
+const WORKBUDDY_AI_ENDPOINT: &str = "https://www.workbuddy.ai";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
@@ -353,9 +355,20 @@ async fn post_with_account(account: &Value, url: &str, body: Value) -> Value {
     }
 }
 
-fn request_origin(url: &str) -> &'static str {
-    if url.starts_with(WORKBUDDY_WEB_ENDPOINT) {
+/// 账号的 `domain` 字段（小写、去空白）。
+fn domain_of(account: &Value) -> Option<String> {
+    account
+        .get("domain")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn request_origin(url: &str) -> &'static str {    if url.starts_with(WORKBUDDY_WEB_ENDPOINT) {
         WORKBUDDY_WEB_ENDPOINT
+    } else if url.starts_with(WORKBUDDY_AI_ENDPOINT) {
+        WORKBUDDY_AI_ENDPOINT
     } else {
         WORKBUDDY_API_ENDPOINT
     }
@@ -412,14 +425,10 @@ fn new_resource_endpoint(account: &Value) -> &'static str {
     // 官网脚本使用相对路径，实际请求的是当前登录 origin。账号库中的 CN
     // OAuth token 默认签发给 www.codebuddy.cn；若把它固定发往
     // www.workbuddy.cn，令牌域和 X-Domain 会不一致并被网关拒绝。
-    // 这里只在两个已知官方 origin 间选择，不允许账号数据拼出任意主机。
-    match account
-        .get("domain")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
+    // 这里只在几个已知官方 origin 间选择，不允许账号数据拼出任意主机。
+    match domain_of(account).as_deref() {
+        // 国际版：token 由 www.workbuddy.ai 签发，必须回同一个域名
+        Some(d) if d.ends_with(".workbuddy.ai") => WORKBUDDY_AI_ENDPOINT,
         Some("workbuddy.cn") | Some("www.workbuddy.cn") => WORKBUDDY_WEB_ENDPOINT,
         _ => WORKBUDDY_API_ENDPOINT,
     }
@@ -519,7 +528,8 @@ async fn fetch_legacy_user_resource(account: &Value) -> Value {
         "PackageEndTimeRangeBegin": begin,
         "PackageEndTimeRangeEnd": end,
     });
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{USER_RESOURCE_PATH}");
+    // 按账号档位选 origin：国内 codebuddy.cn / 国际 workbuddy.ai
+    let url = format!("{}{USER_RESOURCE_PATH}", new_resource_endpoint(account));
     // 新接口编排已经统一执行过惰性刷新，并在任一路未授权时只刷新一次。
     // 旧接口回退必须直接复用该账号，不能重新进入 authenticated_post，
     // 否则可能重复刷新并用旧 refresh token 覆盖刚落盘的新 token。

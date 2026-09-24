@@ -232,8 +232,15 @@ export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
   return call("delete_account", { accountId });
 }
 
-export function oauthStart(): Promise<OAuthStartResult> {
-  return call("oauth_start");
+/**
+ * 发起 OAuth 扫码登录。
+ *
+ * `edition` 缺省 = 国内版；`"international"` = 国际版。
+ * 两档位走不同域名与 `platform` 参数（`workbuddy` / `workbuddy-ai`），
+ * 用错档位会拿到不属于该版本的登录态，所以必须显式传。
+ */
+export function oauthStart(edition?: string): Promise<OAuthStartResult> {
+  return call("oauth_start", { edition });
 }
 
 export function oauthStatus(loginId: string): Promise<OAuthPollResult> {
