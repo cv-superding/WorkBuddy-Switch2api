@@ -117,10 +117,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setProgress("正在切换账号…");
     setError("");
     try {
+      // 国际版的会话复制/共享绑定国内版数据库，后端会跳过；前端也不传，避免误导。
+      const isIntl = account.edition === "international";
       const res = await api.switchAccount({
         accountId: account.id,
-        shareSessions,
-        copySessionIds: copySessions ? [...selected] : undefined,
+        edition: account.edition ?? "domestic",
+        shareSessions: isIntl ? false : shareSessions,
+        copySessionIds: isIntl ? undefined : copySessions ? [...selected] : undefined,
       });
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const parts: string[] = [];

@@ -31,7 +31,9 @@ import type {
   TravelConfig,
   TravelStatus,
   UpdateInfo,
+  EditionStatus,
 } from "./types";
+import { EDITIONS } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
 import { screenshotDemoResponse } from "./screenshot-demo";
 
@@ -90,6 +92,7 @@ const ROUTES: Record<string, Route> = {
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
+  get_editions: { method: "GET", path: "/api/editions" },
   export_accounts: { method: "POST", path: "/api/export-accounts" },
   export_accounts_to_path: { method: "POST", path: "/api/export-accounts-to-path" },
   preview_import_accounts: { method: "POST", path: "/api/import/preview" },
@@ -237,8 +240,34 @@ export function oauthStatus(loginId: string): Promise<OAuthPollResult> {
   return call("oauth_status", { loginId });
 }
 
-export function importLocal(): Promise<{ ok: boolean; account: AccountMeta }> {
-  return call("import_local");
+/**
+ * 导入本机当前账号。
+ *
+ * `edition` 缺省/`"domestic"` = 从国内版 `workbuddy-desktop.info` 导入；
+ * `"international"` = 从国际版 `workbuddy-desktop-ai.info` 导入。
+ */
+export function importLocal(
+  edition?: string,
+): Promise<{ ok: boolean; account: AccountMeta; edition?: string }> {
+  return call("import_local", { edition });
+}
+
+/** GET /api/editions —— 两个版本的客户端状态（是否安装 / 运行 / 已登录）。 */
+export function getEditions(): Promise<{ editions: EditionStatus[] }> {
+  return call("get_editions");
+}
+
+/** 同时尝试两个版本导入，返回成功的那些（某版本未登录就静默跳过）。 */
+export async function importLocalAllEditions(): Promise<AccountMeta[]> {
+  const results = await Promise.allSettled(
+    EDITIONS.map((e) => importLocal(e.value)),
+  );
+  return results
+    .filter(
+      (r): r is PromiseFulfilledResult<{ ok: boolean; account: AccountMeta }> =>
+        r.status === "fulfilled" && r.value?.account != null,
+    )
+    .map((r) => r.value.account);
 }
 
 export function exportAccounts(accountIds: string[]): Promise<{ ok: boolean; accounts: AccountRecord[] }> {
@@ -268,6 +297,8 @@ export function switchAccount(args: {
   restart?: boolean;
   shareSessions?: boolean;
   copySessionIds?: string[];
+  /** 目标客户端版本："domestic"（默认）/ "international"。 */
+  edition?: string;
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }

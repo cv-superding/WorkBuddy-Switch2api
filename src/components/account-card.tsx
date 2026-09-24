@@ -16,7 +16,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import { cn } from "@/lib/utils";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import { accountGroupLabel, type AccountMeta, type CreditExpiry, type CreditResource, type TravelStatus } from "@/lib/types";
+import { accountGroupLabel, isInternational, type AccountMeta, type CreditExpiry, type CreditResource, type TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -244,6 +244,11 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
 
   const statusChips = (
     <>
+      {isInternational(account) && (
+        <Badge variant="secondary" className={cn(chipClass, "bg-amber-100 text-amber-800")}>
+          国际版
+        </Badge>
+      )}
       {(account.group === "desktop" || account.group === "proxy") && (
         <Badge
           variant="secondary"

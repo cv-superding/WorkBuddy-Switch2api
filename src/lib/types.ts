@@ -14,6 +14,36 @@ export interface AccountMeta {
   needsReloginReason: string | null;
   /** 账号分组："desktop"=桌面端 / "proxy"=反代API / 缺失=未分组 */
   group?: string | null;
+  /** 客户端版本："domestic"=国内版（缺失时视为国内版）/ "international"=国际版 */
+  edition?: string | null;
+}
+
+/** 客户端版本的展示文案与进程名。 */
+export const EDITIONS = [
+  { value: "domestic", label: "国内版", processName: "WorkBuddy" },
+  { value: "international", label: "国际版", processName: "WorkBuddyAI" },
+] as const;
+
+export function editionLabel(edition?: string | null): string {
+  return edition === "international" ? "国际版" : "国内版";
+}
+
+/** 是否国际版（国内版是默认值，字段缺失也算国内版）。 */
+export function isInternational(acc: { edition?: string | null }): boolean {
+  return acc.edition === "international";
+}
+
+/** GET /api/editions —— 两个版本的客户端状态。 */
+export interface EditionStatus {
+  key: string;
+  label: string;
+  processName: string;
+  authFile: string;
+  authFileExists: boolean;
+  installed: boolean;
+  running: boolean;
+  currentUid: string | null;
+  snapshotExists: boolean;
 }
 
 /** 账号分组的合法取值与展示文案。 */

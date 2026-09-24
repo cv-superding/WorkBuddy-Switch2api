@@ -111,9 +111,13 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   },
 
   async importLocal() {
-    const res = await api.importLocal();
+    // 同时扫国内版与国际版：装了哪个客户端就导哪个，都没登录才报错。
+    const imported = await api.importLocalAllEditions();
+    if (!imported.length) {
+      throw new Error("未读到本机任一版本的登录信息（国内版 / 国际版都未登录或未安装）");
+    }
     await get().reconcileAccounts();
-    return res.account;
+    return imported[0];
   },
 
   async reconcileAccounts() {
