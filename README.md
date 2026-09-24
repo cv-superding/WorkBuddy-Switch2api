@@ -9,6 +9,11 @@
   WorkBuddy / CodeBuddy 多账号切换 + 本地 OpenAI 兼容反代
 </p>
 
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest"><img src="https://img.shields.io/github/v/release/cv-superding/WorkBuddy-Switch2api?label=release" alt="Latest release" /></a>
+</p>
+
 WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），并在同一个进程里内置了一个
 OpenAI 兼容的本地网关：多账号池轮转、按分组挑选出站账号、请求用量一目了然。
 
@@ -203,7 +208,7 @@ Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、
 
 ## 致谢
 
-本项目基于以下开源工作：
+本项目基于以下开源工作（完整的第三方声明见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)）：
 
 - **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)** —— 账号切换、积分与 Token 统计、
   自动签到、自动轮换等绝大部分功能的作者。本仓库在此之上做了改造与扩展（API 反代、账号分组、反代用量统计、
@@ -229,4 +234,8 @@ Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、
 
 ## 许可
 
-[MIT](./LICENSE)
+[MIT](./LICENSE) © 2026 wb-switch / cv-superding
+
+第三方声明（上游与参考项目的版权归属）见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
+
+本仓库与腾讯（WorkBuddy / CodeBuddy）官方无关，仅为本地账号管理与自用网关工具。

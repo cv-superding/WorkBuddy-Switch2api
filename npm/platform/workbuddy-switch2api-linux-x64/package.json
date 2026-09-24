@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch2api-linux-x64",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "workbuddy-switch2api platform binary (linux-x64)",
   "os": [
     "linux"

@@ -1,17 +1,7 @@
 MIT License
 
 Copyright (c) 2026 wb-switch
-Modifications Copyright (c) 2026 cv-superding
-
-Third-party notices
--------------------
-
-本项目的部分实现参考了以下 MIT 许可的开源项目，其版权声明与许可条款一并适用：
-
-- changexbc/workbuddy-switch  (https://github.com/changexbc/workbuddy-switch)
-- Harvey-Will/workbuddy-tools (https://github.com/Harvey-Will/workbuddy-tools)
-  —— 国内版 / 国际版的数据目录划分与客户端 account-snapshot.json 切换机制参考其
-  core/editions.py 与 core/accounts.py，相关代码为独立重写。
+Copyright (c) 2026 cv-superding
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

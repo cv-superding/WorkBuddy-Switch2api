@@ -60,4 +60,6 @@ webui 界面与桌面 App 一致：账号管理、切换、会话复制、自动
 
 ## 许可
 
-[MIT](./LICENSE)
+[MIT](https://github.com/cv-superding/WorkBuddy-Switch2api/blob/main/LICENSE) © 2026 wb-switch / cv-superding
+
+第三方声明见 [THIRD-PARTY-NOTICES.md](https://github.com/cv-superding/WorkBuddy-Switch2api/blob/main/THIRD-PARTY-NOTICES.md)。
