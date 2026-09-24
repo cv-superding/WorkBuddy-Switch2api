@@ -3,24 +3,26 @@
 //! 对照 server.py `auth_file_path` / `workbuddy_app_path` / `read_auth_file` /
 //! `import_from_auth_file`。切换写入（build_account_obj / build_auth_obj /
 //! write_account_to_auth_file）在阶段 2 随 switch.rs 落地。
+//!
+//! **版本支持（2026-09-24 加）**：国内版文件是同目录下的 `workbuddy-desktop.info`，
+//! 国际版是 `workbuddy-desktop-ai.info`。所有 `*_for(Edition)` 函数按版本选文件名；
+//! 不带 `_for` 的旧函数等价于国内版，保持调用点不变。
 
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
 use crate::modules::account::get_str;
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
+use crate::modules::edition::{edition_of, Edition};
 
-/// WorkBuddy 官方认证文件路径（与 cockpit 一致）。
+/// 国内版认证文件路径（等价于 `auth_file_path_for(Edition::Domestic)`）。
 pub fn auth_file_path() -> PathBuf {
-    let home = crate::modules::config::home_dir();
-    #[cfg(target_os = "macos")]
-    return home.join(
-        "Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info",
-    );
-    #[cfg(target_os = "windows")]
-    return home.join("AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return home.join(".local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info");
+    auth_file_path_for(Edition::Domestic)
+}
+
+/// 指定版本的官方认证文件路径。
+pub fn auth_file_path_for(edition: Edition) -> PathBuf {
+    edition.auth_file_path()
 }
 
 /// WorkBuddy 应用路径。
@@ -48,7 +50,12 @@ pub fn workbuddy_app_path() -> PathBuf {
 
 /// 读取认证文件 JSON；不存在或解析失败返回 None。
 pub fn read_auth_file() -> Option<Value> {
-    let path = auth_file_path();
+    read_auth_file_for(Edition::Domestic)
+}
+
+/// 读取指定版本的认证文件 JSON。
+pub fn read_auth_file_for(edition: Edition) -> Option<Value> {
+    let path = auth_file_path_for(edition);
     if !path.exists() {
         return None;
     }
@@ -58,14 +65,19 @@ pub fn read_auth_file() -> Option<Value> {
 
 /// 切换前备份当前认证文件，返回备份路径。对照 server.py `backup_auth_file`。
 pub fn backup_auth_file() -> Option<PathBuf> {
-    let path = auth_file_path();
+    backup_auth_file_for(Edition::Domestic)
+}
+
+/// 备份指定版本的认证文件。备份名带版本前缀，两个版本互不覆盖。
+pub fn backup_auth_file_for(edition: Edition) -> Option<PathBuf> {
+    let path = auth_file_path_for(edition);
     if !path.exists() {
         return None;
     }
     let dir = backup_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let ts = utc_iso();
-    let dest = dir.join(format!("workbuddy-desktop.{ts}.info"));
+    let dest = dir.join(format!("{}.{ts}.info", edition.backup_prefix()));
     std::fs::copy(&path, &dest).ok()?;
     Some(dest)
 }
@@ -139,10 +151,12 @@ pub fn build_auth_obj(acc: &Value) -> Value {
         get_str(acc, "refresh_token").unwrap_or_default().into(),
     );
     obj.insert("tokenType".to_string(), token_type.into());
-    obj.insert(
-        "domain".to_string(),
-        get_str(acc, "domain").unwrap_or_default().into(),
-    );
+    // domain 决定客户端连哪个后端（国内 www.codebuddy.cn / 国际 www.workbuddy.ai）。
+    // 账号记录里缺 domain 时按版本兜底，避免写出空域名把客户端指到错误后端。
+    let domain = get_str(acc, "domain")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| edition_of(acc).api_domain().to_string());
+    obj.insert("domain".to_string(), domain.into());
     obj.insert("lastRefreshTime".to_string(), json!(now));
     setdefault(
         &mut obj,
@@ -178,12 +192,20 @@ pub fn build_auth_obj(acc: &Value) -> Value {
 
 /// 把账号写入官方认证文件（原子写 + 写后校验）。对照 server.py `write_account_to_auth_file`。
 pub fn write_account_to_auth_file(acc: &Value) -> Result<(), String> {
-    let path = auth_file_path();
+    write_account_to_auth_file_for(Edition::Domestic, acc)
+}
+
+/// 把账号写入指定版本的认证文件。
+///
+/// 两个版本的 `auth.domain` 不同（`www.codebuddy.cn` / `www.workbuddy.ai`），
+/// 由 `build_auth_obj` 按账号自身的 `edition` 决定；这里只负责选对文件。
+pub fn write_account_to_auth_file_for(edition: Edition, acc: &Value) -> Result<(), String> {
+    let path = auth_file_path_for(edition);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let existing = read_auth_file().unwrap_or_else(|| json!({}));
+    let existing = read_auth_file_for(edition).unwrap_or_else(|| json!({}));
     eprintln!(
         "[auth] write_account: existing is_object={} allAccounts_len={}",
         existing.is_object(),
@@ -263,7 +285,66 @@ fn setdefault(map: &mut Map<String, Value>, key: &str, value: Value) {
 
 /// 从当前 WorkBuddy 登录态导入账号。对照 server.py `import_from_auth_file`。
 pub fn import_from_auth_file() -> Option<Value> {
-    imported_account_from_root(read_auth_file()?)
+    import_from_auth_file_for(Edition::Domestic)
+}
+
+/// 从指定版本的登录态导入账号，并在记录上打 `edition` 标记。
+pub fn import_from_auth_file_for(edition: Edition) -> Option<Value> {
+    let mut acc = imported_account_from_root(read_auth_file_for(edition)?)?;
+    acc["edition"] = json!(edition.key());
+    Some(acc)
+}
+
+/// 更新客户端自己记的「当前账号」快照（`<数据目录>/storage/skeleton/account-snapshot.json`）。
+///
+/// 机制移植自 <https://github.com/Harvey-Will/workbuddy-tools>（MIT License，
+/// Copyright (c) Harvey-Will）的 `core/accounts.py::switch_account`：
+/// 只改 `primary.{uid,nickname,savedAt}`，写前备份、原子写。
+///
+/// ⚠️ 本机实测：**国际版有该文件，国内版当前版本没有**（`~/.workbuddy` 下连
+/// `storage/` 目录都不存在）。文件不存在时返回 `Ok(false)` 且**不创建**，
+/// 避免给国内版凭空造一个客户端不认识的文件。
+///
+/// 返回 `Ok(true)` 表示确实改写了。
+pub fn write_account_snapshot(edition: Edition, uid: &str, nickname: &str) -> Result<bool, String> {
+    let path = edition.account_snapshot_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut data: Value = serde_json::from_str(&text).map_err(|e| {
+        format!("account-snapshot.json 无法解析，已中止以保护原文件: {e}")
+    })?;
+    if !data.is_object() {
+        return Err("account-snapshot.json 结构异常，已中止".to_string());
+    }
+
+    let dir = backup_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let dest = dir.join(format!(
+        "account-snapshot.{}.{}.json",
+        edition.key(),
+        utc_iso()
+    ));
+    let _ = std::fs::copy(&path, &dest);
+
+    if !data.get("primary").map(Value::is_object).unwrap_or(false) {
+        data["primary"] = json!({});
+    }
+    if let Some(primary) = data.get_mut("primary").and_then(|v| v.as_object_mut()) {
+        primary.insert("uid".to_string(), json!(uid));
+        // 不把空昵称写进客户端，否则界面会显示空白账号名。
+        if !nickname.trim().is_empty() {
+            primary.insert("nickname".to_string(), json!(nickname.trim()));
+        }
+        primary.insert("savedAt".to_string(), json!(now_ms()));
+    } else {
+        return Err("account-snapshot.json primary 结构异常，已中止".to_string());
+    }
+
+    let content = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    atomic_write(&path, &content).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn imported_account_from_root(root: Value) -> Option<Value> {
