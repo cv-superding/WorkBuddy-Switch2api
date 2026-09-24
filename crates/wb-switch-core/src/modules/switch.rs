@@ -6,7 +6,11 @@
 //!
 //! **版本支持（2026-09-24）**：国内版走原有 `process.rs` 全链路；
 //! 国际版走 `client_ctl` 的简化流程（关/开 WorkBuddyAI + 写 `-ai.info` + 写客户端快照）。
-//! 国际版暂不支持会话复制/共享（那些逻辑绑定国内版数据库）。
+//!
+//! **会话复制 / 共享两个档位都支持**。早先以为国际版没有会话库所以跳过，那是照抄上游
+//! `variant.rs` 的结论，**本机实测是错的**：`~/.workbuddy-ai` 下有完整的
+//! `workbuddy.db`(sessions 表) + `projects/{workspace}/{cid}.jsonl` + `edge-sync-mapping-v3.db`。
+//! 现在改成按磁盘实况探测（`Edition::supports_session_sharing`），探测到才做、探测不到才跳过。
 
 use serde_json::{json, Value};
 
@@ -40,7 +44,9 @@ pub fn switch_account(
 
 /// 切换账号到指定版本的客户端。
 ///
-/// `copy_session_ids` 非空时按路径 B 复制勾选会话（仅国内版支持）。
+/// `copy_session_ids` 非空时按路径 B 复制勾选会话；`share_sessions` 为真时按路径 C
+/// 把会话归属清空。两者都**按目标档位操作该档位自己的会话库**，
+/// 且只在 `restart = true` 时执行（客户端运行中不宜写库）。
 pub fn switch_account_in_edition(
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
@@ -75,37 +81,44 @@ pub fn switch_account_in_edition(
     let mut copy_report: Option<Value> = None;
     let mut session_report: Option<Value> = None;
 
-    if edition == Edition::Domestic {
-        if restart {
+    // 会话能力按磁盘实况探测：两个档位现在都有会话库，但仍保留探测以便客户端改版后优雅降级
+    let session_capable = session::supports_session_sharing_for(edition);
+
+    if restart {
+        // 客户端运行中不宜写会话库，所以只在重启场景关闭进程
+        if edition == Edition::Domestic {
             progress("正在关闭 WorkBuddy…");
             close_workbuddy(20)?;
-            // 只有重启场景才做会话操作（数据库在运行中不宜写入）
-            if !copy_session_ids.is_empty() {
+        } else {
+            progress("正在关闭 WorkBuddyAI…");
+            client_ctl::close(edition, 20)?;
+        }
+        if !copy_session_ids.is_empty() {
+            if session_capable {
                 progress("正在复制会话到目标账号…");
-                copy_report = session::copy_sessions_for_switch(&acc, copy_session_ids);
+                copy_report =
+                    session::copy_sessions_for_switch_for(edition, &acc, copy_session_ids);
+            } else {
+                progress("该版本没有可用的会话库，已跳过会话复制");
             }
-            if share_sessions {
+        }
+        if share_sessions {
+            if session_capable {
                 // 路径 C：把 user_id 置空 → 任何账号登录都能看到同一份，不产生副本。
                 progress("正在把会话设为多账号共享…");
-                session_report = Some(match session::share_sessions_for_switch() {
-                    Ok(r) => r,
-                    Err(e) => json!({"error": e}),
-                });
-            }
-        }
-    } else {
-        // 国际版：会话库逻辑绑定国内版数据库，明确跳过而不是静默做错事。
-        if !copy_session_ids.is_empty() || share_sessions {
-            progress("国际版暂不支持会话复制/共享，已跳过");
-        }
-        if client_ctl::is_running(edition) {
-            if restart {
-                progress("正在关闭 WorkBuddyAI…");
-                client_ctl::close(edition, 20)?;
+                session_report = Some(
+                    match session::share_sessions_for_switch_for(edition) {
+                        Ok(r) => r,
+                        Err(e) => json!({"error": e}),
+                    },
+                );
             } else {
-                return Err("WorkBuddyAI 正在运行，请先完全退出后再切换".to_string());
+                progress("该版本没有可用的会话库，已跳过会话共享");
             }
         }
+    } else if edition == Edition::International && client_ctl::is_running(edition) {
+        // 不重启就没法安全改认证文件，国际版先要求用户手动退出
+        return Err("WorkBuddyAI 正在运行，请先完全退出后再切换".to_string());
     }
 
     progress("正在写入认证文件…");

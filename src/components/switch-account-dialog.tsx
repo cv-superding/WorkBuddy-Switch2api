@@ -72,8 +72,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       setExpanded(new Set());
       setError("");
       setLoadingSessions(true);
+      // 会话列表按目标账号的档位取：国际版有自己的 workbuddy.db，不能读国内版那份
       api
-        .listSessions()
+        .listSessions(account.edition ?? "domestic")
         .then((res) => {
           setSessions(res.sessions);
           setCurrentUid(res.current);
@@ -117,13 +118,12 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setProgress("正在切换账号…");
     setError("");
     try {
-      // 国际版的会话复制/共享绑定国内版数据库，后端会跳过；前端也不传，避免误导。
-      const isIntl = account.edition === "international";
+      // 国际版与国内版各有独立的会话库，两条路径都支持共享/复制
       const res = await api.switchAccount({
         accountId: account.id,
         edition: account.edition ?? "domestic",
-        shareSessions: isIntl ? false : shareSessions,
-        copySessionIds: isIntl ? undefined : copySessions ? [...selected] : undefined,
+        shareSessions,
+        copySessionIds: copySessions ? [...selected] : undefined,
       });
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const parts: string[] = [];
@@ -199,6 +199,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
 
   const copyCount = copySessions ? selected.size : 0;
   const needsPermission = error.includes("无权限");
+  const isIntlAccount = account?.edition === "international";
   const sessionsEmpty = !loadingSessions && sessions.length === 0;
   const copyHint = loadingSessions
     ? "正在加载会话…"
@@ -219,7 +220,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         <DialogHeader className="shrink-0">
           <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
           <DialogDescription>
-            切换会关闭并重启 WorkBuddy，认证文件将写入目标账号。
+            切换会关闭并重启 {isIntlAccount ? "WorkBuddy AI" : "WorkBuddy"}，认证文件将写入目标账号。
+            会话共享 / 复制作用于{isIntlAccount ? "国际版" : "国内版"}自己的会话库。
           </DialogDescription>
         </DialogHeader>
 

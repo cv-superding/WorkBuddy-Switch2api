@@ -7,8 +7,20 @@
 //! WorkBuddy 5.x 数据三件套（缺一不可）：
 //!   1) 正文：`~/.workbuddy/projects/{workspace}/{cid}.jsonl`（JSONL 含 sessionId 字段）
 //!   2) 元数据：`~/.workbuddy/workbuddy.db` sessions 表（id = conversation id = UUID）
-//!   3) 云端映射：`~/.workbuddy/edge-sync-mapping-v2.db` edge_sync_mapping
+//!   3) 云端映射：`~/.workbuddy/edge-sync-mapping.db` edge_sync_mapping
 //!      （session_id=conversation_id，msg_channel=convmsg:{uid} 决定云端归属）
+//!
+//! ## 档位（国内版 / 国际版）
+//!
+//! **两个档位都有完整的三件套**，只是落在各自的数据目录，且映射库文件名带版本后缀：
+//!
+//! | 项 | 国内版 | 国际版 |
+//! |---|---|---|
+//! | 元数据 | `~/.workbuddy/workbuddy.db` | `~/.workbuddy-ai/workbuddy.db` |
+//! | 正文 | `~/.workbuddy/projects/` | `~/.workbuddy-ai/projects/` |
+//! | 云端映射 | `edge-sync-mapping.db` | `edge-sync-mapping-v3.db` |
+//!
+//! 所以路径全部按 `Edition` 取，映射库走目录探测（见 `edge_sync_db_path_for`）。
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -16,7 +28,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::modules::auth_file;
-use crate::modules::config::{backup_dir, home_dir, now_ms, now_secs, utc_iso};
+use crate::modules::config::{backup_dir, now_ms, now_secs, utc_iso};
+use crate::modules::edition::Edition;
 
 /// 打开数据库并设置 busy_timeout（对照 Python `sqlite3.connect(timeout=5)`）。
 fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
@@ -29,23 +42,85 @@ fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
     Some(conn)
 }
 
+/// 会话元数据库路径（国内版；保留旧签名）。
 pub fn workbuddy_db_path() -> PathBuf {
-    home_dir().join(".workbuddy").join("workbuddy.db")
+    workbuddy_db_path_for(Edition::Domestic)
 }
 
-fn edge_sync_db_path() -> PathBuf {
-    home_dir()
-        .join(".workbuddy")
-        .join("edge-sync-mapping-v2.db")
+/// 指定档位的会话元数据库路径。
+pub fn workbuddy_db_path_for(edition: Edition) -> PathBuf {
+    edition.db_path()
 }
 
-/// 当前认证账号的 uid（认证文件 account.uid）。
+/// 云端映射库路径（国内版；保留旧签名）。
+pub fn edge_sync_db_path() -> PathBuf {
+    edge_sync_db_path_for(Edition::Domestic)
+}
+
+/// 指定档位的云端映射库路径。
+///
+/// ⚠️ 文件名带版本后缀且会随客户端升级变化（国内实测 `edge-sync-mapping.db`、
+/// 国际 `edge-sync-mapping-v3.db`），所以**扫描数据目录探测**：在名字匹配
+/// `edge-sync-mapping*.db` 且**确实含 `edge_sync_mapping` 表**的候选中，
+/// 取修改时间最新的一个。探测不到就回落到该档位默认名（文件不存在时
+/// 注册逻辑会静默跳过，不报错）。
+///
+/// 顺带修掉一个老 bug：之前硬编码 `-v2`，而实际的库叫 `edge-sync-mapping.db`，
+/// 导致 `register_edge_sync_mapping` 一直返回 false（云端归属从未写成功）。
+pub fn edge_sync_db_path_for(edition: Edition) -> PathBuf {
+    let dir = edition.data_dir();
+    let fallback = edition.edge_sync_db_path();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return fallback;
+    };
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // 只认主库，跳过 -wal / -shm
+        if !name.starts_with("edge-sync-mapping") || !name.ends_with(".db") {
+            continue;
+        }
+        if !path.is_file() || !has_edge_sync_table(&path) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p).unwrap_or(fallback)
+}
+
+fn has_edge_sync_table(path: &Path) -> bool {
+    let Some(conn) = open_db(path, true) else {
+        return false;
+    };
+    table_exists(&conn, "edge_sync_mapping")
+}
+
+/// 当前认证账号的 uid（国内版；保留旧签名）。
 pub fn current_user_uid() -> Option<String> {
-    let auth = auth_file::read_auth_file()?;
+    current_user_uid_for(Edition::Domestic)
+}
+
+/// 指定档位当前登录账号的 uid（认证文件 `account.uid`）。
+pub fn current_user_uid_for(edition: Edition) -> Option<String> {
+    let auth = auth_file::read_auth_file_for(edition)?;
     auth.get("account")
         .and_then(|a| a.get("uid"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// 该档位是否具备会话能力（按磁盘实况探测）。
+pub fn supports_session_sharing_for(edition: Edition) -> bool {
+    edition.supports_session_sharing()
 }
 
 fn table_exists(conn: &Connection, name: &str) -> bool {
@@ -91,16 +166,46 @@ fn is_claw_workspace(cwd: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("claw"))
 }
 
+/// 列出某账号未删除的会话（国内版；保留旧签名）。
+pub fn list_sessions_for_user(uid: &str) -> Value {
+    list_sessions_for_user_for(Edition::Domestic, uid)
+}
+
+/// 会话可见性条件 —— **必须与客户端完全一致**。
+///
+/// 两个客户端源码（`app.asar`）里都确认过：
+/// - 国际版 SQL 原文：`AND (user_id = ? OR user_id = '')`
+/// - 国内版注释原文：重建 projects 记录时 `userId` 设为空字符串，
+///   「上层 getSessions 通过 `user_id IS NULL OR user_id = ''` 条件保证这些记录对当前用户可见」
+///
+/// 🔴 走完「共享会话」（把 `user_id` 置空）之后，如果这里只按 `user_id = ?1` 查，
+/// 界面会显示"当前账号暂无会话" —— 客户端里明明看得到，我们却列不出来。
+/// 用 `?1` 占位符编号，调用方按顺序绑定 uid。
+const SQL_VISIBLE_TO_USER: &str = "(user_id = ?1 OR user_id = '' OR user_id IS NULL)";
+
+/// 定位「源会话」时的匹配条件（`?1` = 会话 id，`?2` = 源 uid）。
+///
+/// 与 [`SQL_VISIBLE_TO_USER`] 同理：已共享的会话 `user_id` 为空，
+/// 若按 `id = ?1 AND user_id = ?2` 精确匹配，会「找不到源行」而**静默不复制**。
+const SQL_SOURCE_MATCH: &str = "id = ?1 AND (user_id = ?2 OR user_id = '' OR user_id IS NULL)";
+
 /// 列出某账号未删除的会话（workbuddy.db sessions 表，db 为准）。
 ///
 /// `title` 为 WorkBuddy 侧栏同款展示名；`isPlayground` 对应侧栏「任务」，
 /// 其余按 `cwd` 最后一段归入「空间」。
-pub fn list_sessions_for_user(uid: &str) -> Value {
-    let db = workbuddy_db_path();
+///
+/// 过滤条件见 [`SQL_VISIBLE_TO_USER`]：**跟随客户端的可见性规则**，
+/// 而不是「只属于当前 uid」。
+pub fn list_sessions_for_user_for(edition: Edition, uid: &str) -> Value {
+    list_sessions_in(&workbuddy_db_path_for(edition), uid)
+}
+
+/// `list_sessions_for_user_for` 的实现（可传入 db 路径，便于单测）。
+fn list_sessions_in(db: &Path, uid: &str) -> Value {
     if !db.is_file() {
         return json!([]);
     }
-    let Some(conn) = open_db(&db, true) else {
+    let Some(conn) = open_db(db, true) else {
         return json!([]);
     };
     if !table_exists(&conn, "sessions") {
@@ -108,25 +213,13 @@ pub fn list_sessions_for_user(uid: &str) -> Value {
     }
     let has_custom = column_exists(&conn, "sessions", "custom_title");
     let has_playground = column_exists(&conn, "sessions", "is_playground");
-    let sql = match (has_custom, has_playground) {
-        (true, true) => {
-            "SELECT id, cwd, title, custom_title, updated_at, is_playground FROM sessions \
-             WHERE user_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC"
-        }
-        (true, false) => {
-            "SELECT id, cwd, title, custom_title, updated_at, 0 FROM sessions \
-             WHERE user_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC"
-        }
-        (false, true) => {
-            "SELECT id, cwd, title, NULL, updated_at, is_playground FROM sessions \
-             WHERE user_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC"
-        }
-        (false, false) => {
-            "SELECT id, cwd, title, NULL, updated_at, 0 FROM sessions \
-             WHERE user_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC"
-        }
-    };
-    let mut stmt = match conn.prepare(sql) {
+    let custom_col = if has_custom { "custom_title" } else { "NULL" };
+    let playground_col = if has_playground { "is_playground" } else { "0" };
+    let sql = format!(
+        "SELECT id, cwd, title, {custom_col}, updated_at, {playground_col} FROM sessions \
+         WHERE deleted_at IS NULL AND {SQL_VISIBLE_TO_USER} ORDER BY updated_at DESC"
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return json!([]),
     };
@@ -155,7 +248,8 @@ pub fn list_sessions_for_user(uid: &str) -> Value {
                 "title": session_display_title(title, custom_title),
                 "cwd": cwd,
                 "updatedAt": updated_at.unwrap_or(0),
-                "hasHistory": find_project_jsonl(&cid).is_some(),
+                // 正文目录固定在库文件同级（数据目录）下
+                "hasHistory": find_project_jsonl_in(data_dir_of(db), &cid).is_some(),
                 "isPlayground": is_playground.unwrap_or(0) != 0,
             }));
         }
@@ -163,9 +257,18 @@ pub fn list_sessions_for_user(uid: &str) -> Value {
     json!(sessions)
 }
 
-/// 在 `~/.workbuddy/projects/{workspace}/{cid}.jsonl` 定位会话正文。
-fn find_project_jsonl(cid: &str) -> Option<PathBuf> {
-    let projects = home_dir().join(".workbuddy").join("projects");
+/// 会话库所在的数据目录（`workbuddy.db` 的父目录）。
+fn data_dir_of(db: &Path) -> &Path {
+    db.parent().unwrap_or_else(|| Path::new("."))
+}
+
+/// 在指定档位的 `projects/{workspace}/{cid}.jsonl` 定位会话正文。
+fn find_project_jsonl_for(edition: Edition, cid: &str) -> Option<PathBuf> {
+    find_project_jsonl_in(&edition.projects_dir(), cid)
+}
+
+/// 在 `projects/{workspace}/{cid}.jsonl` 里定位会话正文（可传入目录，便于单测）。
+fn find_project_jsonl_in(projects: &Path, cid: &str) -> Option<PathBuf> {
     if !projects.is_dir() {
         return None;
     }
@@ -173,7 +276,7 @@ fn find_project_jsonl(cid: &str) -> Option<PathBuf> {
     if direct.is_file() {
         return Some(direct);
     }
-    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+    for entry in std::fs::read_dir(projects).ok()?.flatten() {
         if !entry.path().is_dir() {
             continue;
         }
@@ -185,9 +288,9 @@ fn find_project_jsonl(cid: &str) -> Option<PathBuf> {
     None
 }
 
-/// 备份 workbuddy.db（含 -wal/-shm），返回主库备份路径。对照 `backup_workbuddy_db`。
-fn backup_workbuddy_db(backup_root: &Path) -> Option<PathBuf> {
-    let db = workbuddy_db_path();
+/// 备份指定档位的 workbuddy.db（含 -wal/-shm），返回主库备份路径。
+fn backup_workbuddy_db_for(edition: Edition, backup_root: &Path) -> Option<PathBuf> {
+    let db = workbuddy_db_path_for(edition);
     if !db.is_file() {
         return None;
     }
@@ -201,22 +304,33 @@ fn backup_workbuddy_db(backup_root: &Path) -> Option<PathBuf> {
     Some(backup_root.join("workbuddy.db"))
 }
 
-/// 把 source_uid 的一个会话复制为 target_uid 的新会话（路径 B：生成新 id）。
-///
-/// 全部按「新 id」复制一份给目标账号，源账号数据完全不动。
-/// 新 id 必须用带连字符的 UUID 格式（`Uuid::new_v4().to_string()`），与官方一致；
-/// 32 位无连字符形式会导致 WorkBuddy 无法识别新会话。
+/// 把 source_uid 的一个会话复制为 target_uid 的新会话（国内版；保留旧签名）。
 pub fn copy_session_to_user(
     cid: &str,
     source_uid: &str,
     target_uid: &str,
 ) -> Result<Value, String> {
+    copy_session_to_user_for(Edition::Domestic, cid, source_uid, target_uid)
+}
+
+/// 把 source_uid 的一个会话复制为 target_uid 的新会话（路径 B：生成新 id）。
+///
+/// 全部按「新 id」复制一份给目标账号，源账号数据完全不动。
+/// 新 id 必须用带连字符的 UUID 格式（`Uuid::new_v4().to_string()`），与官方一致；
+/// 32 位无连字符形式会导致 WorkBuddy 无法识别新会话。
+pub fn copy_session_to_user_for(
+    edition: Edition,
+    cid: &str,
+    source_uid: &str,
+    target_uid: &str,
+) -> Result<Value, String> {
     let new_cid = uuid::Uuid::new_v4().to_string();
-    let db = workbuddy_db_path();
+    let db = workbuddy_db_path_for(edition);
     if let Some(conn) = open_db(&db, true) {
+        // 源会话可能是「已共享」的（user_id 为空），所以不能只按 user_id 精确匹配
         let cwd: Option<String> = conn
             .query_row(
-                "SELECT cwd FROM sessions WHERE id = ?1 AND user_id = ?2",
+                &format!("SELECT cwd FROM sessions WHERE {SQL_SOURCE_MATCH}"),
                 rusqlite::params![cid, source_uid],
                 |r| r.get(0),
             )
@@ -228,7 +342,7 @@ pub fn copy_session_to_user(
 
     // 1) 复制正文 jsonl：{projects}/{ws}/{cid}.jsonl → {projects}/{ws}/{new_cid}.jsonl
     let mut jsonl_copied = false;
-    if let Some(src_jsonl) = find_project_jsonl(cid) {
+    if let Some(src_jsonl) = find_project_jsonl_for(edition, cid) {
         let dst_jsonl = src_jsonl.with_file_name(format!("{new_cid}.jsonl"));
         if let Ok(text) = std::fs::read_to_string(&src_jsonl) {
             let text = text.replace(cid, &new_cid); // 替换 sessionId 等旧 id 引用
@@ -240,11 +354,11 @@ pub fn copy_session_to_user(
 
     // 2) 备份 db（复制前），再 INSERT 新 sessions 行
     let backup_root = backup_dir().join("sessions").join(utc_iso());
-    backup_workbuddy_db(&backup_root);
+    backup_workbuddy_db_for(edition, &backup_root);
     insert_session_copy(&db, &new_cid, cid, source_uid, target_uid)?;
 
     // 3) 注册云端映射：新会话归属目标账号（msg_channel=convmsg:{target_uid}）
-    let mapping_written = register_edge_sync_mapping(&new_cid, target_uid);
+    let mapping_written = register_edge_sync_mapping_for(edition, &new_cid, target_uid);
 
     Ok(json!({
         "id": cid,
@@ -275,7 +389,7 @@ fn insert_session_copy(
         return Ok(());
     }
     let mut src_stmt = conn
-        .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
+        .prepare(&format!("SELECT * FROM sessions WHERE {SQL_SOURCE_MATCH}"))
         .map_err(|e| e.to_string())?;
     let cols: Vec<String> = src_stmt
         .column_names()
@@ -320,8 +434,8 @@ fn insert_session_copy(
 }
 
 /// 把新会话注册进 edge_sync_mapping（云端归属关键）。失败不致命，返回 False。
-fn register_edge_sync_mapping(new_cid: &str, target_uid: &str) -> bool {
-    insert_edge_sync_mapping(&edge_sync_db_path(), new_cid, target_uid)
+fn register_edge_sync_mapping_for(edition: Edition, new_cid: &str, target_uid: &str) -> bool {
+    insert_edge_sync_mapping(&edge_sync_db_path_for(edition), new_cid, target_uid)
 }
 
 fn insert_edge_sync_mapping(db_path: &Path, new_cid: &str, target_uid: &str) -> bool {
@@ -351,8 +465,20 @@ fn insert_edge_sync_mapping(db_path: &Path, new_cid: &str, target_uid: &str) -> 
     }
 }
 
-/// 切换前把勾选的会话复制到目标账号（路径 B）。返回复制报告。
+/// 切换前把勾选的会话复制到目标账号（国内版；保留旧签名）。
 pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> Option<Value> {
+    copy_sessions_for_switch_for(Edition::Domestic, target_acc, session_ids)
+}
+
+/// 切换前把勾选的会话复制到目标账号（路径 B）。返回复制报告。
+///
+/// `edition` 决定读写哪个档位的会话库 —— 源 uid 也从**该档位的认证文件**读，
+/// 否则国际版会拿国内版的 uid 去匹配，永远找不到源会话。
+pub fn copy_sessions_for_switch_for(
+    edition: Edition,
+    target_acc: &Value,
+    session_ids: &[String],
+) -> Option<Value> {
     let target_uid = target_acc
         .get("uid")
         .and_then(|v| v.as_str())
@@ -361,7 +487,7 @@ pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> O
     if target_uid.is_empty() {
         return None;
     }
-    let source_uid = current_user_uid()?;
+    let source_uid = current_user_uid_for(edition)?;
     if source_uid == target_uid {
         return None;
     }
@@ -373,7 +499,7 @@ pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> O
     });
     let mut errors: Vec<Value> = Vec::new();
     for cid in session_ids {
-        match copy_session_to_user(cid, &source_uid, &target_uid) {
+        match copy_session_to_user_for(edition, cid, &source_uid, &target_uid) {
             Ok(r) => report["copied"].as_array_mut().unwrap().push(r),
             Err(e) => errors.push(json!({"id": cid, "error": e})),
         }
@@ -402,7 +528,12 @@ const SQL_IS_CLAW: &str = "(LOWER(cwd) LIKE '%\\claw' OR LOWER(cwd) LIKE '%/claw
 ///
 /// Claw 工作区绑定 IM 渠道账号，跳过不动。
 pub fn share_sessions_for_switch() -> Result<Value, String> {
-    share_sessions_in(&workbuddy_db_path())
+    share_sessions_for_switch_for(Edition::Domestic)
+}
+
+/// 指定档位的「多账号共享」（两个档位都有独立会话库，各自处理）。
+pub fn share_sessions_for_switch_for(edition: Edition) -> Result<Value, String> {
+    share_sessions_in(&workbuddy_db_path_for(edition))
 }
 
 /// `share_sessions_for_switch` 的实现（可传入 db 路径，便于单测）。
@@ -449,13 +580,67 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn db_paths_point_to_home() {
-        assert!(workbuddy_db_path()
-            .to_string_lossy()
-            .ends_with(".workbuddy/workbuddy.db"));
-        assert!(edge_sync_db_path()
-            .to_string_lossy()
-            .ends_with("edge-sync-mapping-v2.db"));
+    fn db_paths_are_resolved_per_edition() {
+        // 用 Path 比较而不是字符串后缀，避免 Windows 反斜杠导致误判
+        let cn = workbuddy_db_path_for(Edition::Domestic);
+        assert!(cn.starts_with(Edition::Domestic.data_dir()));
+        assert_eq!(cn.file_name().and_then(|s| s.to_str()), Some("workbuddy.db"));
+
+        let ai = workbuddy_db_path_for(Edition::International);
+        assert!(ai.starts_with(Edition::International.data_dir()));
+        assert_ne!(cn, ai, "两个档位的会话库不能是同一个文件");
+    }
+
+    #[test]
+    fn edge_sync_db_is_discovered_from_data_dir() {
+        // 探测到的路径必须落在该档位数据目录里，且文件名以 edge-sync-mapping 开头
+        for e in Edition::ALL {
+            let p = edge_sync_db_path_for(e);
+            assert!(
+                p.starts_with(e.data_dir()),
+                "{} 的映射库跑到了别的目录: {p:?}",
+                e.label()
+            );
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            assert!(name.starts_with("edge-sync-mapping"), "遇到非预期文件名 {name}");
+            assert!(name.ends_with(".db") && !name.ends_with("-wal") && !name.ends_with("-shm"));
+        }
+    }
+
+    #[test]
+    fn shared_sessions_are_listed_for_every_account() {
+        // 客户端侧栏条件是 `user_id = 我 OR user_id = '' OR user_id IS NULL`；
+        // 我们的列表必须一致，否则走完「共享会话」后界面会显示"当前账号暂无会话"。
+        let db = temp_db("list_shared");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, user_id TEXT, cwd TEXT, title TEXT,
+                created_at INTEGER, updated_at INTEGER, deleted_at INTEGER);
+             INSERT INTO sessions VALUES
+                ('s-shared', '',    'C:/proj/a', '共享会话',   1, 10, NULL),
+                ('s-mine',   'u-1', 'C:/proj/a', '我的会话',   1, 20, NULL),
+                ('s-other',  'u-2', 'C:/proj/b', '别人的会话', 1, 30, NULL),
+                ('s-null',   NULL,  'C:/proj/c', '空归属会话', 1, 35, NULL),
+                ('s-gone',   '',    'C:/proj/a', '已删会话',   1, 40, 99);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let listed = list_sessions_in(&db, "u-1");
+        let titles: Vec<String> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["title"].as_str().unwrap_or("").to_string())
+            .collect();
+        for expect in ["共享会话", "我的会话", "空归属会话"] {
+            assert!(titles.contains(&expect.to_string()), "{expect} 没被列出: {titles:?}");
+        }
+        assert!(!titles.contains(&"别人的会话".to_string()), "串了别人的会话: {titles:?}");
+        assert!(!titles.contains(&"已删会话".to_string()), "已删会话不该列出: {titles:?}");
+
+        let _ = std::fs::remove_file(&db);
     }
 
     fn temp_db(name: &str) -> PathBuf {

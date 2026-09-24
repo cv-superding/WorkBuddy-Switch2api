@@ -911,7 +911,8 @@ export default function AccountsPage() {
         {editionTab === "international" && accounts.length > 0 && (
           <p className="mb-3 rounded-lg border border-border bg-muted/30 px-3.5 py-2.5 text-xs leading-5 text-muted-foreground">
             国际版（WorkBuddy AI）使用独立的认证文件与进程，切换只影响该版本。
-            该档位<span className="font-medium text-foreground">暂不支持</span>每日签到、成长中心（派猫猫）与会话复制/共享；积分与 Token 刷新走
+            该档位<span className="font-medium text-foreground">暂不支持</span>每日签到与成长中心（派猫猫）。
+            会话共享 / 复制作用于国际版自己的会话库；积分与 Token 刷新走
             <code className="mx-1 rounded bg-background px-1">www.workbuddy.ai</code>。
           </p>
         )}

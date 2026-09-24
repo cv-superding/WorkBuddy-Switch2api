@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, client_ctl, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits,
-    edition::parse_lenient, export_import, oauth,
+    edition::{edition_of, parse_lenient}, export_import, oauth,
     process, proxy, refresh, rotate, session, switch, token_stats, travel, update,
 };
 
@@ -331,19 +331,26 @@ pub async fn switch_account(
     .map_err(|e| e.to_string())?
 }
 
-/// GET /api/sessions —— 当前账号的会话列表。
+/// GET /api/sessions —— 指定档位当前账号的会话列表。
+///
+/// `edition` 缺省 = 国内版。国际版有自己的 `workbuddy.db`，必须显式传，
+/// 否则会拿国内版的库和 uid 去查，列表永远是空的。
 #[tauri::command]
-pub fn list_sessions() -> Value {
-    match session::current_user_uid() {
+pub fn list_sessions(edition: Option<String>) -> Value {
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
+    match session::current_user_uid_for(edition) {
         Some(uid) => json!({
-            "sessions": session::list_sessions_for_user(&uid),
+            "sessions": session::list_sessions_for_user_for(edition, &uid),
             "current": uid,
+            "edition": edition.key(),
         }),
-        None => json!({"sessions": [], "current": Value::Null}),
+        None => json!({"sessions": [], "current": Value::Null, "edition": edition.key()}),
     }
 }
 
 /// POST /api/sessions/copy —— 把勾选会话复制到指定账号（路径 B）。
+///
+/// 档位取自**目标账号自身**的 `edition`，保证读写的是该档位的会话库。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn copy_sessions(
     target_account_id: String,
@@ -357,7 +364,9 @@ pub async fn copy_sessions(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
-        Ok(session::copy_sessions_for_switch(&target, &session_ids).unwrap_or_else(|| json!({})))
+        let edition = edition_of(&target);
+        Ok(session::copy_sessions_for_switch_for(edition, &target, &session_ids)
+            .unwrap_or_else(|| json!({})))
     })
     .await
     .map_err(|e| e.to_string())?

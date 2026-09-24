@@ -199,6 +199,49 @@ impl Edition {
             .join("account-snapshot.json")
     }
 
+    // ---------------------------------------------------------------- 会话三件套
+    //
+    // 🔴 **2026-09-24 修正**：上游 `variant.rs` 用「数据根有没有 `projects/`」做能力探测，
+    // 结论是国际版不支持会话复制。**本机实测这个结论是错的**：
+    // `~/.workbuddy-ai` 下有完整的 `workbuddy.db`(sessions 表) + `projects/{workspace}/{cid}.jsonl`
+    // + `edge-sync-mapping-v3.db`，与国内版结构一致（只是数据库文件名带版本后缀）。
+    // 所以这里改成**真正按路径探测**，而不是照抄上游的结论。
+
+    /// 会话元数据库（`workbuddy.db`，含 `sessions` 表）。
+    pub fn db_path(self) -> PathBuf {
+        self.data_dir().join("workbuddy.db")
+    }
+
+    /// 会话正文目录（`projects/{workspace}/{cid}.jsonl`）。
+    pub fn projects_dir(self) -> PathBuf {
+        self.data_dir().join("projects")
+    }
+
+    /// 云端映射库的**默认**文件名。
+    ///
+    /// ⚠️ 实测两个档位**文件名不同且带版本号**：国内 `edge-sync-mapping.db`、
+    /// 国际 `edge-sync-mapping-v3.db`。版本号会随客户端升级变化，所以运行期一律走
+    /// `session::resolve_edge_sync_db()` 的**目录探测**，这里只作为兜底默认值。
+    pub fn edge_sync_db_name(self) -> &'static str {
+        match self {
+            Edition::Domestic => "edge-sync-mapping.db",
+            Edition::International => "edge-sync-mapping-v3.db",
+        }
+    }
+
+    /// 兜底用的云端映射库路径（探测不到时才用；文件不存在会被调用方跳过）。
+    pub fn edge_sync_db_path(self) -> PathBuf {
+        self.data_dir().join(self.edge_sync_db_name())
+    }
+
+    /// 能力探测：该档位是否支持会话复制 / 共享。
+    ///
+    /// 判据是**磁盘实况**（`workbuddy.db` 与 `projects/` 都在），不依赖客户端品牌，
+    /// 版本升级后也不会误判。探测失败时调用方应跳过会话操作而不是报错。
+    pub fn supports_session_sharing(self) -> bool {
+        self.db_path().is_file() && self.projects_dir().is_dir()
+    }
+
     /// 客户端安装目录的候选父目录（供扫描 exe 用）。
     pub fn install_parent_dirs(self) -> Vec<PathBuf> {
         let mut out = Vec::new();
@@ -283,5 +326,41 @@ mod tests {
     fn edition_of_reads_json_field() {
         assert_eq!(edition_of(&serde_json::json!({"edition": "international"})), Edition::International);
         assert_eq!(edition_of(&serde_json::json!({})), Edition::Domestic);
+    }
+
+    #[test]
+    fn session_paths_are_per_edition() {
+        // 两个档位的会话库/正文目录/映射库都必须落在各自的数据目录下，不能串
+        let cn = Edition::Domestic;
+        let ai = Edition::International;
+        assert!(cn.db_path().to_string_lossy().contains(".workbuddy"));
+        assert!(ai.db_path().to_string_lossy().contains(".workbuddy-ai"));
+        assert_ne!(cn.db_path(), ai.db_path());
+        assert_ne!(cn.projects_dir(), ai.projects_dir());
+        assert_ne!(cn.edge_sync_db_name(), ai.edge_sync_db_name());
+    }
+
+    #[test]
+    fn edge_sync_db_names_match_measured_values() {
+        // 实测：国内 `edge-sync-mapping.db`（无版本后缀）、国际 `edge-sync-mapping-v3.db`
+        assert_eq!(Edition::Domestic.edge_sync_db_name(), "edge-sync-mapping.db");
+        assert_eq!(
+            Edition::International.edge_sync_db_name(),
+            "edge-sync-mapping-v3.db"
+        );
+    }
+
+    #[test]
+    fn session_sharing_capability_is_probed_from_disk_not_hardcoded() {
+        // 判据必须是「workbuddy.db 存在 && projects/ 存在」这条磁盘事实，
+        // 而不是写死的常量或客户端品牌 —— 这样版本升级后不会误判。
+        for e in Edition::ALL {
+            assert_eq!(
+                e.supports_session_sharing(),
+                e.db_path().is_file() && e.projects_dir().is_dir(),
+                "{} 的能力探测与磁盘实况不一致",
+                e.label()
+            );
+        }
     }
 }

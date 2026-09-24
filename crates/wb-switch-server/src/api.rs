@@ -393,13 +393,25 @@ async fn api_switch_progress() -> Response {
 // 会话
 // ---------------------------------------------------------------------------
 
-async fn api_sessions() -> Response {
-    match session::current_user_uid() {
+async fn api_sessions(RawQuery(query): RawQuery) -> Response {
+    // ?edition=international 走国际版会话库；缺省国内版
+    let edition = query
+        .as_deref()
+        .and_then(|q| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "edition")
+                .map(|(_, v)| v.to_string())
+        })
+        .map(|v| wb_switch_core::modules::edition::parse_lenient(&v))
+        .unwrap_or_default();
+    match session::current_user_uid_for(edition) {
         Some(uid) => json_ok(json!({
-            "sessions": session::list_sessions_for_user(&uid),
+            "sessions": session::list_sessions_for_user_for(edition, &uid),
             "current": uid,
+            "edition": edition.key(),
         })),
-        None => json_ok(json!({ "sessions": [], "current": null })),
+        None => json_ok(json!({ "sessions": [], "current": null, "edition": edition.key() })),
     }
 }
 
@@ -421,11 +433,14 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     let Some(target) = account::find_account(&target_account_id) else {
         return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
-    let source_uid = session::current_user_uid();
-    let result = session::copy_sessions_for_switch(&target, &session_ids);
+    // 档位取自目标账号自身，保证读写该档位的会话库
+    let edition = wb_switch_core::modules::edition::edition_of(&target);
+    let source_uid = session::current_user_uid_for(edition);
+    let result = session::copy_sessions_for_switch_for(edition, &target, &session_ids);
     json_ok(json!({
         "sourceUid": source_uid,
         "targetUid": target.get("uid"),
+        "edition": edition.key(),
         "copied": result,
     }))
 }

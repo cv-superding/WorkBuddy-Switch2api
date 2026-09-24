@@ -315,13 +315,21 @@ export function switchProgress(): Promise<{ running: boolean; progress: string |
   return call("switch_progress");
 }
 
-export function listSessions(): Promise<{
+/**
+ * 列出会话。
+ *
+ * `edition` 决定读哪个档位的会话库（缺省国内版）。国际版有自己的
+ * `~/.workbuddy-ai/workbuddy.db`，不传就会拿国内版的库去查，列表永远为空。
+ */
+export function listSessions(edition?: string): Promise<{
   sessions: Session[];
   current: string | null;
+  edition?: string;
 }> {
-  return call("list_sessions");
+  return call("list_sessions", { edition });
 }
 
+/** 把勾选会话复制到目标账号；档位由后端按目标账号自身的 edition 决定。 */
 export function copySessions(
   targetAccountId: string,
   sessionIds: string[],
