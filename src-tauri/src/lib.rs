@@ -127,6 +127,7 @@ pub fn run() {
             commands::oauth_start,
             commands::oauth_status,
             commands::import_local,
+            commands::get_editions,
             commands::export_accounts,
             commands::export_accounts_to_path,
             commands::preview_import_accounts,

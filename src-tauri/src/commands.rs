@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits, export_import, oauth,
+    account, auth_file, checkin, client_ctl, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits,
+    edition::parse_lenient, export_import, oauth,
     process, proxy, refresh, rotate, session, switch, token_stats, travel, update,
 };
 
@@ -163,9 +164,44 @@ pub async fn oauth_status(login_id: String) -> Value {
 }
 
 /// POST /api/import-local —— 导入本机当前账号。
+///
+/// `edition` 缺省 = 国内版；传 `international` 则从 `workbuddy-desktop-ai.info` 导入。
 #[tauri::command]
-pub fn import_local() -> Result<Value, String> {
-    account::import_local().map(|acc| json!({ "ok": true, "account": acc }))
+pub fn import_local(edition: Option<String>) -> Result<Value, String> {
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
+    account::import_local_for(edition)
+        .map(|acc| json!({ "ok": true, "account": acc, "edition": edition.key() }))
+}
+
+/// GET /api/editions —— 两个版本（国内版 / 国际版）的客户端状态。
+///
+/// 供前端版本切换器展示：是否安装、是否正在运行、认证文件是否存在、当前登录 uid。
+#[tauri::command]
+pub fn get_editions() -> Value {
+    let editions: Vec<Value> = wb_switch_core::modules::edition::Edition::ALL
+        .iter()
+        .map(|e| {
+            let auth = auth_file::read_auth_file_for(*e);
+            let current_uid = auth
+                .as_ref()
+                .and_then(|a| a.get("account"))
+                .and_then(|a| a.get("uid"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            json!({
+                "key": e.key(),
+                "label": e.label(),
+                "processName": e.process_name(),
+                "authFile": e.auth_file_path().to_string_lossy(),
+                "authFileExists": auth.is_some(),
+                "installed": client_ctl::find_client_exe(*e).is_some(),
+                "running": client_ctl::is_running(*e),
+                "currentUid": current_uid,
+                "snapshotExists": e.account_snapshot_path().exists(),
+            })
+        })
+        .collect();
+    json!({ "editions": editions })
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +300,7 @@ pub async fn switch_account(
     restart: Option<bool>,
     share_sessions: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
+    edition: Option<String>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -271,16 +308,19 @@ pub async fn switch_account(
     let restart = restart.unwrap_or(true);
     let share_sessions = share_sessions.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
+    // 缺省 = 国内版，老前端不传该字段时行为不变。
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
     let progress: switch::ProgressFn = Box::new(move |message| {
         let _ = app.emit("switch-progress", json!({ "message": message }));
     });
     tauri::async_runtime::spawn_blocking(move || {
-        switch::switch_account(
+        switch::switch_account_in_edition(
             Some(&progress),
             &account_id,
             restart,
             share_sessions,
             &copy_ids,
+            edition,
         )
     })
     .await

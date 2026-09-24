@@ -382,8 +382,13 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
 
 /// 导入本机当前账号（从认证文件读取）。
 pub fn import_local() -> Result<Value, String> {
-    let acc = crate::modules::auth_file::import_from_auth_file()
-        .ok_or("未读取到本地 WorkBuddy 登录信息")?;
+    import_local_for(crate::modules::edition::Edition::Domestic)
+}
+
+/// 从指定版本客户端的认证文件导入当前账号。
+pub fn import_local_for(edition: crate::modules::edition::Edition) -> Result<Value, String> {
+    let acc = crate::modules::auth_file::import_from_auth_file_for(edition)
+        .ok_or_else(|| format!("未读取到本机 {} 登录信息（该版本未登录或未安装）", edition.label()))?;
     let saved = save_collected_account(acc).map_err(|e| e.to_string())?;
     Ok(account_meta(&saved))
 }
