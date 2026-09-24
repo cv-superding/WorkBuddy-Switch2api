@@ -136,6 +136,12 @@ pub fn close(edition: Edition, timeout_secs: i64) -> Result<(), String> {
     }
 }
 
+/// 轮询等待进程消失。
+///
+/// ⚠️ **必须挂 `#[cfg(target_os = "windows")]`**：它只被 `close()` 的 Windows 分支调用，
+/// 在 Linux / macOS 上是 dead code，而 CI 带 `-D warnings` ⇒ 非 Windows 平台构建直接失败
+/// （v0.6.0 第一次打 tag 就是这么挂的，三个平台全红）。
+#[cfg(target_os = "windows")]
 fn wait_gone(edition: Edition, timeout_secs: f64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
     while std::time::Instant::now() < deadline {
