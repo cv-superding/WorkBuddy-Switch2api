@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch2api",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "WorkBuddy 账号切换工具：本地 webui（浏览器操作）+ 桌面 App（安装后运行 workbuddy-switch 命令）",
   "bin": {
     "workbuddy-switch": "bin/workbuddy-switch.js"
@@ -10,10 +10,10 @@
     "scripts"
   ],
   "optionalDependencies": {
-    "workbuddy-switch2api-darwin-arm64": "0.6.1",
-    "workbuddy-switch2api-darwin-x64": "0.6.1",
-    "workbuddy-switch2api-win32-x64": "0.6.1",
-    "workbuddy-switch2api-linux-x64": "0.6.1"
+    "workbuddy-switch2api-darwin-arm64": "0.6.2",
+    "workbuddy-switch2api-darwin-x64": "0.6.2",
+    "workbuddy-switch2api-win32-x64": "0.6.2",
+    "workbuddy-switch2api-linux-x64": "0.6.2"
   },
   "scripts": {
     "postinstall": "node scripts/install.js"

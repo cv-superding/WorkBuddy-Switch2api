@@ -6,4 +6,4 @@ resolver = "2"
 # 其余字段（authors/repository/license）刻意不继承 —— 各 crate 的 homepage
 # 并不完全一致，抽出去反而容易改错。
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"

@@ -1,21 +1,29 @@
 # WorkBuddy-Switch2api
 
 <p align="center">
-  <img src="public/icon-transparent.png" alt="WorkBuddy-Switch2api" width="128" />
-</p>
-
-<p align="center">
-  <strong>WorkBuddy-Switch2api</strong><br />
-  WorkBuddy / CodeBuddy 多账号切换 + 本地 OpenAI 兼容反代
+  <img src="docs/images/banner.png" alt="手绘动画风横幅：山坡小屋放出成串绿色与紫色的灯笼，全部汇入右侧一扇发光的石门，标题 WorkBuddy-Switch2api" />
 </p>
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <a href="https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest"><img src="https://img.shields.io/github/v/release/cv-superding/WorkBuddy-Switch2api?label=release" alt="Latest release" /></a>
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4b5563.svg" alt="Platforms: Windows / macOS / Linux" />
+  <img src="https://img.shields.io/badge/built%20with-Tauri%20%2B%20Rust-24C8DB.svg" alt="Built with Tauri + Rust" />
+</p>
+
+<p align="center">
+  <strong>WorkBuddy / CodeBuddy 多账号切换 + 本地 OpenAI 兼容反代</strong>
+</p>
+
+<p align="center">
+  <sub>顶部横幅为 AI 生成的手绘风插画，非软件界面截图。</sub>
 </p>
 
 WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），并在同一个进程里内置了一个
 OpenAI 兼容的本地网关：多账号池轮转、按分组挑选出站账号、请求用量一目了然。
+
+国内版（WorkBuddy）与国际版（WorkBuddy AI）分成两个档位独立管理：各自的认证文件、进程与接口域名，
+账号页用标签页分开显示，登录、切换、积分、反代都按档位走。
 
 - **账号切换** —— 多账号共享登录态，一键切换 WorkBuddy 登录账号，支持把当前会话复制给目标账号
 - **API 反代** —— 把账号库包装成 `http://127.0.0.1:7863/v1`，任何 OpenAI SDK 客户端都能直接用
@@ -36,7 +44,7 @@ OpenAI 兼容的本地网关：多账号池轮转、按分组挑选出站账号�
 
 ### npm / webui（本地构建）
 
-浏览器操作界面，与桌面 App 共用同一套账号管理能力。该 npm 包**尚未发布到 npm**，从本仓库构建安装：
+浏览器操作界面，与桌面 App 共用同一套账号管理能力。包名为 `workbuddy-switch2api`（**尚未发布到 npm**，从本仓库构建安装；安装后可用的命令仍是 `workbuddy-switch`）：
 
 ```bash
 cd npm
@@ -45,7 +53,7 @@ workbuddy-switch              # 启动本地服务 + 自动打开浏览器
 workbuddy-switch status       # 终端查看当前账号
 ```
 
-webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账号切换、积分到期监控、自动签到、会话复制、API 反代、Token 统计与 token 保活。
+webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账号切换、积分到期监控、自动签到、会话复制与共享、API 反代、Token 统计与 token 保活。
 
 ### 桌面 App
 
