@@ -1,27 +1,34 @@
-// workbuddy-switch postinstall：从「平台包」复制本平台二进制。
+// postinstall：从「平台包」复制本平台二进制。
 //
-// 平台分包（esbuild 模式）：二进制发布在独立 npm 包（workbuddy-switch-<platform>-<arch>），
+// 平台分包（esbuild 模式）：二进制发布在独立 npm 包（<主包名>-<platform>-<arch>），
 // 主包声明为 optionalDependencies，安装时 npm 自动装好平台包，postinstall 只需复制——
 // 不依赖 GitHub，国内镜像（npmmirror）也能稳定安装。
+//
+// ⚠️ 平台包名一律从本包 package.json 的 name 推导，不写死。
+//    写死过一次的代价：主包改名后 postinstall 找不到平台包，`npm i -g` 直接失败。
 //
 // 环境变量覆盖：
 //   WB_SWITCH_BINARY=<本地二进制路径>  本地开发/离线安装（直接复制，不联网）
 const fs = require("fs");
 const path = require("path");
 
+/** 主包名（= 平台包前缀）。 */
+const PKG_NAME = require("../package.json").name;
+
 const FILE = {
   "darwin-arm64": "wb-switch-darwin-arm64",
   "darwin-x64": "wb-switch-darwin-x64",
   "win32-x64": "wb-switch-win32-x64.exe",
   "linux-x64": "wb-switch-linux-x64",
-  "linux-arm64": "wb-switch-linux-arm64",
+  // 刻意不列 linux-arm64：CI matrix 没有该平台，平台包从未发布过，
+  // 列在这里只会让用户走到"平台包未安装"的报错分支。
 }[`${process.platform}-${process.arch}`];
 
-const PLATFORM_PKG = `workbuddy-switch-${process.platform}-${process.arch}`;
+const PLATFORM_PKG = `${PKG_NAME}-${process.platform}-${process.arch}`;
 
 if (!FILE) {
   console.warn(
-    `workbuddy-switch: 跳过平台 ${process.platform}-${process.arch}（当前不支持），` +
+    `${PKG_NAME}: 跳过平台 ${process.platform}-${process.arch}（当前不支持），` +
       `可手动下载二进制后放置到 bin/ 目录`,
   );
   process.exit(0);
@@ -31,7 +38,7 @@ const binDir = path.join(__dirname, "..", "bin");
 const target = path.join(binDir, FILE);
 
 function fail(msg) {
-  console.error(`workbuddy-switch install: ${msg}`);
+  console.error(`${PKG_NAME} install: ${msg}`);
   console.error(
     "安装失败。请确认安装了对应平台包（npm 会自动装），或设置 WB_SWITCH_BINARY 指向本地二进制。",
   );
@@ -48,7 +55,7 @@ function copyFrom(src) {
     return fail(`平台包二进制异常（仅 ${size} 字节）`);
   }
   console.log(
-    `workbuddy-switch: 二进制就绪 → ${target} (${(size / 1048576).toFixed(1)}MB)`,
+    `${PKG_NAME}: 二进制就绪 → ${target} (${(size / 1048576).toFixed(1)}MB)`,
   );
 }
 
@@ -60,7 +67,7 @@ async function main() {
     return fail(`WB_SWITCH_BINARY 指向的文件不存在: ${local}`);
   }
 
-  // 2) 从平台包复制（node_modules/workbuddy-switch-<platform>-<arch>/bin/<file>）
+  // 2) 从平台包复制（node_modules/<主包名>-<platform>-<arch>/bin/<file>）
   try {
     const pkgRoot = path.dirname(require.resolve(`${PLATFORM_PKG}/package.json`));
     const src = path.join(pkgRoot, "bin", FILE);
@@ -69,7 +76,7 @@ async function main() {
   } catch (e) {
     // 平台包缺失：可能是 optionalDependencies 没装上（如手动安装/旧版 npm）
     if (fs.existsSync(target)) {
-      console.log("workbuddy-switch: 二进制已存在，跳过");
+      console.log(`${PKG_NAME}: 二进制已存在，跳过`);
       return;
     }
     return fail(

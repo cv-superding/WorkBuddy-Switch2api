@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-core"
-version = "0.6.0"
+version.workspace = true
 edition = "2021"
 authors = ["cv-superding"]
 repository = "https://github.com/cv-superding/WorkBuddy-Switch2api"

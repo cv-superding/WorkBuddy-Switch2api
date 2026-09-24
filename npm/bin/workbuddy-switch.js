@@ -12,7 +12,8 @@ const FILE = {
   "darwin-x64": "wb-switch-darwin-x64",
   "win32-x64": "wb-switch-win32-x64.exe",
   "linux-x64": "wb-switch-linux-x64",
-  "linux-arm64": "wb-switch-linux-arm64",
+  // 刻意不列 linux-arm64：CI matrix 没有该平台，平台包从未发布过，
+  // 列在这里只会让用户走到"平台包未安装"的报错分支。
 }[`${process.platform}-${process.arch}`];
 
 if (!FILE) {
@@ -23,7 +24,7 @@ if (!FILE) {
 const binPath = path.join(binDir, FILE);
 if (!fs.existsSync(binPath)) {
   console.error(
-    "wb-switch: 未找到平台二进制，请重新安装（npm install -g wb-switch 触发下载）",
+    "wb-switch: 未找到平台二进制，请重新安装（npm install -g workbuddy-switch2api 触发下载）",
   );
   process.exit(1);
 }

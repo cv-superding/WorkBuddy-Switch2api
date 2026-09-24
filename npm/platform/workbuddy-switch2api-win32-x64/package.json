@@ -1,7 +1,7 @@
 {
-  "name": "workbuddy-switch-win32-x64",
+  "name": "workbuddy-switch2api-win32-x64",
   "version": "0.6.0",
-  "description": "workbuddy-switch platform binary (win32-x64)",
+  "description": "workbuddy-switch2api platform binary (win32-x64)",
   "os": [
     "win32"
   ],

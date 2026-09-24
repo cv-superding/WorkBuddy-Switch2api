@@ -119,6 +119,12 @@ jobs:
         with:
           node-version: 20
 
+      # 版本号一致性：18 个位置（Rust workspace / 前端 / Tauri / 3 套 npm 包 /
+      # package-lock / Cargo.lock）必须全等于 [workspace.package].version，
+      # 且 tag 名必须与之一致。放在编译之前，1 秒就能拦住"版本漏改"这类问题。
+      - name: Check version consistency
+        run: node scripts/version.mjs check
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -179,7 +185,9 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          PKG_DIR="npm/platform/workbuddy-switch-${{ matrix.platform_tag }}"
+          # 平台包目录名从主包名推导，改名后不会漏
+          PKG_NAME=$(node -p "require('./npm/package.json').name")
+          PKG_DIR="npm/platform/$PKG_NAME-${{ matrix.platform_tag }}"
           # 用 tag 版本同步 platform 包版本（git 里的可能滞后）
           VER="${GITHUB_REF_NAME#v}"
           perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" "$PKG_DIR/package.json"
