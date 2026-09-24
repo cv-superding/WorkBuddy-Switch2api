@@ -8,9 +8,9 @@ use std::sync::atomic::AtomicBool;
 
 use crate::modules::account::{build_auth_headers, upsert_account};
 use crate::modules::config::{
-    http_request, load_checkin_config, norm_ts, now_ms, RunFlagGuard, WORKBUDDY_API_ENDPOINT,
-    WORKBUDDY_API_PREFIX,
+    http_request, load_checkin_config, norm_ts, now_ms, RunFlagGuard,
 };
+use crate::modules::edition::edition_of;
 
 static KEEPALIVE_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -36,7 +36,14 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
 
     let mut headers = build_auth_headers(&account);
     headers.insert("X-Refresh-Token".to_string(), rt.clone());
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{WORKBUDDY_API_PREFIX}/auth/token/refresh");
+    // 按账号所属档位选端点：国际版必须打 www.workbuddy.ai，
+    // 拿国内域名去刷新国际版 refresh token 会被 401（既有的「国际版刷新失败」）。
+    let variant = edition_of(&account);
+    let url = format!(
+        "{}{}/auth/token/refresh",
+        variant.api_endpoint(),
+        variant.api_prefix()
+    );
     let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
