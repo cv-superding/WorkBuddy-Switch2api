@@ -69,24 +69,57 @@ pub fn account_display_name(acc: &Value) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// 把任意 JSON 值收敛成「字符串或 null」。
+///
+/// 不只是类型洁癖：前端把这些元数据字段**直接当 React 子节点渲染**，
+/// 一旦有对象漏过去就是 React #31（`Objects are not valid as a React child`），
+/// 整页白屏、连错误信息都看不到。
+///
+/// 2026-09-23 的 WorkBuddy 更新把 token 改成信封加密，鉴权文件里出现了
+/// `{ $wbEncrypted, envelope }` 这种对象；只要它顺着某个字段走到前端就必然白屏。
+/// 因此这里一律取字符串，非字符串（对象/数组/数字/布尔）统统降级为 null ——
+/// 宁可少一个字段，也不能让对象出到前端。
+fn str_or_null(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::String(s)) if !s.trim().is_empty() => Value::String(s.clone()),
+        _ => Value::Null,
+    }
+}
+
+/// 把任意 JSON 值收敛成「数字或 null」（兼容数字型字符串）。
+fn num_or_null(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::Number(n)) => Value::Number(n.clone()),
+        Some(Value::String(s)) => match s.trim().parse::<f64>() {
+            Ok(f) if f.is_finite() => json!(f),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
 /// 账号的展示元数据（不泄露 token）。对照 server.py `account_meta`。
+///
+/// ⚠️ 所有字段都必须经过 `str_or_null` / `num_or_null` 收敛，**不要**直接
+/// `acc.get(...)` 透传：原始值可能是对象，前端渲染为 React 子节点时会抛
+/// React #31 导致整窗白屏（见 `str_or_null` 的说明）。
 pub fn account_meta(acc: &Value) -> Value {
     json!({
-        "id": acc.get("id"),
-        "uid": acc.get("uid"),
-        "email": acc.get("email"),
-        "nickname": acc.get("nickname"),
-        "enterpriseName": acc.get("enterpriseName"),
-        "expiresAt": acc.get("expiresAt"),
-        "refreshExpiresAt": acc.get("refreshExpiresAt"),
-        "refreshedAt": acc.get("refreshedAt"),
-        "createdAt": acc.get("createdAt"),
+        "id": str_or_null(acc.get("id")),
+        "uid": str_or_null(acc.get("uid")),
+        "email": str_or_null(acc.get("email")),
+        "nickname": str_or_null(acc.get("nickname")),
+        "enterpriseName": str_or_null(acc.get("enterpriseName")),
+        "expiresAt": num_or_null(acc.get("expiresAt")),
+        "refreshExpiresAt": num_or_null(acc.get("refreshExpiresAt")),
+        "refreshedAt": num_or_null(acc.get("refreshedAt")),
+        "createdAt": num_or_null(acc.get("createdAt")),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
-        "needsReloginReason": acc.get("needs_relogin_reason"),
+        "needsReloginReason": str_or_null(acc.get("needs_relogin_reason")),
         // 账号分组："desktop"=桌面端 / "proxy"=反代API / 缺失=未分组
-        "group": acc.get("group"),
+        "group": str_or_null(acc.get("group")),
         // 客户端档位："domestic"=国内版（缺失时视为国内版）/ "international"=国际版
-        "edition": acc.get("edition"),
+        "edition": str_or_null(acc.get("edition")),
     })
 }
 
@@ -225,6 +258,54 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn account_meta_coerces_non_scalar_fields_to_null() {
+        // 回归：2026-09-23 WorkBuddy 更新后 token 变为信封加密，账号库里可能混入
+        // `{ $wbEncrypted, envelope }` 这类对象。若原样透传到前端被当 React 子节点
+        // 渲染，就是 React #31（Objects are not valid as a React child）→ 整窗白屏。
+        let envelope = json!({ "$wbEncrypted": true, "envelope": "BASE64..." });
+        let acc = json!({
+            "id": "a1",
+            "uid": "u1",
+            "email": envelope.clone(),
+            "nickname": envelope.clone(),
+            "enterpriseName": envelope.clone(),
+            "needs_relogin_reason": envelope.clone(),
+            "group": envelope.clone(),
+            "edition": envelope.clone(),
+            "expiresAt": envelope.clone(),
+            "refreshExpiresAt": json!([1, 2, 3]),
+            "refreshedAt": "1758700000000",
+            "createdAt": 42,
+        });
+        let meta = account_meta(&acc);
+        for key in [
+            "email",
+            "nickname",
+            "enterpriseName",
+            "needsReloginReason",
+            "group",
+            "edition",
+            "expiresAt",
+            "refreshExpiresAt",
+        ] {
+            assert_eq!(meta[key], Value::Null, "{key} 必须被收敛成 null，不能透传对象");
+        }
+        // 数字型字符串按数字出来，正常数字原样保留
+        assert_eq!(meta["refreshedAt"], json!(1758700000000.0));
+        assert_eq!(meta["createdAt"], json!(42));
+        assert_eq!(meta["id"], "a1");
+    }
+
+    #[test]
+    fn account_meta_old_behavior_would_leak_object() {
+        // 反向验证：确认「直接透传」的确会产出对象 —— 证明上面的收敛不是恒真断言。
+        let envelope = json!({ "$wbEncrypted": true, "envelope": "BASE64..." });
+        let acc = json!({ "id": "a1", "nickname": envelope.clone() });
+        assert!(acc.get("nickname").unwrap().is_object(), "旧行为：对象原样透传，正是白屏根因");
+        assert_eq!(account_meta(&acc)["nickname"], Value::Null, "新行为：已收敛");
+    }
 
     #[test]
     fn account_meta_strips_tokens() {

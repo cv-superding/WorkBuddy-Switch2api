@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
+import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import { ArrowUp, MessagesSquare, Network, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -11,6 +11,7 @@ import CreditStatsPage from "@/pages/CreditStatsPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
+import { PageErrorBoundary } from "@/components/error-boundary";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -84,8 +85,19 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
   );
 }
 
+/** 路由 → 页面名，用于错误边界显示「哪个页面崩了」。 */
+const PAGE_LABELS: Record<string, string | undefined> = {
+  "/": "账号管理",
+  "/token-stats": "Token 统计",
+  "/credit-stats": "积分统计",
+  "/api-proxy": "API 反代",
+  "/settings": "设置",
+};
+
 function Layout() {
   const running = useAccountsStore((s) => s.status?.running);
+  const { pathname } = useLocation();
+  const pageLabel = PAGE_LABELS[pathname];
   const hasUnifiedTitleBar =
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
   useCreditAutoRefresh();
@@ -193,7 +205,9 @@ function Layout() {
           hasUnifiedTitleBar && "pt-16 [&>div]:pt-4",
         )}
       >
-        <Outlet />
+        <PageErrorBoundary label={pageLabel}>
+          <Outlet />
+        </PageErrorBoundary>
       </main>
     </div>
   );

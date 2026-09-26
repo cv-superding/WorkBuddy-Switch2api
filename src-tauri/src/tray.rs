@@ -69,6 +69,40 @@ pub fn is_silent_startup(args: impl IntoIterator<Item = impl AsRef<str>>) -> boo
         .any(|arg| arg.as_ref() == SILENT_STARTUP_ARG)
 }
 
+/// 首次呈现主窗口时的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupWindowAction {
+    /// 显示主窗口，必要时重建 WebView。
+    Show,
+    /// 保持隐藏，只留托盘。
+    KeepHidden,
+}
+
+/// 推导首次启动的主窗口动作（纯函数，便于单测）。
+///
+/// `main` 窗口在 `tauri.conf.json` 里是 `visible: false`（为了「开机静默启动到托盘」），
+/// 所以**普通启动也必须显式 show 一次**；静默启动则保持隐藏。
+///
+/// `lightweight` 这个入参不能省。轻量模式会把 WebView 整体 `destroy()`，
+/// 此后 `get_webview_window("main")` 返回 `None`；若此时仍走 show 路径，
+/// `show_main_window` 会把「窗口不存在」当成需要重建，落到 `exit_lightweight`，
+/// 而后者用 `from_config` 重建会读回配置里的 `visible: false` —— 于是形成一条
+/// **自洽的锁死回路**：
+///
+/// 1. 进程被判定为「轻量模式仍然生效」，托盘勾选项与实际状态脱节；
+/// 2. 重建出的窗口**永久不可见** —— 用户点多少次「打开主界面」都是白屏
+///    （窗口在、进程在、WebView 已加载，只是从不 show）。
+///
+/// 这不是概率性竞态：只要进程内 `LIGHTWEIGHT_MODE` 为真，启动就必然白屏。
+/// 所以首次呈现前必须先把它归零（见 `setup_startup_visibility`）。
+pub fn startup_window_action(silent: bool, lightweight: bool) -> StartupWindowAction {
+    if lightweight || !silent {
+        StartupWindowAction::Show
+    } else {
+        StartupWindowAction::KeepHidden
+    }
+}
+
 /// 在事件循环呈现应用前决定首次启动的主窗口可见性。
 ///
 /// `main` 窗口由 `tauri.conf.json` 配置创建为不可见，此处做出第一次
@@ -80,12 +114,22 @@ pub fn is_silent_startup(args: impl IntoIterator<Item = impl AsRef<str>>) -> boo
 ///   只保留托盘；不设置 `LIGHTWEIGHT_MODE`（WebView 仍然存在）。
 ///
 /// 之后从托盘「打开主界面」仍走 `show_main_window`，与隐藏窗口完全一致。
+///
+/// **首次呈现前一律清零 `LIGHTWEIGHT_MODE`**：该标志只描述「当前是否处于轻量模式」，
+/// 没有任何跨进程持久化，因此进程刚起来时它的语义只能是 `false`。历史版本在
+/// `setup` 里保留上一次写入的值，会让「先开轻量模式、再重启应用」直接进入白屏
+/// —— 详见 [`startup_window_action`]。
 pub fn setup_startup_visibility<R: Runtime>(app: &AppHandle<R>, silent: bool) {
-    if silent {
-        apply_dock_visible(app, false);
-        emit_main_window_visible(app, false);
-    } else {
-        show_main_window(app);
+    // 必须在任何 show / 重建路径之前归零：`show_main_window` 与 `exit_lightweight`
+    // 都会读这个标志，残留为真就会触发重建锁死回路。
+    let was_lightweight = LIGHTWEIGHT_MODE.swap(false, Ordering::AcqRel);
+
+    match startup_window_action(silent, was_lightweight) {
+        StartupWindowAction::Show => show_main_window(app),
+        StartupWindowAction::KeepHidden => {
+            apply_dock_visible(app, false);
+            emit_main_window_visible(app, false);
+        }
     }
 }
 
@@ -473,13 +517,53 @@ fn format_checkin_tooltip(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_checkin_tooltip, is_silent_startup, menu_bar_icon, should_keep_tray_alive};
+    use super::{
+        format_checkin_tooltip, is_silent_startup, menu_bar_icon, should_keep_tray_alive,
+        startup_window_action, StartupWindowAction,
+    };
     use serde_json::json;
 
     #[test]
     fn runtime_exit_with_no_code_keeps_tray() {
         assert!(should_keep_tray_alive(None));
         assert!(!should_keep_tray_alive(Some(0)));
+    }
+
+    /// 回归：普通启动必须显示窗口。
+    #[test]
+    fn normal_startup_shows_window() {
+        assert_eq!(startup_window_action(false, false), StartupWindowAction::Show);
+    }
+
+    /// 回归：静默启动（系统自启 `--hidden`）保持隐藏，不闪窗。
+    #[test]
+    fn silent_startup_stays_hidden() {
+        assert_eq!(
+            startup_window_action(true, false),
+            StartupWindowAction::KeepHidden
+        );
+    }
+
+    /// 回归：轻量模式残留时**必须**显示窗口 —— 「重启后白屏」的直接防线。
+    /// 若此断言失败，说明又回到了「把残留的轻量模式当成重建信号」的锁死回路。
+    #[test]
+    fn leftover_lightweight_mode_still_shows_window() {
+        assert_eq!(startup_window_action(false, true), StartupWindowAction::Show);
+        // 即使同时带 `--hidden`，也不能把窗口留在「已销毁」状态：
+        // 轻量标志为真意味着 WebView 已不存在，保持隐藏会让用户永远看不到界面。
+        assert_eq!(startup_window_action(true, true), StartupWindowAction::Show);
+    }
+
+    /// 只要进程带着残留的轻量标志启动，任何参数组合都不能停在隐藏态。
+    #[test]
+    fn no_combination_keeps_hidden_window_when_lightweight_leftover() {
+        for silent in [false, true] {
+            assert_ne!(
+                startup_window_action(silent, true),
+                StartupWindowAction::KeepHidden,
+                "silent={silent} 且轻量模式残留时不得保持隐藏"
+            );
+        }
     }
 
     #[test]
