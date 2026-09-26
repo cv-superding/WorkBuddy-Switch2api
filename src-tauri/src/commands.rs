@@ -22,6 +22,16 @@ pub struct AppStatus {
     version: String,
 }
 
+/// 前端挂载成功后调用一次，告诉 Rust 侧「界面真的起来了」。
+///
+/// 这是白屏自愈的判据：`webview_guard` 的看门狗等不到这个信号，
+/// 就认为 WebView2 没把页面跑起来（状态脏），先 reload、再用干净 profile 重建。
+/// 纯置位操作，不做任何 IO，允许重复调用。
+#[tauri::command]
+pub fn ui_ready() {
+    crate::webview_guard::mark_ready();
+}
+
 /// GET /api/status —— WorkBuddy 运行状态 + 当前账号。
 #[tauri::command]
 pub async fn get_status() -> Result<AppStatus, String> {
@@ -37,10 +47,16 @@ fn build_app_status() -> AppStatus {
     let auth = auth_file::read_auth_file();
     let current = auth.as_ref().and_then(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
+        // 只取字符串：鉴权文件里的字段可能是对象（加密信封），
+        // 原样透传到前端会被当 React 子节点渲染 → React #31 → 整窗白屏。
+        let text = |key: &str| match acct.get(key) {
+            Some(Value::String(s)) if !s.trim().is_empty() => json!(s.clone()),
+            _ => Value::Null,
+        };
         Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
+            "uid": text("uid"),
+            "nickname": text("nickname"),
+            "email": text("email"),
         }))
     });
     AppStatus {

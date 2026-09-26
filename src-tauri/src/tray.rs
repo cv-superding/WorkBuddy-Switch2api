@@ -14,7 +14,7 @@ use tauri_plugin_opener::OpenerExt;
 use wb_switch_core::modules::{checkin, update};
 
 const TRAY_ID: &str = "main-menu-bar";
-const MAIN_WINDOW_LABEL: &str = "main";
+pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 const DEFAULT_TOOLTIP: &str = "WorkBuddy-Switch2api";
 const CHECKIN_TOOLTIP_RESTORE_SECS: u64 = 8;
 
@@ -38,6 +38,7 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open-main-window" => show_main_window(app),
+            "reload-ui" => crate::webview_guard::reload_main(app),
             "open-github" => open_github(app),
             "checkin-all" => start_checkin_all(app),
             "lightweight-mode" => toggle_lightweight(app),
@@ -443,6 +444,8 @@ fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) {
 
 fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>> {
     let open_item = MenuItem::with_id(app, "open-main-window", "打开主界面", true, None::<&str>)?;
+    // 白屏时 WebView 起不来，但托盘菜单是原生实现、仍然可用 —— 这是用户唯一的自救入口。
+    let reload_item = MenuItem::with_id(app, "reload-ui", "重载界面", true, None::<&str>)?;
     let github_item = MenuItem::with_id(app, "open-github", "打开 GitHub", true, None::<&str>)?;
     let checked_in = checkin::all_accounts_checked_in_today();
     let (checkin_label, checkin_enabled) = if CHECKIN_BUSY.load(Ordering::Acquire) {
@@ -471,6 +474,7 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>>
 
     MenuBuilder::new(app)
         .item(&open_item)
+        .item(&reload_item)
         .item(&github_item)
         .item(&checkin_item)
         .separator()

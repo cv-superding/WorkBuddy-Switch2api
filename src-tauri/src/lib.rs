@@ -2,6 +2,7 @@
 mod commands;
 #[cfg(desktop)]
 mod tray;
+mod webview_guard;
 
 use std::time::Duration;
 use wb_switch_core::modules;
@@ -81,6 +82,11 @@ fn spawn_background_loops() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    // 必须在 build() 之前：上次启动若界面没起来，这里会把坏掉的 WebView2
+    // 用户数据目录挪走，让 WebView2 重新建一个干净的（白屏自愈的关键一步）。
+    webview_guard::preflight(&context.config().identifier);
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -112,9 +118,12 @@ pub fn run() {
             if !is_screenshot_demo() {
                 spawn_background_loops();
             }
+            // 白屏自愈：前端挂载后会调 ui_ready，等不到就 reload → 再不行就用干净 profile 重建。
+            webview_guard::spawn_watchdog(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::ui_ready,
             commands::get_status,
             commands::get_accounts,
             commands::get_codebuddy_cli_status,
@@ -169,7 +178,7 @@ pub fn run() {
             commands::get_proxy_usage,
             commands::reset_proxy_usage,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
 
     app.run(|_app_handle, event| {

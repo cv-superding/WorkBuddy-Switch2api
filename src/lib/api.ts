@@ -175,6 +175,18 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 // 状态 / 账号
 // ---------------------------------------------------------------------------
 
+/**
+ * 告诉桌面端「界面已经挂载完成」——白屏自愈的握手信号。
+ *
+ * Rust 侧的看门狗等不到它，就认为 WebView2 没把页面跑起来（状态脏），
+ * 会自动重载、必要时用干净的用户数据目录重建窗口。webui 与演示模式没有这条通道，
+ * 直接静默跳过；握手本身失败也不该影响界面。
+ */
+export function uiReady(): void {
+  if (demoModeEnabled || isWebui()) return;
+  void invoke("ui_ready").catch(() => {});
+}
+
 export function getStatus(): Promise<AppStatus> {
   return call("get_status");
 }

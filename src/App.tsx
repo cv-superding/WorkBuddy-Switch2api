@@ -216,6 +216,12 @@ function Layout() {
 export default function App() {
   const Router = pagesDemoHostingEnabled ? HashRouter : BrowserRouter;
 
+  // 白屏自愈握手：React 真的挂上了才通知 Rust。桌面端等不到这个信号，
+  // 就会认为 WebView2 没把页面跑起来，自动重载 / 用干净 profile 重建窗口。
+  useEffect(() => {
+    api.uiReady();
+  }, []);
+
   return (
     <TooltipProvider delayDuration={250}>
       <Router>
