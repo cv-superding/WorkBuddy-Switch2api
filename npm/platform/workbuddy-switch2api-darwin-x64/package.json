@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch2api-darwin-x64",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "workbuddy-switch2api platform binary (darwin-x64)",
   "os": [
     "darwin"

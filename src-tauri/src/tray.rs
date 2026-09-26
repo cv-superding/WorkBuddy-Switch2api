@@ -128,6 +128,12 @@ pub fn setup_startup_visibility<R: Runtime>(app: &AppHandle<R>, silent: bool) {
     match startup_window_action(silent, was_lightweight) {
         StartupWindowAction::Show => show_main_window(app),
         StartupWindowAction::KeepHidden => {
+            // 防御性隐藏：窗口由 `tauri.conf.json` 创建为 `visible: false`，
+            // 正常情况下这里已经是隐藏态；显式 hide 一次是为了兜住
+            // "配置被改动 / 平台行为差异导致窗口先可见"的情况。
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                let _ = window.hide();
+            }
             apply_dock_visible(app, false);
             emit_main_window_visible(app, false);
         }
@@ -154,7 +160,7 @@ fn should_keep_tray_alive(code: Option<i32>) -> bool {
     code.is_none()
 }
 
-fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     // Recreate if the WebView is gone even when the flag is already false
     // (e.g. destroy() completed after a failed lightweight toggle).
     if LIGHTWEIGHT_MODE.load(Ordering::Acquire)

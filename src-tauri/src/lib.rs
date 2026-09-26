@@ -83,9 +83,22 @@ fn spawn_background_loops() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
+    let identifier = context.config().identifier.clone();
+
+    // 已有实例在跑 ⇒ 不启动第二个 UI。
+    // 两个实例共用同一个 WebView2 profile（`%LOCALAPPDATA%\<identifier>\EBWebView`），
+    // 实测（2026-09-26）会**双双黑屏**（两边都只剩原生标题栏），后启动的那个还会
+    // 抢不到反代端口（os error 10048）。用户看到的就是"点开是白屏"。
+    // 所以：请已有实例把窗口显示出来，然后自己退出。
+    if webview_guard::another_instance_running() {
+        webview_guard::request_show(&identifier);
+        eprintln!("[instance] 已有实例在运行，已请求它显示主窗口，本次退出");
+        return;
+    }
+
     // 必须在 build() 之前：上次启动若界面没起来，这里会把坏掉的 WebView2
     // 用户数据目录挪走，让 WebView2 重新建一个干净的（白屏自愈的关键一步）。
-    webview_guard::preflight(&context.config().identifier);
+    webview_guard::preflight(&identifier);
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
