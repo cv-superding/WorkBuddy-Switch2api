@@ -815,14 +815,37 @@ export default function TransferPage() {
   const [params, setParams] = useSearchParams();
   const tab = params.get("tab") === "import" ? "import" : "export";
 
-  return (
-    <div className="space-y-4">
-      <div>
-        <h1 className="text-lg font-semibold">迁移</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          把会话与全部配置（技能 / MCP / 连接器 / 记忆 / 定时任务）打包带走，在另一台机器上增量合并进来。
-        </p>
+  const title = (
+    <header>
+      <h1 className="text-[28px] font-semibold tracking-tight">迁移</h1>
+      <p className="mt-2 text-sm leading-6 text-muted-foreground">
+        把会话与全部配置（技能 / MCP / 连接器 / 记忆 / 定时任务）打包带走，在另一台机器上增量合并进来。
+      </p>
+    </header>
+  );
+
+  // webui（浏览器）模式下没有系统文件对话框，选不了迁移包的保存 / 打开位置。
+  // 与其让按钮点下去报「暂不支持该操作」，不如直接说清楚。
+  if (api.isWebui()) {
+    return (
+      <div className="mx-auto min-w-0 w-full max-w-[1180px] px-4 py-6 sm:px-8 sm:py-9">
+        {title}
+        <Alert>
+          <AlertDescription>
+            迁移需要在 <span className="font-medium">桌面应用</span> 里使用 —— 打包和导入都要通过系统文件对话框选择迁移包的位置，
+            浏览器做不到。请在另一台机器上装好桌面端，从「迁移」页导出 / 导入。
+            <br />
+            只是想在<span className="font-medium">同一台机器的两个账号之间</span>共享会话？那不需要迁移包，
+            用账号管理里的「共享会话」即可（不产生副本）。
+          </AlertDescription>
+        </Alert>
       </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto min-w-0 w-full max-w-[1180px] space-y-4 px-4 py-6 sm:px-8 sm:py-9">
+      {title}
 
       <Tabs
         value={tab}
