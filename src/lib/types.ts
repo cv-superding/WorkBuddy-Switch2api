@@ -521,3 +521,154 @@ export interface CodeBuddyCnIdeSwitchResult {
   message?: string;
 }
 
+// ---------------------------------------------------------------------------
+// 跨机器迁移包
+// ---------------------------------------------------------------------------
+
+/** 字节数 + 文件数。 */
+export interface TransferBytes {
+  bytes: number;
+  files: number;
+}
+
+/** 一个可导出的工作区（＝ projects/ 下的一个目录）。 */
+export interface TransferWorkspace {
+  slug: string;
+  cwd: string;
+  title: string;
+  sessions: number;
+  bytes: number;
+  files: number;
+}
+
+export interface TransferScanItem {
+  key: string;
+  label: string;
+  path: string;
+  isDir: boolean;
+  bytes: number;
+  files: number;
+  exists?: boolean;
+  optional?: boolean;
+}
+
+export interface TransferScan {
+  edition: string;
+  editionLabel: string;
+  dataDir: string;
+  uid: string | null;
+  workspaces: TransferWorkspace[];
+  workspaceCount: number;
+  sessionFiles: number;
+  config: TransferScanItem[];
+  extras: {
+    blobs: TransferBytes;
+    fileHistory: TransferBytes;
+    workspaceSnapshots: TransferBytes;
+    tasks: TransferBytes;
+    artifactIndex: TransferBytes;
+    database: { bytes: number };
+  };
+  scannedAt: number;
+}
+
+export interface TransferExportOptions {
+  slugs: string[];
+  includeConfig: boolean;
+  includePlugins: boolean;
+  includeFileHistory: boolean;
+  includeWorkspaceSnapshots: boolean;
+  includeCredentials: boolean;
+}
+
+export interface TransferExportResult {
+  path: string;
+  bytes: number;
+  rawBytes: number;
+  sessions: number;
+  workspaces: number;
+  blobs: number;
+  files: number;
+  skipped: string[];
+  credentials: boolean;
+}
+
+export interface TransferPreviewSession {
+  sid: string;
+  title: string;
+  slug: string;
+  updatedAt: number;
+  files: number;
+  bytes: number;
+  exists: boolean;
+}
+
+export interface TransferPreviewConfig {
+  key: string;
+  label: string;
+  isDir: boolean;
+  incoming: number;
+  incomingBytes: number;
+  missingLocally: number;
+  topItems: number;
+  sample: string[];
+}
+
+export interface TransferPreview {
+  ok: boolean;
+  path: string;
+  manifest: Record<string, unknown>;
+  source: {
+    edition?: string;
+    editionLabel?: string;
+    hostname?: string;
+    os?: string;
+    uid?: string;
+    dataDir?: string;
+  } | null;
+  options: Record<string, boolean> | null;
+  target: { edition: string; editionLabel: string; dataDir: string; uid: string | null };
+  sessions: TransferPreviewSession[];
+  summary: {
+    sessions: { total: number; new: number; existing: number };
+    blobs: { total: number; missing: number; bytesTotal: number; bytesMissing: number };
+    config: TransferPreviewConfig[];
+    db: Record<string, { incoming: number; existing: number; new: number }>;
+    dbNew: number;
+    credentials: { uid?: string; nickname?: string; hasAccessToken?: boolean } | null;
+  };
+  warnings: string[];
+}
+
+export interface TransferImportOptions {
+  sessionIds?: string[];
+  applySessions: boolean;
+  applyBlobs: boolean;
+  applyConfig: boolean;
+  configKeys?: string[];
+  applyDb: boolean;
+  applyCredentials: boolean;
+  /** 目标已有同名文件时是否覆盖（默认只补缺失）。 */
+  overwrite: boolean;
+  /** 把会话置为「共享」（user_id 清空），换账号/换机器都看得见。 */
+  shareSessions: boolean;
+}
+
+export interface TransferImportResult {
+  ok: boolean;
+  path: string;
+  sessions: { files: number; bytes: number; skipped: number; ids: number; shared: boolean };
+  blobs: { files: number; bytes: number; skipped: number };
+  config: {
+    newFiles: number;
+    mergedLeaves: number;
+    skipped: number;
+    bytes: number;
+    keys: string[];
+  };
+  db: Record<string, { inserted: number; skipped: number; total: number }>;
+  credentials: { written: boolean };
+  backup: { dir: string; files: number; bytes: number };
+  errors: string[];
+  notes: string[];
+}

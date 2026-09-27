@@ -32,6 +32,12 @@ import type {
   TravelStatus,
   UpdateInfo,
   EditionStatus,
+  TransferScan,
+  TransferExportOptions,
+  TransferExportResult,
+  TransferPreview,
+  TransferImportOptions,
+  TransferImportResult,
 } from "./types";
 import { EDITIONS } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
@@ -587,4 +593,36 @@ export function asError(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
   return JSON.stringify(e ?? "未知错误");
+}
+
+// ---------------------------------------------------------------------------
+// 跨机器迁移包
+// ---------------------------------------------------------------------------
+
+/** 扫描本机可导出的内容（工作区 / 配置 / 各类体积）。 */
+export function transferScan(edition?: string): Promise<TransferScan> {
+  return call("transfer_scan", { edition });
+}
+
+/** 打包到指定路径（桌面端由系统保存对话框给出 path）。 */
+export function transferExport(
+  output: string,
+  options: TransferExportOptions,
+  edition?: string,
+): Promise<TransferExportResult> {
+  return call("transfer_export", { edition, output, options });
+}
+
+/** 只读预览一个迁移包：包里有什么、本地缺什么。 */
+export function transferPreview(path: string, edition?: string): Promise<TransferPreview> {
+  return call("transfer_preview", { edition, path });
+}
+
+/** 执行增量导入。 */
+export function transferImport(
+  path: string,
+  options: TransferImportOptions,
+  edition?: string,
+): Promise<TransferImportResult> {
+  return call("transfer_import", { edition, path, options });
 }

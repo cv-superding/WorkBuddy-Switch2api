@@ -8,6 +8,9 @@ license = "MIT"
 description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
 [dependencies]
+# 归档：自己写 zip（stored/deflate），避免引入 zip crate（它拉 zopfli，离线装不了）。
+flate2 = "1"
+crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

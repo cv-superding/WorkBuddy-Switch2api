@@ -190,6 +190,10 @@ pub fn run() {
             commands::set_account_group,
             commands::get_proxy_usage,
             commands::reset_proxy_usage,
+            commands::transfer_scan,
+            commands::transfer_export,
+            commands::transfer_preview,
+            commands::transfer_import,
         ])
         .build(context)
         .expect("error while building tauri application");

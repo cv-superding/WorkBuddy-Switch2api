@@ -44,6 +44,17 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 // ---------------------------------------------------------------------------
 
 pub fn home_dir() -> PathBuf {
+    // 测试/沙箱隔离用：设了 `WB_SWITCH_HOME_OVERRIDE` 就让**所有**数据目录跟着走。
+    //
+    // 为什么需要这个口子：`dirs::home_dir()` 在 Windows 上走 Win32
+    // `SHGetKnownFolderPath`，**不读 `USERPROFILE`** —— 想用环境变量把家目录
+    // 临时指到别处是做不到的。端到端测试如果直接跑，会写进用户的真实数据目录。
+    // 正常运行时这个变量不存在，行为与以前完全一致。
+    if let Ok(p) = std::env::var("WB_SWITCH_HOME_OVERRIDE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 

@@ -5446,7 +5446,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5455,7 +5455,9 @@ dependencies = [
  "bytes",
  "cbc",
  "chrono",
+ "crc32fast",
  "dirs 5.0.1",
+ "flate2",
  "futures",
  "pbkdf2",
  "reqwest 0.12.28",
@@ -5470,7 +5472,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-rust"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -5491,7 +5493,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-server"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "axum",
  "rust-embed",

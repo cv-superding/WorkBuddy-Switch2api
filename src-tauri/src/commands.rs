@@ -3,6 +3,8 @@
 //! 阶段 1 覆盖：get_status / get_accounts / delete_account / oauth_start /
 //! oauth_status / import_local。
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -10,7 +12,7 @@ use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, client_ctl, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits,
     edition::{edition_of, parse_lenient}, export_import, oauth,
-    process, proxy, refresh, rotate, session, switch, token_stats, travel, update,
+    process, proxy, refresh, rotate, session, switch, token_stats, transfer, travel, update,
 };
 
 #[derive(Serialize)]
@@ -721,4 +723,127 @@ pub fn get_proxy_usage() -> Value {
 pub fn reset_proxy_usage() -> Result<Value, String> {
     proxy::reset_usage()?;
     Ok(json!({ "ok": true }))
+}
+
+// ---------------------------------------------------------------------------
+// 跨机器迁移包（扫描 / 导出 / 预览 / 导入）
+// ---------------------------------------------------------------------------
+
+/// 从 JS 传来的选项对象里读一个布尔值（camelCase 与 snake_case 都认）。
+fn opt_bool(v: &Value, keys: &[&str], default: bool) -> bool {
+    for k in keys {
+        if let Some(b) = v.get(*k).and_then(|x| x.as_bool()) {
+            return b;
+        }
+    }
+    default
+}
+
+/// 同上，读字符串数组（空串会被剔掉）。
+fn opt_str_list(v: &Value, keys: &[&str]) -> Vec<String> {
+    for k in keys {
+        if let Some(a) = v.get(*k).and_then(|x| x.as_array()) {
+            return a
+                .iter()
+                .filter_map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// GET /api/transfer/scan —— 列出可以导出的工作区、会话数与各类数据的体积。
+#[tauri::command]
+pub fn transfer_scan(edition: Option<String>) -> Value {
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
+    transfer::scan_exportable(edition)
+}
+
+/// POST /api/transfer/export —— 把选中的工作区 + 配置打成一个 zip。
+///
+/// 打包是重 IO，可能几秒到几十秒 —— 挪到阻塞线程池，别占着 async runtime。
+#[tauri::command]
+pub async fn transfer_export(
+    edition: Option<String>,
+    options: Option<Value>,
+    output: String,
+) -> Result<Value, String> {
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
+    if output.trim().is_empty() {
+        return Err("缺少导出路径".to_string());
+    }
+    let v = options.unwrap_or_else(|| json!({}));
+    let out = PathBuf::from(output);
+    tauri::async_runtime::spawn_blocking(move || {
+        let opts = transfer::ExportOptions {
+            slugs: opt_str_list(&v, &["slugs"]),
+            include_config: opt_bool(&v, &["includeConfig", "include_config"], true),
+            include_plugins: opt_bool(&v, &["includePlugins", "include_plugins"], false),
+            include_file_history: opt_bool(
+                &v,
+                &["includeFileHistory", "include_file_history"],
+                false,
+            ),
+            include_workspace_snapshots: opt_bool(
+                &v,
+                &["includeWorkspaceSnapshots", "include_workspace_snapshots"],
+                false,
+            ),
+            include_credentials: opt_bool(
+                &v,
+                &["includeCredentials", "include_credentials"],
+                false,
+            ),
+        };
+        transfer::export_bundle(edition, &opts, &out)
+    })
+    .await
+    .map_err(|e| format!("导出任务异常：{e}"))?
+}
+
+/// POST /api/transfer/preview —— 只读预览：包里有什么、本地缺什么、会发生什么。
+#[tauri::command]
+pub async fn transfer_preview(edition: Option<String>, path: String) -> Result<Value, String> {
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
+    if path.trim().is_empty() {
+        return Err("缺少包路径".to_string());
+    }
+    let p = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || transfer::preview_bundle(edition, &p))
+        .await
+        .map_err(|e| format!("预览任务异常：{e}"))?
+}
+
+/// POST /api/transfer/import —— 按选项增量合并进来。
+#[tauri::command]
+pub async fn transfer_import(
+    edition: Option<String>,
+    path: String,
+    options: Option<Value>,
+) -> Result<Value, String> {
+    let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
+    if path.trim().is_empty() {
+        return Err("缺少包路径".to_string());
+    }
+    let v = options.unwrap_or_else(|| json!({}));
+    let p = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || {
+        let opts = transfer::ImportOptions {
+            session_ids: opt_str_list(&v, &["sessionIds", "session_ids"]),
+            apply_sessions: opt_bool(&v, &["applySessions", "apply_sessions"], true),
+            apply_blobs: opt_bool(&v, &["applyBlobs", "apply_blobs"], true),
+            apply_config: opt_bool(&v, &["applyConfig", "apply_config"], true),
+            config_keys: opt_str_list(&v, &["configKeys", "config_keys"]),
+            apply_db: opt_bool(&v, &["applyDb", "apply_db"], true),
+            apply_credentials: opt_bool(&v, &["applyCredentials", "apply_credentials"], false),
+            overwrite: opt_bool(&v, &["overwrite"], false),
+            // 默认置空 user_id ⇒ 变成「共享会话」，换机器/换账号都看得见。
+            share_sessions: opt_bool(&v, &["shareSessions", "share_sessions"], true),
+        };
+        transfer::import_bundle(edition, &p, &opts)
+    })
+    .await
+    .map_err(|e| format!("导入任务异常：{e}"))?
 }
