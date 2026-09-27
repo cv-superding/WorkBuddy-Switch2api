@@ -132,7 +132,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         parts.push(`已把 ${shared} 个会话设为多账号共享`);
       }
       if (res.sessionCopy?.copied.length) {
-        parts.push(`已复制 ${res.sessionCopy.copied.length} 个会话`);
+        const copied = res.sessionCopy.copied;
+        // 附属数据（工具输出目录、产物索引、任务、文件历史）会跟着会话一起搬，
+        // 报出来是为了让「东西到底搬过去没有」有据可查。
+        const sideFiles = copied.reduce((n, c) => n + (c.side?.sideFiles ?? 0), 0);
+        const missing = copied.reduce((n, c) => n + (c.side?.blobsMissing ?? 0), 0);
+        parts.push(
+          sideFiles > 0
+            ? `已复制 ${copied.length} 个会话（含 ${sideFiles} 个附属文件）`
+            : `已复制 ${copied.length} 个会话`,
+        );
+        if (missing > 0) parts.push(`${missing} 个附件在本地找不到`);
       }
       if (res.backup) parts.push(`备份: ${res.backup}`);
       toast.success(`已切换至「${nickname}」`, {

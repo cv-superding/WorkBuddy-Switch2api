@@ -342,7 +342,9 @@ pub fn copy_session_to_user_for(
 
     // 1) 复制正文 jsonl：{projects}/{ws}/{cid}.jsonl → {projects}/{ws}/{new_cid}.jsonl
     let mut jsonl_copied = false;
+    let mut project_dir: Option<PathBuf> = None;
     if let Some(src_jsonl) = find_project_jsonl_for(edition, cid) {
+        project_dir = src_jsonl.parent().map(|p| p.to_path_buf());
         let dst_jsonl = src_jsonl.with_file_name(format!("{new_cid}.jsonl"));
         if let Ok(text) = std::fs::read_to_string(&src_jsonl) {
             let text = text.replace(cid, &new_cid); // 替换 sessionId 等旧 id 引用
@@ -352,7 +354,21 @@ pub fn copy_session_to_user_for(
         }
     }
 
-    // 2) 备份 db（复制前），再 INSERT 新 sessions 行
+    // 2) 附属数据：工具输出外溢目录 / 产物索引 / 历史任务 / 文件改动历史。
+    //
+    // 🔴 这些数据全都**按会话 id 命名**。只搬正文的话，新会话指向的是一片空白 ——
+    // 目标账号能看到对话，但工具输出、产物索引、任务历史全丢。
+    //
+    // 附件**不用搬**：`blobs/` 是内容寻址的全局仓库（`blobs/{sha256 前两位}/{sha256}`），
+    // 不分账号，新会话引用同样的哈希、文件本来就在原地（详见 transfer 里的注释）。
+    let side = crate::modules::transfer::copy_session_side_data(
+        edition,
+        cid,
+        &new_cid,
+        project_dir.as_deref(),
+    );
+
+    // 3) 备份 db（复制前），再 INSERT 新 sessions 行
     let backup_root = backup_dir().join("sessions").join(utc_iso());
     backup_workbuddy_db_for(edition, &backup_root);
     insert_session_copy(&db, &new_cid, cid, source_uid, target_uid)?;
@@ -364,6 +380,8 @@ pub fn copy_session_to_user_for(
         "id": cid,
         "newId": new_cid,
         "jsonlCopied": jsonl_copied,
+        // 附属数据的搬运情况（sideFiles / blobsReferenced / blobsMissing / …）
+        "side": side,
         "mappingWritten": mapping_written,
         "backup": backup_root.to_string_lossy().to_string(),
     }))

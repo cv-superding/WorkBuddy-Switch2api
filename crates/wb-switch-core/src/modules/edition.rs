@@ -217,6 +217,32 @@ impl Edition {
         self.data_dir().join("projects")
     }
 
+    /// 历史任务目录（`tasks/{cid}/…`）。
+    pub fn tasks_dir(self) -> PathBuf {
+        self.data_dir().join("tasks")
+    }
+
+    /// 附件仓库（`blobs/{前两位}/{sha256}`）。**文件名就是内容的 SHA256**，
+    /// 所以天然可以去重：同名即同内容。
+    pub fn blobs_dir(self) -> PathBuf {
+        self.data_dir().join("blobs")
+    }
+
+    /// 产物索引目录（`artifact-index/{cid}.json`）。
+    pub fn artifact_index_dir(self) -> PathBuf {
+        self.data_dir().join("artifact-index")
+    }
+
+    /// 文件改动历史目录（`file-history/{cid}/…`）。
+    pub fn file_history_dir(self) -> PathBuf {
+        self.data_dir().join("file-history")
+    }
+
+    /// 工作区文件快照目录（`workspace/sessions/{cid}/…`）—— 全部数据里最大的一块。
+    pub fn workspace_sessions_dir(self) -> PathBuf {
+        self.data_dir().join("workspace").join("sessions")
+    }
+
     /// 云端映射库的**默认**文件名。
     ///
     /// ⚠️ 实测两个档位**文件名不同且带版本号**：国内 `edge-sync-mapping.db`、

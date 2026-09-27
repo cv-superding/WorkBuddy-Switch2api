@@ -69,23 +69,23 @@ fn projects_dir(edition: Edition) -> PathBuf {
 }
 
 fn tasks_dir(edition: Edition) -> PathBuf {
-    edition.data_dir().join("tasks")
+    edition.tasks_dir()
 }
 
 fn blobs_dir(edition: Edition) -> PathBuf {
-    edition.data_dir().join("blobs")
+    edition.blobs_dir()
 }
 
 fn artifact_index_dir(edition: Edition) -> PathBuf {
-    edition.data_dir().join("artifact-index")
+    edition.artifact_index_dir()
 }
 
 fn file_history_dir(edition: Edition) -> PathBuf {
-    edition.data_dir().join("file-history")
+    edition.file_history_dir()
 }
 
 fn workspace_sessions_dir(edition: Edition) -> PathBuf {
-    edition.data_dir().join("workspace").join("sessions")
+    edition.workspace_sessions_dir()
 }
 
 fn config_dir(edition: Edition) -> PathBuf {
@@ -2065,9 +2065,362 @@ pub fn import_bundle(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// 账号间复制会话时的附属数据
+// ---------------------------------------------------------------------------
+
+/// 一次附属数据复制的统计。
+///
+/// 存在的意义：`copy_session_to_user` 以前只搬正文，用户看到的后果是
+/// 「会话在、工具输出和产物索引没了」。现在把这件事量化报出来，缺什么一眼能看见。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SideCopyReport {
+    pub files: usize,
+    pub bytes: u64,
+    /// 正文里引用到的 SHA256 个数。
+    pub blobs_referenced: usize,
+    /// 引用了、但附件仓库里找不到的个数（正常应该是 0；非 0 说明附件被 GC 过）。
+    pub blobs_missing: usize,
+    /// 源会话有没有工作区快照（有也不搬，见函数头注释）。
+    pub snapshot_present: bool,
+    pub errors: Vec<String>,
+}
+
+impl SideCopyReport {
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "sideFiles": self.files,
+            "sideBytes": self.bytes,
+            "blobsReferenced": self.blobs_referenced,
+            "blobsMissing": self.blobs_missing,
+            "snapshotNotCopied": self.snapshot_present,
+            "errors": self.errors,
+        })
+    }
+}
+
+/// 复制时要用的目录集合（抽出来是为了能用临时目录做单测，不必碰真实数据目录）。
+pub(crate) struct SideDirs {
+    /// `projects/{slug}` —— 里面有 `{sid}.jsonl`、`.meta.json`、`{sid}/` 等。
+    pub project_dir: Option<PathBuf>,
+    pub tasks: PathBuf,
+    pub artifact_index: PathBuf,
+    pub file_history: PathBuf,
+    pub workspace: PathBuf,
+    pub blobs: PathBuf,
+}
+
+/// 把一个会话的**附属数据**复制到新会话 id 之下。
+///
+/// # 为什么需要它
+///
+/// `session::copy_session_to_user_for` 以前只复制 `{sid}.jsonl`。新会话 id 一变，
+/// 那些**按旧 id 命名**的附属数据就全对不上了 —— 工具输出外溢目录、产物索引、
+/// 历史任务、文件改动历史，目标账号看到的会话是"内容在、东西没了"。
+///
+/// # 为什么不复制 blobs
+///
+/// `blobs/` 是**内容寻址的全局仓库**（`blobs/{sha256 前两位}/{sha256}`），
+/// **不分账号**：新会话引用的是同样的 SHA256，文件本来就在原地。
+/// 复制只会白抄几百 MB —— 这里只做一次引用完整性检查。
+///
+/// # 不搬的
+///
+/// `workspace/sessions/{sid}`（文件快照）：单会话可达数百 MB，账号间复制收益低、
+/// 代价高 ⇒ 明确不搬，但在报告里指出源里到底有没有。
+pub(crate) fn copy_session_side_data(
+    edition: Edition,
+    src_sid: &str,
+    dst_sid: &str,
+    src_project_dir: Option<&Path>,
+) -> Value {
+    let dirs = SideDirs {
+        project_dir: src_project_dir.map(|p| p.to_path_buf()),
+        tasks: tasks_dir(edition),
+        artifact_index: artifact_index_dir(edition),
+        file_history: file_history_dir(edition),
+        workspace: workspace_sessions_dir(edition),
+        blobs: blobs_dir(edition),
+    };
+    copy_side_data_in(&dirs, src_sid, dst_sid).to_json()
+}
+
+/// 复制主体（目录全部由调用方给定，便于单测）。
+fn copy_side_data_in(dirs: &SideDirs, src_sid: &str, dst_sid: &str) -> SideCopyReport {
+    let mut r = SideCopyReport::default();
+    // 复制的文本文件（用于稍后抠 SHA256）；正文也算进去。
+    let mut texts: Vec<String> = Vec::new();
+    let mut copied_text_files: Vec<PathBuf> = Vec::new();
+
+    // ---- 1) projects/{slug}/ 下同 id 的附属（正文由调用方搬，这里跳过）----
+    if let Some(dir) = &dirs.project_dir {
+        let src_jsonl = dir.join(format!("{src_sid}.jsonl"));
+        if let Ok(t) = std::fs::read_to_string(&src_jsonl) {
+            texts.push(t);
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.split('.').next() != Some(src_sid) {
+                    continue;
+                }
+                if name == format!("{src_sid}.jsonl") {
+                    continue;
+                }
+                let dst = dir.join(name.replacen(src_sid, dst_sid, 1));
+                copy_into(
+                    &entry.path(),
+                    &dst,
+                    src_sid,
+                    dst_sid,
+                    &mut r,
+                    &mut copied_text_files,
+                );
+            }
+        }
+    }
+
+    // ---- 2) tasks / artifact-index / file-history：候选项是 `{sid}` 目录或 `{sid}.json` ----
+    for root in [&dirs.tasks, &dirs.artifact_index, &dirs.file_history] {
+        for cand in [root.join(src_sid), root.join(format!("{src_sid}.json"))] {
+            if !cand.exists() {
+                continue;
+            }
+            let Some(fname) = cand.file_name() else {
+                continue;
+            };
+            let dst = root.join(fname.to_string_lossy().replacen(src_sid, dst_sid, 1));
+            copy_into(&cand, &dst, src_sid, dst_sid, &mut r, &mut copied_text_files);
+        }
+    }
+
+    // ---- 3) 工作区快照：只报告，不搬（见函数头注释）----
+    r.snapshot_present = dirs.workspace.join(src_sid).exists()
+        || dirs.workspace.join(format!("{src_sid}.json")).exists();
+
+    // ---- 4) 附件完整性检查（不复制 —— 同仓共享，见函数头注释）----
+    for p in &copied_text_files {
+        if let Ok(t) = std::fs::read_to_string(p) {
+            texts.push(t);
+        }
+    }
+    let mut hashes: BTreeSet<String> = BTreeSet::new();
+    for t in &texts {
+        hashes.extend(hex64_tokens(t));
+    }
+    r.blobs_referenced = hashes.len();
+    if dirs.blobs.is_dir() {
+        for h in &hashes {
+            if !blob_exists(&dirs.blobs, h) {
+                r.blobs_missing += 1;
+            }
+        }
+    }
+
+    r
+}
+
+/// 复制一个条目（文件或目录）。
+fn copy_into(
+    src: &Path,
+    dst: &Path,
+    src_sid: &str,
+    dst_sid: &str,
+    r: &mut SideCopyReport,
+    copied_text_files: &mut Vec<PathBuf>,
+) {
+    if src.is_dir() {
+        copy_tree(src, dst, src_sid, dst_sid, r, copied_text_files);
+        return;
+    }
+    if !src.is_file() {
+        return;
+    }
+    match copy_one(src, dst, src_sid, dst_sid) {
+        Ok((n, textual)) => {
+            r.files += 1;
+            r.bytes += n;
+            if textual {
+                copied_text_files.push(dst.to_path_buf());
+            }
+        }
+        Err(e) => r.errors.push(e),
+    }
+}
+
+/// 递归复制目录，路径名里的旧会话 id 一并替换。
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    src_sid: &str,
+    dst_sid: &str,
+    r: &mut SideCopyReport,
+    copied_text_files: &mut Vec<PathBuf>,
+) {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&s) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().replacen(src_sid, dst_sid, 1);
+            let target = d.join(name);
+            if p.is_dir() {
+                stack.push((p, target));
+            } else if p.is_file() {
+                match copy_one(&p, &target, src_sid, dst_sid) {
+                    Ok((n, textual)) => {
+                        r.files += 1;
+                        r.bytes += n;
+                        if textual {
+                            copied_text_files.push(target);
+                        }
+                    }
+                    Err(e) => r.errors.push(e),
+                }
+            }
+        }
+    }
+}
+
+/// 复制单个文件。返回 `(字节数, 是否文本)`。
+///
+/// 文本类（≤ 4 MiB 的 json/jsonl/ndjson/txt/md/log）会把里面的**旧会话 id 替换成新 id** ——
+/// 否则新会话的元数据仍指向旧 id。二进制原样复制（改字节会损坏文件）。
+fn copy_one(src: &Path, dst: &Path, src_sid: &str, dst_sid: &str) -> Result<(u64, bool), String> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败：{e}"))?;
+    }
+    const MAX_REWRITE: u64 = 4 * 1024 * 1024;
+    let textual = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "json" | "jsonl" | "ndjson" | "txt" | "md" | "log"
+            )
+        })
+        .unwrap_or(false);
+    if textual {
+        if let Ok(meta) = src.metadata() {
+            if meta.len() <= MAX_REWRITE {
+                if let Ok(text) = std::fs::read_to_string(src) {
+                    let out = text.replace(src_sid, dst_sid);
+                    std::fs::write(dst, out.as_bytes())
+                        .map_err(|e| format!("写 {} 失败：{e}", dst.display()))?;
+                    return Ok((out.len() as u64, true));
+                }
+            }
+        }
+    }
+    let n = std::fs::copy(src, dst).map_err(|e| format!("复制 {} 失败：{e}", src.display()))?;
+    Ok((n, textual))
+}
+
+/// 附件仓库里有没有这个 hash。
+///
+/// 文件名可能是 `{hash}`，也可能后面带后缀（客户端某些版本会加），
+/// 所以先精确匹配、再按前缀找。
+fn blob_exists(blobs: &Path, hash: &str) -> bool {
+    if hash.len() < 2 {
+        return false;
+    }
+    let bucket = blobs.join(&hash[0..2]);
+    if bucket.join(hash).is_file() {
+        return true;
+    }
+    let Ok(rd) = std::fs::read_dir(&bucket) else {
+        return false;
+    };
+    rd.flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(hash) && e.path().is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 会话附属数据复制：新 id、内容替换、三类目录、附件只查不搬。
+    #[test]
+    fn copies_session_side_data_under_new_id() {
+        const SRC: &str = "11111111-1111-1111-1111-111111111111";
+        const DST: &str = "22222222-2222-2222-2222-222222222222";
+        // 一个「仓库里有」的 sha256，一个「没有」的
+        const HAVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const GONE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let base = std::env::temp_dir().join(format!("wb-side-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let proj = base.join("projects").join("f-Code-x");
+        std::fs::create_dir_all(proj.join(SRC)).unwrap(); // 工具输出外溢目录
+        std::fs::write(
+            proj.join(format!("{SRC}.jsonl")),
+            format!(r#"{{"sessionId":"{SRC}","a":"{HAVE}","b":"{GONE}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join(format!("{SRC}.meta.json")),
+            format!(r#"{{"id":"{SRC}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(proj.join(SRC).join("tool.txt"), format!("session {SRC} output")).unwrap();
+
+        let tasks = base.join("tasks");
+        std::fs::create_dir_all(tasks.join(SRC)).unwrap();
+        std::fs::write(tasks.join(SRC).join("t.json"), "{}").unwrap();
+
+        let art = base.join("artifact-index");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join(format!("{SRC}.json")), "[]").unwrap();
+
+        let blobs = base.join("blobs");
+        std::fs::create_dir_all(blobs.join(&HAVE[0..2])).unwrap();
+        std::fs::write(blobs.join(&HAVE[0..2]).join(HAVE), b"png-bytes").unwrap();
+
+        let dirs = SideDirs {
+            project_dir: Some(proj.clone()),
+            tasks: tasks.clone(),
+            artifact_index: art.clone(),
+            file_history: base.join("file-history"),
+            workspace: base.join("workspace").join("sessions"),
+            blobs: blobs.clone(),
+        };
+        let r = copy_side_data_in(&dirs, SRC, DST);
+
+        // 四个附属全到位：meta + {sid}/tool.txt + tasks/{sid}/t.json + artifact-index/{sid}.json
+        assert_eq!(r.files, 4, "复制文件数 {}，错误 {:?}", r.files, r.errors);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(proj.join(format!("{DST}.meta.json")).is_file());
+        assert!(proj.join(DST).join("tool.txt").is_file());
+        assert!(tasks.join(DST).join("t.json").is_file());
+        assert!(art.join(format!("{DST}.json")).is_file());
+
+        // 正文归调用方搬，源文件一个都不动
+        assert!(!proj.join(format!("{DST}.jsonl")).exists());
+        assert!(proj.join(format!("{SRC}.meta.json")).is_file());
+
+        // 文本里的旧会话 id 已被替换
+        let meta = std::fs::read_to_string(proj.join(format!("{DST}.meta.json"))).unwrap();
+        assert!(meta.contains(DST) && !meta.contains(SRC), "{meta}");
+        let tool = std::fs::read_to_string(proj.join(DST).join("tool.txt")).unwrap();
+        assert!(tool.contains(DST) && !tool.contains(SRC), "{tool}");
+
+        // 附件：只统计不复制 —— 仓库里仍然只有那 1 个文件
+        assert_eq!(r.blobs_referenced, 2, "正文引用了 2 个 hash");
+        assert_eq!(r.blobs_missing, 1, "其中一个在仓库里不存在");
+        assert_eq!(
+            std::fs::read_dir(blobs.join(&HAVE[0..2])).unwrap().count(),
+            1,
+            "附件不该被复制（内容寻址的全局仓库，不分账号）"
+        );
+        assert!(!r.snapshot_present);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
 
     #[test]
     fn slug_matches_client_convention() {

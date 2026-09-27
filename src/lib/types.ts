@@ -130,10 +130,25 @@ export interface Session {
   isPlayground?: boolean;
 }
 
+/** 账号间复制会话时，附属数据（工具输出 / 产物索引 / 任务 / 文件历史）的搬运统计。 */
+export interface CopySideStat {
+  sideFiles: number;
+  sideBytes: number;
+  /** 正文里引用到的附件（SHA256）个数。 */
+  blobsReferenced: number;
+  /** 引用了、但本地附件仓库里找不到的个数（正常应为 0）。 */
+  blobsMissing: number;
+  /** 源会话有工作区快照但没搬（体积可达数百 MB）。 */
+  snapshotNotCopied: boolean;
+  errors: string[];
+}
+
 export interface CopyResult {
   id: string;
   newId: string;
   jsonlCopied: boolean;
+  /** 附属数据搬运统计（更早的版本没有这个字段）。 */
+  side?: CopySideStat;
   mappingWritten: boolean;
   backup: string;
 }
