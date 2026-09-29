@@ -110,11 +110,40 @@ api_key  = （没设置就随便填，例如 sk-anything）
 积分消耗也会加快。所以在设置里关掉「使用全部账号」，把常用的 1~2 个号从反代里摘出去，
 体验最好。
 
+## 内容块降级（客户端兼容）
+
+不是所有客户端都只发 `{"type":"text"}`。zcode / Cursor 这类 Agent 会发 OpenAI 较新的
+`{"type":"file", ...}`、Responses 的 `input_file`、Anthropic 的 `document`，
+而上游网关只认 text / image_url —— 原样透传就是一条 400：
+
+```
+{"code":11101,"msg":"Parse message failed: unsupported content type at index 0: file", ...}
+```
+
+反代现在会先把 `messages` 里的内容块过一遍：
+
+| 内容块 | 处理 |
+|---|---|
+| `text` / `image_url` | 原样保留 |
+| `file` / `input_file` / `document` / `image_file` / `input_audio` | 文本类附件（data URL 且 mime 是 text/*、json、xml…）解码成文本内联，上限 64 KB、超长截断；二进制（PDF/图片/音频）换成一行占位说明 `[file 附件 xxx 已省略：…]` |
+| 其它未知类型 | 换成 `[xxx 内容块已省略：上游不支持该类型]` |
+
+注意降级 ≠ 内容真的进了上下文：二进制附件的内容会被丢掉，模型只看到"这里本来有个附件"。
+被降级时响应会带一个头便于排查：
+
+```
+x-wb-switch-degraded: file=1
+```
+
+好处是客户端不再因为一个附件块被整条打回 —— 长会话的自动 compact 最容易踩到，
+因为它会把历史里所有附件块原样重发一遍。
+
 ## 已知限制
 
 - 只做了 `/v1/chat/completions`，没有 embeddings / images / audio
 - 工具调用（function calling）会透传给上游，但没有做额外的 schema 校验
 - `/v1/models` 是从上游 `data.agents[].models[]` 里提取的，拉不到时回退到一个内置列表
+- 上游只认 text / image_url，其它内容块会被降级成文本（见上）
 
 ## 源码位置
 

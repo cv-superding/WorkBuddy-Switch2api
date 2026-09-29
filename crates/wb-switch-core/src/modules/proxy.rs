@@ -18,7 +18,7 @@ use std::{
 
 use axum::{
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -297,8 +297,168 @@ fn chat_headers(acc: &Value) -> HashMap<String, String> {
     h
 }
 
+/// 上游网关只认少数几种内容块类型。客户端（zcode / Cursor / 各类 Agent）常发
+/// OpenAI 较新的 `type:"file"`、Responses 的 `input_file`、Anthropic 的 `document`，
+/// 原样透传会被上游直接 400，且报错看不出是哪来的：
+/// `{"code":11101,"msg":"Parse message failed: unsupported content type at index 0: file"}`
+///
+/// 这里把它们降级成文本：能解出文本就内联，否则留一行占位说明。
+/// 降级记录进 `degraded`，最后随响应头 `x-wb-switch-degraded` 回到客户端。
+fn sanitize_messages(messages: &Value, degraded: &mut Vec<String>) -> Value {
+    let Some(arr) = messages.as_array() else {
+        return messages.clone();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let mut m = item.clone();
+        let Some(parts) = m.get("content").and_then(Value::as_array) else {
+            // content 是字符串（最常见）或压根没有：原样放行。
+            out.push(m);
+            continue;
+        };
+        let mut kept: Vec<Value> = Vec::with_capacity(parts.len());
+        for p in parts {
+            match content_part(p, degraded) {
+                Some(text) => kept.push(json!({ "type": "text", "text": text })),
+                None => kept.push(p.clone()),
+            }
+        }
+        if kept.is_empty() {
+            kept.push(json!({ "type": "text", "text": "[内容块已省略：上游不支持该类型]" }));
+        }
+        m["content"] = Value::Array(kept);
+        out.push(m);
+    }
+    Value::Array(out)
+}
+
+/// 单个内容块：`None` = 原样保留，`Some(text)` = 降级成文本块。
+fn content_part(part: &Value, degraded: &mut Vec<String>) -> Option<String> {
+    let ty = part.get("type").and_then(Value::as_str).unwrap_or("text");
+    match ty {
+        // 上游认识的原生块。
+        "text" | "input_text" | "image_url" | "input_image" => None,
+        // 附件类：能解出文本就内联，否则占位。
+        "file" | "input_file" | "file_url" | "document" | "image_file" | "input_audio"
+        | "audio_url" => {
+            degraded.push(ty.to_string());
+            Some(attachment_note(ty, part))
+        }
+        // 其余未知类型一律降级：宁可少一块内容，也不要整条请求被 400。
+        _ => {
+            degraded.push(ty.to_string());
+            Some(format!("[{ty} 内容块已省略：上游不支持该类型]"))
+        }
+    }
+}
+
+/// 附件块的占位/内联文本。
+fn attachment_note(ty: &str, part: &Value) -> String {
+    let obj = part
+        .get("file")
+        .or_else(|| part.get("document"))
+        .or_else(|| part.get("image_file"))
+        .or_else(|| part.get("input_file"))
+        .unwrap_or(part);
+    let name = obj
+        .get("filename")
+        .or_else(|| obj.get("name"))
+        .or_else(|| obj.get("file_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("未命名附件");
+    let data = obj
+        .get("file_data")
+        .or_else(|| obj.get("data"))
+        .or_else(|| obj.get("base64"))
+        .and_then(Value::as_str);
+    match data.and_then(decode_text_data) {
+        Some(text) => format!("[附件 {name}]\n{text}"),
+        None => format!("[{ty} 附件 {name} 已省略：上游不支持该内容类型，仅文本类附件会内联]"),
+    }
+}
+
+/// 只在能确定是文本时才解码：二进制（PDF/图片/音频）一律不解 ——
+/// 把几十 KB 的 base64 灌进上下文比丢掉这块内容更糟。
+fn decode_text_data(data: &str) -> Option<String> {
+    use base64::Engine;
+    /// 单个附件最多内联这么多字符。
+    const MAX: usize = 64 * 1024;
+
+    let Some(rest) = data.strip_prefix("data:") else {
+        // 没有 data URL 前缀 = 客户端已经给了明文。
+        return Some(clamp(data));
+    };
+    let (meta, b64) = rest.split_once(";base64,")?;
+    let mime = meta.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let textual = mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("xml")
+        || mime.contains("javascript")
+        || mime.contains("yaml")
+        || mime.contains("csv")
+        || mime.contains("markdown");
+    if !textual {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()?;
+    if bytes.len() <= MAX {
+        return Some(String::from_utf8_lossy(&bytes).to_string());
+    }
+    let mut t = String::from_utf8_lossy(&bytes[..MAX]).to_string();
+    t.push_str("\n…（附件过长，已截断）");
+    Some(t)
+}
+
+fn clamp(s: &str) -> String {
+    const MAX: usize = 64 * 1024;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut t = s[..cut_at(s, MAX)].to_string();
+    t.push_str("\n…（附件过长，已截断）");
+    t
+}
+
+/// 按 UTF-8 边界往回退，避免切碎多字节字符。
+fn cut_at(s: &str, max: usize) -> usize {
+    let mut i = max.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// 降级记录的摘要，用作响应头（必须 ASCII）。
+fn degraded_summary(degraded: &[String]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for t in degraded {
+        match counts.iter_mut().find(|(k, _)| k == t) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((t.clone(), 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 给响应挂上降级摘要头（没降级就不挂）。
+fn with_degraded_header(mut resp: Response, degraded: &[String]) -> Response {
+    if degraded.is_empty() {
+        return resp;
+    }
+    if let Ok(v) = HeaderValue::from_str(&degraded_summary(degraded)) {
+        resp.headers_mut().insert("x-wb-switch-degraded", v);
+    }
+    resp
+}
+
 /// 把 OpenAI 入站体改写成上游形态（强制流式、去掉上游不认识的字段）。
-fn build_upstream_body(incoming: &Value) -> Value {
+fn build_upstream_body(incoming: &Value, degraded: &mut Vec<String>) -> Value {
     let model = incoming
         .get("model")
         .and_then(Value::as_str)
@@ -307,7 +467,7 @@ fn build_upstream_body(incoming: &Value) -> Value {
     let messages = incoming.get("messages").cloned().unwrap_or_else(|| json!([]));
     let mut body = json!({
         "model": model,
-        "messages": messages,
+        "messages": sanitize_messages(&messages, degraded),
         "stream": true,
     });
     if let Some(t) = incoming.get("temperature") {
@@ -964,7 +1124,17 @@ async fn chat_completions(
     for (k, v) in chat_headers(&acc) {
         req = req.header(k, v);
     }
-    let resp = match req.json(&build_upstream_body(&incoming)).send().await {
+    // 上游不认识的内容块（zcode 等客户端发的 file / document）在这里降级成文本，
+    // 否则整条请求会被上游 400：`unsupported content type at index 0: file`。
+    let mut degraded: Vec<String> = Vec::new();
+    let upstream_body = build_upstream_body(&incoming, &mut degraded);
+    if !degraded.is_empty() {
+        eprintln!(
+            "[反代] 内容块降级 {} (model={model})",
+            degraded_summary(&degraded)
+        );
+    }
+    let resp = match req.json(&upstream_body).send().await {
         Ok(r) => r,
         Err(e) => {
             st.pool.mark_failed(&uid);
@@ -996,15 +1166,16 @@ async fn chat_completions(
         let body = futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         });
-        Response::builder()
+        let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream; charset=utf-8")
             .header("Cache-Control", "no-cache")
             .header("X-Accel-Buffering", "no")
             .body(axum::body::Body::from_stream(body))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        with_degraded_header(resp, &degraded)
     } else {
-        match aggregate(Box::pin(resp.bytes_stream()), &model).await {
+        let resp = match aggregate(Box::pin(resp.bytes_stream()), &model).await {
             Ok(json) => {
                 let usage = json.get("usage").cloned();
                 record_usage(&meta, usage.as_ref(), true);
@@ -1014,7 +1185,8 @@ async fn chat_completions(
                 record_usage(&meta, None, false);
                 (StatusCode::BAD_GATEWAY, e).into_response()
             }
-        }
+        };
+        with_degraded_header(resp, &degraded)
     }
 }
 
@@ -1320,4 +1492,112 @@ pub fn restart_proxy_server() -> Result<(), String> {
         return Ok(());
     }
     start_proxy_server(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 复现线上的 400：客户端把附件当 `{"type":"file"}` 发过来，
+    /// 上游回 `Parse message failed: unsupported content type at index 0: file`。
+    #[test]
+    fn file_block_is_downgraded_to_text() {
+        let msgs = json!([{
+            "role": "user",
+            "content": [
+                { "type": "file", "file": { "filename": "a.pdf", "file_data": "data:application/pdf;base64,JVBERi0=" } },
+                { "type": "text", "text": "看看这个" }
+            ]
+        }]);
+        let mut degraded = Vec::new();
+        let out = sanitize_messages(&msgs, &mut degraded);
+
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        let note = parts[0]["text"].as_str().unwrap();
+        assert!(note.contains("a.pdf"), "{note}");
+        assert!(note.contains("已省略"), "{note}");
+        // 文本块原地保留（位置不动，索引不变）。
+        assert_eq!(parts[1]["text"], "看看这个");
+        assert_eq!(degraded_summary(&degraded), "file=1");
+    }
+
+    #[test]
+    fn plain_string_content_is_untouched() {
+        let msgs = json!([{ "role": "user", "content": "你好" }]);
+        let mut degraded = Vec::new();
+        let out = sanitize_messages(&msgs, &mut degraded);
+        assert_eq!(out, msgs);
+        assert!(degraded.is_empty());
+    }
+
+    #[test]
+    fn textual_attachment_is_inlined() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode("hello 世界".as_bytes());
+        let msgs = json!([{
+            "role": "user",
+            "content": [{ "type": "file", "file": {
+                "filename": "note.md",
+                "file_data": format!("data:text/markdown;base64,{b64}")
+            }}]
+        }]);
+        let mut degraded = Vec::new();
+        let out = sanitize_messages(&msgs, &mut degraded);
+        let text = out[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("hello 世界"), "{text}");
+    }
+
+    #[test]
+    fn unknown_type_never_survives() {
+        // 未知块必须被换掉，否则又是一个 400。
+        let msgs = json!([{
+            "role": "user",
+            "content": [{ "type": "weird_new_thing", "foo": 1 }, { "type": "text", "text": "x" }]
+        }]);
+        let mut degraded = Vec::new();
+        let out = sanitize_messages(&msgs, &mut degraded);
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|p| p["type"] == "text"));
+        assert_eq!(degraded_summary(&degraded), "weird_new_thing=1");
+    }
+
+    #[test]
+    fn image_and_text_blocks_survive() {
+        let msgs = json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "看图" },
+                { "type": "image_url", "image_url": { "url": "https://x/y.png" } }
+            ]
+        }]);
+        let mut degraded = Vec::new();
+        let out = sanitize_messages(&msgs, &mut degraded);
+        assert_eq!(out, msgs);
+        assert!(degraded.is_empty());
+    }
+
+    #[test]
+    fn upstream_body_keeps_params_and_sanitizes() {
+        let incoming = json!({
+            "model": "glm-5.3-flash",
+            "temperature": 0.3,
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "file", "file": { "file_id": "f_123" } }]
+            }]
+        });
+        let mut degraded = Vec::new();
+        let body = build_upstream_body(&incoming, &mut degraded);
+        assert_eq!(body["model"], "glm-5.3-flash");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["temperature"], 0.3);
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert!(body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("f_123"));
+    }
 }
