@@ -190,6 +190,7 @@ pub fn run() {
             commands::set_account_group,
             commands::get_proxy_usage,
             commands::reset_proxy_usage,
+            commands::get_proxy_models,
             commands::transfer_scan,
             commands::transfer_export,
             commands::transfer_preview,

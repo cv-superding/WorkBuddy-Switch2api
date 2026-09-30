@@ -22,6 +22,7 @@ import type {
   OAuthPollResult,
   OAuthStartResult,
   ProxyConfig,
+  ProxyModels,
   ProxyStatus,
   ProxyUsage,
   RotateLog,
@@ -57,6 +58,8 @@ const DEMO_READ_COMMANDS = new Set([
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config",
+  // 反代页：演示/Pages 里也要能渲染，否则整页只显示一条「演示模式下不可操作」
+  "get_proxy_config", "get_proxy_status", "get_proxy_usage", "get_proxy_models",
 ]);
 
 export function isDemoMode(): boolean {
@@ -485,6 +488,11 @@ export function getProxyUsage(): Promise<ProxyUsage> {
 
 export function resetProxyUsage(): Promise<{ ok: boolean }> {
   return call("reset_proxy_usage");
+}
+
+/** 「获取模型ID」：拉一次可用模型列表，客户端 model 字段照着填。 */
+export function getProxyModels(): Promise<ProxyModels> {
+  return call("get_proxy_models");
 }
 
 /** 设置账号分组："desktop"=桌面端 / "proxy"=反代API / ""=未分组。 */

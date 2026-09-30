@@ -199,6 +199,14 @@ export interface ProxyStatus {
   accountCount: number;
 }
 
+/** 「获取模型ID」的结果：客户端 model 字段该填什么。 */
+export interface ProxyModels {
+  models: string[];
+  /** 数据来源：「本机反代」= 问了本机 7863，消耗为 0；「上游」= 反代没开，直连拉的。 */
+  source: string;
+  sourceUrl: string;
+}
+
 export interface UsageBucket {
   requests?: number;
   errors?: number;

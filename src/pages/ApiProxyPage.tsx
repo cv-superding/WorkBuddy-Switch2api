@@ -1,9 +1,19 @@
 import { useEffect, useState } from "react";
-import { Loader2, RefreshCw, Save, Trash2, Users } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
+import { Check, Copy, ListPlus, Loader2, RefreshCw, Save, Trash2, Users } from "lucide-react";
+import { toast } from "sonner";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -12,6 +22,7 @@ import {
   accountGroupLabel,
   type AccountMeta,
   type ProxyConfig,
+  type ProxyModels,
   type ProxyStatus,
   type ProxyUsage,
   type UsageBucket,
@@ -64,6 +75,7 @@ function bucketRow(name: string, b: UsageBucket) {
 }
 
 export default function ApiProxyPage() {
+  const [params] = useSearchParams();
   const [cfg, setCfg] = useState<ProxyConfig | null>(null);
   const [st, setSt] = useState<ProxyStatus | null>(null);
   const [accounts, setAccounts] = useState<AccountMeta[]>([]);
@@ -71,9 +83,16 @@ export default function ApiProxyPage() {
   const [saving, setSaving] = useState(false);
   const [resettingUsage, setResettingUsage] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  // 「获取模型ID」：拉一次模型列表，弹窗展示 + 一键复制
+  const [models, setModels] = useState<ProxyModels | null>(null);
+  const [modelsOpen, setModelsOpen] = useState(false);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
 
   useEffect(() => {
     void load();
+    // 截图/演示用：?models=1 直接展开模型列表（和迁移页的 ?tab=import 一个路子）
+    if (params.get("models") === "1") void fetchModels();
   }, []);
 
   async function load() {
@@ -116,6 +135,31 @@ export default function ApiProxyPage() {
       else next.delete(uid);
       return { ...prev, accounts: Array.from(next) };
     });
+  }
+
+  /** 拉一次可用模型列表：优先问本机反代，拿不到再直连上游。 */
+  async function fetchModels() {
+    setLoadingModels(true);
+    setMsg(null);
+    try {
+      const res = await api.getProxyModels();
+      setModels(res);
+      setModelsOpen(true);
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setLoadingModels(false);
+    }
+  }
+
+  async function copyText(text: string, key: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied((cur) => (cur === key ? null : cur)), 1600);
+    } catch {
+      toast.error("复制失败", { description: "可以手动选中后 Ctrl+C" });
+    }
   }
 
   const allAccounts = (cfg?.accounts.length ?? 0) === 0;
@@ -282,10 +326,26 @@ export default function ApiProxyPage() {
                     <>未运行{cfg.enabled ? "（点击保存后启动）" : ""}</>
                   )}
                 </div>
-                <Button size="sm" onClick={() => void save()} disabled={saving}>
-                  {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
-                  保存
-                </Button>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void fetchModels()}
+                    disabled={loadingModels}
+                    title="拉一次可用模型列表，客户端 model 字段照着填"
+                  >
+                    {loadingModels ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <ListPlus className="size-3.5" />
+                    )}
+                    获取模型ID
+                  </Button>
+                  <Button size="sm" onClick={() => void save()} disabled={saving}>
+                    {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+                    保存
+                  </Button>
+                </div>
               </div>
             </>
           ) : (
@@ -402,6 +462,58 @@ export default function ApiProxyPage() {
       <p className="mt-6 px-1 text-xs leading-5 text-muted-foreground/70">
         提示：如果开了梯子（系统代理），客户端连 127.0.0.1 失败时先设置 <code className="rounded bg-muted px-1">no_proxy=127.0.0.1,localhost</code>。
       </p>
+
+      <Dialog open={modelsOpen} onOpenChange={setModelsOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>可用模型 ID</DialogTitle>
+            <DialogDescription>
+              客户端里的 <code className="rounded bg-muted px-1">model</code> 字段填下面任意一个。
+              {models ? ` 共 ${models.models.length} 个 · 来源：${models.source}` : null}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="max-h-[46vh] divide-y divide-border/40 overflow-y-auto rounded-lg border border-border/60">
+            {(models?.models ?? []).map((id) => (
+              <div key={id} className="flex items-center justify-between gap-3 px-3 py-2">
+                <code className="min-w-0 flex-1 truncate text-[13px]">{id}</code>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 shrink-0 px-2"
+                  onClick={() => void copyText(id, id)}
+                  aria-label={`复制 ${id}`}
+                >
+                  {copied === id ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+                </Button>
+              </div>
+            ))}
+          </div>
+
+          <p className="text-xs leading-5 text-muted-foreground">
+            列表外的 ID 也能直接发（上游支持就行）；拉不到时会退回一组内置兜底。
+            {models?.sourceUrl ? (
+              <>
+                {" "}数据来自 <code className="rounded bg-muted px-1">{models.sourceUrl}</code>
+              </>
+            ) : null}
+          </p>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void copyText((models?.models ?? []).join("\n"), "__all__")}
+            >
+              {copied === "__all__" ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+              复制全部
+            </Button>
+            <Button size="sm" onClick={() => setModelsOpen(false)}>
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

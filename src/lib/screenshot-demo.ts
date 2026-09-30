@@ -1,8 +1,9 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
-  TravelConfig, TravelStatus,
+  GithubConfig, ProxyConfig, ProxyModels, ProxyStatus, ProxyUsage, RotateLog, RotateStatus,
+  TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals, TravelConfig, TravelStatus,
+  UsageBucket,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
 
@@ -349,6 +350,65 @@ function rotateConfig(): AutoRotateConfig {
   return { enabled: true, check_interval_minutes: 15, cooldown_minutes: 120, min_gap_hours: 24, min_urgency_hours: 72, active_guard_minutes: 30, min_remaining_credits: 50 };
 }
 
+/** 反代页的演示数据（演示/Pages 构建里也要能完整渲染这一页）。 */
+function proxyConfig(): ProxyConfig {
+  return { enabled: true, listen: "127.0.0.1:7863", api_key: "", accounts: [] };
+}
+
+function proxyStatus(): ProxyStatus {
+  return { running: true, listen: "127.0.0.1:7863", enabled: true, hasApiKey: false, accountCount: 11 };
+}
+
+function proxyUsage(): ProxyUsage {
+  const accounts = hydratedAccounts();
+  const byAccount: Record<string, UsageBucket> = {};
+  const seeds: Array<[number, number, number, number, number]> = [
+    [812, 2, 196_402_118, 384_512, 1_042.318],
+    [640, 1, 154_988_204, 301_776, 823.104],
+    [391, 0, 92_455_710, 180_244, 486.732],
+  ];
+  accounts.slice(0, seeds.length).forEach((a, i) => {
+    const [requests, errors, promptTokens, completionTokens, credit] = seeds[i];
+    byAccount[a.uid ?? a.id] = { nickname: a.nickname ?? a.uid ?? a.id, requests, errors, promptTokens, completionTokens, credit };
+  });
+  const byModel: Record<string, UsageBucket> = {
+    "deepseek-v4.1-flash": { requests: 1_026, promptTokens: 248_120_442, completionTokens: 512_884, credit: 1_364.211 },
+    "glm-5.3": { requests: 502, promptTokens: 121_884_006, completionTokens: 268_402, credit: 722.480 },
+    "kimi-k3-1": { requests: 315, promptTokens: 73_841_584, completionTokens: 85_246, credit: 265.463 },
+  };
+  const total = Object.values(byAccount).reduce<UsageBucket>(
+    (acc, b) => ({
+      requests: (acc.requests ?? 0) + (b.requests ?? 0),
+      errors: (acc.errors ?? 0) + (b.errors ?? 0),
+      promptTokens: (acc.promptTokens ?? 0) + (b.promptTokens ?? 0),
+      completionTokens: (acc.completionTokens ?? 0) + (b.completionTokens ?? 0),
+      credit: Number(((acc.credit ?? 0) + (b.credit ?? 0)).toFixed(6)),
+    }),
+    { requests: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0 },
+  );
+  const now = Date.now();
+  const recent = accounts.slice(0, 4).map((a, i) => ({
+    ts: now - i * 137_000,
+    uid: a.uid ?? a.id,
+    nickname: a.nickname ?? a.uid ?? a.id,
+    model: ["deepseek-v4.1-flash", "glm-5.3", "kimi-k3-1", "deepseek-v4.1-flash"][i],
+    stream: true,
+    ok: i !== 3,
+    promptTokens: [8_442, 12_905, 3_118, 6_740][i],
+    completionTokens: [1_208, 2_461, 640, 0][i],
+    credit: [12.406, 24.118, 5.902, 0][i],
+  }));
+  return { updatedAt: now, total, byAccount, byModel, recent };
+}
+
+function proxyModels(): ProxyModels {
+  return {
+    models: ["auto", "hy4-preview", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "kimi-k3-1", "minimax-m3"],
+    source: "本机反代",
+    sourceUrl: "http://127.0.0.1:7863/v1/models",
+  };
+}
+
 function checkinLogs(): CheckinLog[] {
   return hydratedAccounts().flatMap((account, accountIndex) => [0, 1, 2].map((daysAgo) => ({ ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9), accountId: account.id, email: account.nickname ?? account.email ?? account.id, result: accountIndex === 1 && daysAgo === 0 ? "already" : "success" })));
 }
@@ -443,6 +503,10 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "check_update": return { ok: true, current: "0.1.24", latest: "0.1.25", latestTag: "v0.1.25", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: "https://github.com/cv-superding/WorkBuddy-Switch2api/releases/tag/v0.1.25" };
     case "get_launch_at_login_enabled": return true;
     case "switch_progress": return { running: false, progress: null };
+    case "get_proxy_config": return proxyConfig();
+    case "get_proxy_status": return proxyStatus();
+    case "get_proxy_usage": return proxyUsage();
+    case "get_proxy_models": return proxyModels();
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }

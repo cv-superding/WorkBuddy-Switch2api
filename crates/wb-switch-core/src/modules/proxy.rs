@@ -527,6 +527,80 @@ fn push_unique(ids: &mut Vec<String>, id: &str) {
     }
 }
 
+/// 上游模型列表的兜底（拉不到时给一组可用的，免得客户端因为空列表直接报错）。
+const FALLBACK_MODEL_IDS: [&str; 7] = [
+    "auto",
+    "hy4-preview",
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
+    "glm-5.3",
+    "kimi-k3-1",
+    "minimax-m3",
+];
+
+/// 从上游响应里抠出模型 id。
+/// 上游结构：`{ code, msg, data: { agents: [ { name, models: [...] } ] } }`，
+/// 也可能直接是 `{ data: [...] }` 或裸数组，这里都兜住。
+fn parse_model_ids(v: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(agents) = v.pointer("/data/agents").and_then(Value::as_array) {
+        for a in agents {
+            if let Some(models) = a.get("models").and_then(Value::as_array) {
+                for m in models {
+                    if let Some(s) = m.as_str() {
+                        push_unique(&mut ids, s);
+                    }
+                }
+            }
+        }
+    }
+    if ids.is_empty() {
+        let items = match v.get("data").cloned() {
+            Some(Value::Array(arr)) => arr,
+            _ => v.as_array().cloned().unwrap_or_default(),
+        };
+        for m in items {
+            let id = m
+                .get("id")
+                .or_else(|| m.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            push_unique(&mut ids, id);
+        }
+    }
+    if ids.is_empty() {
+        for s in FALLBACK_MODEL_IDS {
+            push_unique(&mut ids, s);
+        }
+    }
+    ids
+}
+
+/// 本机反代 `/v1/models` 的响应（OpenAI 形状）里抠 id。
+fn parse_openai_model_list(v: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(items) = v.get("data").and_then(Value::as_array) {
+        for m in items {
+            let id = m
+                .get("id")
+                .or_else(|| m.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            push_unique(&mut ids, id);
+        }
+    }
+    ids
+}
+
+fn cut_text(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 async fn list_models(State(st): State<AppState>) -> Response {
     let Some(acc) = take_account(&st.pool, &st.cfg).await else {
         return (
@@ -544,51 +618,9 @@ async fn list_models(State(st): State<AppState>) -> Response {
         req = req.header(k, v);
     }
     match req.send().await {
-            Ok(resp) => match resp.json::<Value>().await {
-                Ok(v) => {
-                // 上游结构：{ code, msg, data: { agents: [ { name, models: [...] } ] } }
-                // 也可能直接是 { data: [...] } 或裸数组，这里都兜住。
-                let mut ids: Vec<String> = Vec::new();
-                if let Some(agents) = v.pointer("/data/agents").and_then(Value::as_array) {
-                    for a in agents {
-                        if let Some(models) = a.get("models").and_then(Value::as_array) {
-                            for m in models {
-                                if let Some(s) = m.as_str() {
-                                    push_unique(&mut ids, s);
-                                }
-                            }
-                        }
-                    }
-                }
-                if ids.is_empty() {
-                    let items = match v.get("data").cloned() {
-                        Some(Value::Array(arr)) => arr,
-                        _ => v.as_array().cloned().unwrap_or_default(),
-                    };
-                    for m in items {
-                        let id = m
-                            .get("id")
-                            .or_else(|| m.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        push_unique(&mut ids, id);
-                    }
-                }
-                if ids.is_empty() {
-                    // 拉不到就给一个可用的兜底，避免客户端因为空列表直接报错。
-                    for s in [
-                        "auto",
-                        "hy4-preview",
-                        "deepseek-v4-pro",
-                        "deepseek-v4.1-flash",
-                        "glm-5.3",
-                        "kimi-k3-1",
-                        "minimax-m3",
-                    ] {
-                        push_unique(&mut ids, s);
-                    }
-                }
-                let data: Vec<Value> = ids
+        Ok(resp) => match resp.json::<Value>().await {
+            Ok(v) => {
+                let data: Vec<Value> = parse_model_ids(&v)
                     .into_iter()
                     .map(|id| json!({"id": id, "object": "model", "owned_by": "workbuddy"}))
                     .collect();
@@ -598,6 +630,96 @@ async fn list_models(State(st): State<AppState>) -> Response {
         },
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
+}
+
+// ---------------------------------------------------------------- 取模型列表（桌面端按钮用）
+
+/// 从账号库里挑一个可用账号（必要时先刷新 token）。不参与轮转、不动失败冷却。
+async fn pick_any_account(cfg: &ProxyConfig) -> Option<Value> {
+    let want = cfg.accounts.clone();
+    let acc = load_accounts().into_iter().find(|a| {
+        a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
+            && (want.is_empty()
+                || a.get("uid")
+                    .and_then(Value::as_str)
+                    .map(|u| want.iter().any(|w| w == u))
+                    .unwrap_or(false))
+    })?;
+    let exp = acc.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+    if exp - now_ms_i64() >= REFRESH_MARGIN_MS {
+        return Some(acc);
+    }
+    match tokio::time::timeout(Duration::from_secs(30), refresh_account_token(acc.clone())).await {
+        Ok(refreshed) if refreshed.get("needs_relogin").and_then(Value::as_bool) != Some(true) => {
+            let _ = upsert_account(&refreshed);
+            Some(refreshed)
+        }
+        Ok(_) => None,
+        Err(_) => {
+            eprintln!("[反代] 取模型列表前刷新超时");
+            None
+        }
+    }
+}
+
+/// 「获取模型ID」：先问本机反代（同一份数据、不额外占号），拿不到再直连上游。
+/// 返回 `{ models: [...], source: "本机反代" | "上游", sourceUrl }`。
+pub async fn fetch_models() -> Result<Value, String> {
+    let cfg = load_proxy_config();
+
+    if proxy_running() {
+        let host = cfg.listen.replacen("0.0.0.0", "127.0.0.1", 1);
+        let url = format!("http://{host}/v1/models");
+        if let Ok(client) = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(15))
+            .build()
+        {
+            let mut req = client.get(&url);
+            if !cfg.api_key.trim().is_empty() {
+                req = req.header("authorization", format!("Bearer {}", cfg.api_key.trim()));
+            }
+            if let Ok(r) = req.send().await {
+                if r.status().is_success() {
+                    if let Ok(v) = r.json::<Value>().await {
+                        let ids = parse_openai_model_list(&v);
+                        if !ids.is_empty() {
+                            return Ok(json!({
+                                "models": ids,
+                                "source": "本机反代",
+                                "sourceUrl": url,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let acc = pick_any_account(&cfg)
+        .await
+        .ok_or_else(|| "没有可用账号：账号库为空，或全部需要重新登录".to_string())?;
+    let url = models_url(&acc);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(&url);
+    for (k, v) in chat_headers(&acc) {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.map_err(|e| format!("请求上游失败：{e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("上游返回 {status}：{}", cut_text(&text, 200)));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("上游返回不是 JSON：{e}"))?;
+    Ok(json!({
+        "models": parse_model_ids(&v),
+        "source": "上游",
+        "sourceUrl": url,
+    }))
 }
 
 // ---------------------------------------------------------------- 用量统计
@@ -1599,5 +1721,35 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("f_123"));
+    }
+
+    /// 上游 `data.agents[].models[]` 形态。
+    #[test]
+    fn parse_model_ids_reads_agents() {
+        let v = json!({
+            "code": 0,
+            "data": { "agents": [
+                { "name": "a", "models": ["glm-5.3", "kimi-k3-1"] },
+                { "name": "b", "models": ["glm-5.3", "deepseek-v4-pro"] }
+            ]}
+        });
+        // 去重且保序
+        assert_eq!(parse_model_ids(&v), vec!["glm-5.3", "kimi-k3-1", "deepseek-v4-pro"]);
+    }
+
+    /// 兜底形态：`{data:[{id}]}`（本机反代 / OpenAI 风格）。
+    #[test]
+    fn parse_model_ids_reads_openai_list() {
+        let v = json!({ "object": "list", "data": [ {"id": "auto"}, {"id": "glm-5.3"} ] });
+        assert_eq!(parse_model_ids(&v), vec!["auto", "glm-5.3"]);
+        assert_eq!(parse_openai_model_list(&v), vec!["auto", "glm-5.3"]);
+    }
+
+    /// 啥都拿不到时给内置兜底，别让客户端拿到空列表。
+    #[test]
+    fn parse_model_ids_falls_back() {
+        let ids = parse_model_ids(&json!({ "code": 0 }));
+        assert!(ids.contains(&"auto".to_string()));
+        assert_eq!(ids.len(), FALLBACK_MODEL_IDS.len());
     }
 }
