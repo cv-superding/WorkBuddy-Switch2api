@@ -6,7 +6,8 @@
 //! 平台加密模型对齐 Chromium/Electron Safe Storage：
 //! - macOS: Keychain「CodeBuddy CN Safe Storage」→ PBKDF2-SHA1(1003) → AES-128-CBC `v10`
 //! - Windows: Local State `os_crypt.encrypted_key` + DPAPI → AES-256-GCM `v10`
-//! - Linux: secret-tool / peanuts 固定密钥 → AES-128-CBC `v11`/`v10`
+//! - Linux: Secret Service（`org.freedesktop.secrets`）密钥 → AES-128-CBC `v11`；
+//!   没有密钥环时退回 peanuts 固定密钥 `v10`
 
 use std::path::{Path, PathBuf};
 
@@ -237,14 +238,21 @@ const LINUX_EMPTY_KEY: [u8; 16] = [
     0xd0, 0xd0, 0xec, 0x9c, 0x7d, 0x77, 0xd4, 0x3a, 0xc5, 0x41, 0x87, 0xfa, 0x48, 0x18, 0xd1, 0x7f,
 ];
 
+/// Linux 密钥环里的应用名候选：Secret Service 按 `application` 属性检索，
+/// `secret-tool` 兜底路径按同一属性查询。
+#[cfg(target_os = "linux")]
+const LINUX_SECRET_APP_NAMES: [&str; 4] =
+    ["CodeBuddy CN", "codebuddy cn", "codebuddy-cn", "codebuddycn"];
+
 #[cfg(target_os = "linux")]
 fn get_linux_v11_key() -> Option<[u8; 16]> {
-    for app in [
-        "CodeBuddy CN",
-        "codebuddy cn",
-        "codebuddy-cn",
-        "codebuddycn",
-    ] {
+    // 优先原生 D-Bus（Secret Service）：`secret-tool` 属于 libsecret-tools，多数发行版
+    // 默认不装，而 Electron 早把密码写进了 gnome-keyring，只差一个读得到的客户端。
+    if let Some(password) = crate::modules::linux_keyring::find_password(&LINUX_SECRET_APP_NAMES) {
+        return Some(pbkdf2_sha1_key(&password, 1));
+    }
+    // 兜底：极少数只装了 libsecret-tools 的环境，按老路子再试一次。
+    for app in LINUX_SECRET_APP_NAMES {
         if let Some(password) =
             run_command_get_trimmed("secret-tool", &["lookup", "application", app], 10)
         {
@@ -252,6 +260,16 @@ fn get_linux_v11_key() -> Option<[u8; 16]> {
         }
     }
     None
+}
+
+/// v11 密钥缺失时的提示：直接说清「谁去开、怎么开」，不要只说一句加载失败。
+///
+/// 文案刻意不出现 "Safe Storage" / "Keychain"：上层会按这两个词追加 macOS
+/// 钥匙串指引，那是平台错位的建议。
+#[cfg(target_os = "linux")]
+fn linux_v11_key_error() -> String {
+    "无法从系统密钥环读取 CodeBuddy CN 的登录凭证密钥（v11）。请确认 gnome-keyring /      KWallet 已启动、登录密钥环已解锁，并先手动打开 CodeBuddy CN 登录一次。"
+        .to_string()
 }
 
 #[cfg(target_os = "windows")]
@@ -370,9 +388,7 @@ fn decrypt_secret_payload(encrypted: &[u8], data_root: &Path) -> Result<Vec<u8>,
         let _ = data_root;
         match detect_prefix(encrypted) {
             Some("v11") => {
-                let key = get_linux_v11_key().ok_or_else(|| {
-                    "无法加载 Linux secret storage key（v11）".to_string()
-                })?;
+                let key = get_linux_v11_key().ok_or_else(linux_v11_key_error)?;
                 match decrypt_cbc_prefixed(encrypted, V11_PREFIX, &key) {
                     Ok(value) => Ok(value),
                     Err(_) => decrypt_cbc_prefixed(encrypted, V11_PREFIX, &LINUX_EMPTY_KEY),
@@ -424,8 +440,7 @@ fn encrypt_secret_payload(
             "v10"
         };
         if target_prefix == "v11" {
-            let key = get_linux_v11_key()
-                .ok_or_else(|| "无法加载 Linux secret storage key（v11）".to_string())?;
+            let key = get_linux_v11_key().ok_or_else(linux_v11_key_error)?;
             return encrypt_cbc_prefixed(V11_PREFIX, &key, plaintext);
         }
         return encrypt_cbc_prefixed(V10_PREFIX, &LINUX_V10_KEY, plaintext);

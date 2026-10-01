@@ -96,7 +96,10 @@ fn merge_import_record(accounts: &mut Vec<Value>, item: &Value) -> MergeOutcome 
             return MergeOutcome::Overwritten;
         }
     }
-    accounts.push(item.clone());
+    // 追加分支也必须带 id：否则下一次刷新回写会再追加一条（issue #111）。
+    let mut appended = item.clone();
+    account::ensure_account_id(&mut appended);
+    accounts.push(appended);
     MergeOutcome::Appended
 }
 
@@ -252,6 +255,19 @@ mod tests {
     fn parse_rejects_non_object_element() {
         let err = parse_accounts_json(r#"[{ "uid": "u1" }, 42]"#).unwrap_err();
         assert!(err.contains("第 2 项"), "错误应带位置：{err}");
+    }
+
+    /// 导入缺 id 的记录时，追加进账号库的副本必须自带 id（issue #111 的入口侧）。
+    #[test]
+    fn imported_record_without_id_gets_one() {
+        let mut accounts: Vec<Value> = Vec::new();
+        let text = r#"[{ "uid": "u1", "nickname": "导入", "access_token": "t" }]"#;
+        let res = merge_import_records(&mut accounts, text, &[0]).unwrap();
+        assert_eq!(res.imported, 1);
+        assert!(
+            account::get_str(&accounts[0], "id").is_some(),
+            "导入追加的记录必须带 id"
+        );
     }
 
     #[test]

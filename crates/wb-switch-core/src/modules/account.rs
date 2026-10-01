@@ -131,6 +131,21 @@ pub fn get_str(v: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 账号库不变量：**每条记录都必须带 id**（空串视为缺失）。
+///
+/// 为什么会缺：导入 / 采集来的 JSON 可能没有 id；刷新回写按 id 匹配，
+/// 未命中就追加，于是无 id 记录每轮刷新都复制一份，后台签到/旅行/保活
+/// 反复全量刷新会把它放大成指数增长（上游 issue #111）。
+/// 这里统一补 id，写入路径不再产生无 id 记录。
+pub(crate) fn ensure_account_id(account: &mut Value) -> String {
+    if let Some(id) = get_str(account, "id") {
+        return id;
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    account["id"] = Value::String(id.clone());
+    id
+}
+
 /// 返回可用于 UID 缺失场景的真实邮箱。历史展示占位值不参与身份匹配。
 fn identity_email(account: &Value) -> Option<String> {
     let email = get_str(account, "email")?;
@@ -189,12 +204,17 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
         if let Some(created_at) = existing.get("createdAt").cloned() {
             collected["createdAt"] = created_at;
         }
+        // 命中身份后补齐 id：老库里缺 id 的记录在这一步被收敛，
+        // 之后每轮刷新都按 id 命中，不再新增副本。
+        ensure_account_id(&mut collected);
 
         for index in matching_indexes.into_iter().rev() {
             accounts.remove(index);
         }
         accounts.insert(first_index.min(accounts.len()), collected.clone());
     } else {
+        // 新账号同样必须带 id，否则下次刷新会再追加一条。
+        ensure_account_id(&mut collected);
         accounts.push(collected.clone());
     }
 
@@ -209,22 +229,53 @@ pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
     Ok(saved)
 }
 
-/// 按 id 覆盖写入账号库（不存在则追加）。对照 server.py `_upsert_account`。
+/// 按 id 覆盖写入账号库；id 缺失或未命中时按 uid 回退覆盖，仍未命中才追加。
+///
+/// 以前只按 id 匹配、未命中即追加：导入进来缺 id 的记录会在每次刷新回写时
+/// 多出一条副本（上游 issue #111）。现在三条路径都保证结果带 id，
+/// 并且按 uid 命中时保留本地 id，避免调用方手里的引用漂移。
 pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
     let mut accounts = load_accounts();
-    let id = updated.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let mut replaced = false;
-    for a in accounts.iter_mut() {
-        if a.get("id").and_then(|v| v.as_str()) == Some(id) {
-            *a = updated.clone();
-            replaced = true;
-            break;
+    upsert_account_in(&mut accounts, updated);
+    save_accounts(&accounts)
+}
+
+/// 内存实现，便于单测。
+pub(crate) fn upsert_account_in(accounts: &mut Vec<Value>, updated: &Value) {
+    let id = get_str(updated, "id");
+    let id_index = id.as_deref().and_then(|id| {
+        accounts
+            .iter()
+            .position(|a| get_str(a, "id").as_deref() == Some(id))
+    });
+    let uid_index = if id_index.is_none() {
+        get_str(updated, "uid").as_deref().and_then(|uid| {
+            accounts
+                .iter()
+                .position(|a| get_str(a, "uid").as_deref() == Some(uid))
+        })
+    } else {
+        None
+    };
+
+    match id_index.or(uid_index) {
+        Some(index) => {
+            let mut next = updated.clone();
+            // 按 uid 命中时以本地 id 为准（即使刷新对象带了另一个 id）。
+            if uid_index.is_some() {
+                if let Some(local_id) = get_str(&accounts[index], "id") {
+                    next["id"] = Value::String(local_id);
+                }
+            }
+            ensure_account_id(&mut next);
+            accounts[index] = next;
+        }
+        None => {
+            let mut next = updated.clone();
+            ensure_account_id(&mut next);
+            accounts.push(next);
         }
     }
-    if !replaced {
-        accounts.push(updated.clone());
-    }
-    save_accounts(&accounts)
 }
 
 /// 构造与官方对齐的请求头。对照 server.py `build_auth_headers`。
@@ -341,6 +392,45 @@ mod tests {
         );
         assert_eq!(account_display_name(&json!({"uid": "u"})), "u");
         assert_eq!(account_display_name(&json!({})), "unknown");
+    }
+
+    /// 账号库不变量：追加 / uid 回退覆盖都要带 id，且不得重复追加（上游 issue #111）。
+    #[test]
+    fn upsert_keeps_single_record_and_always_has_id() {
+        let mut accounts = vec![json!({
+            "id": "local-1",
+            "uid": "u1",
+            "nickname": "旧名",
+            "access_token": "t1",
+            "createdAt": 1,
+        })];
+
+        // ① 刷新对象没带 id，但 uid 命中 → 原地覆盖，保留本地 id，不新增记录
+        upsert_account_in(&mut accounts, &json!({ "uid": "u1", "nickname": "新名", "access_token": "t2" }));
+        assert_eq!(accounts.len(), 1, "uid 命中不该追加新记录");
+        assert_eq!(get_str(&accounts[0], "id").as_deref(), Some("local-1"), "本地 id 应保留");
+        assert_eq!(get_str(&accounts[0], "nickname").as_deref(), Some("新名"));
+
+        // ② 全新 uid → 追加，且必须自带 id
+        upsert_account_in(&mut accounts, &json!({ "uid": "u2", "nickname": "二号" }));
+        assert_eq!(accounts.len(), 2);
+        assert!(get_str(&accounts[1], "id").is_some(), "追加的记录必须带 id");
+
+        // ③ 再刷新一次同一个新账号 → 仍然只有两条（按 id 命中）
+        let second_id = get_str(&accounts[1], "id").unwrap();
+        upsert_account_in(&mut accounts, &json!({ "id": second_id, "uid": "u2", "nickname": "二号改" }));
+        assert_eq!(accounts.len(), 2, "重复刷新不该复制记录");
+    }
+
+    /// 无 id 的历史记录被采集覆盖时也要收敛出 id（否则每轮刷新都加一条副本）。
+    #[test]
+    fn collected_account_without_id_gets_one() {
+        let mut accounts: Vec<Value> = Vec::new();
+        let first = upsert_collected_account(&mut accounts, json!({ "uid": "u9", "nickname": "a" }));
+        assert!(get_str(&first, "id").is_some());
+        let second = upsert_collected_account(&mut accounts, json!({ "uid": "u9", "nickname": "b" }));
+        assert_eq!(accounts.len(), 1, "同身份采集不该新增记录");
+        assert_eq!(get_str(&second, "id"), get_str(&first, "id"), "id 应稳定");
     }
 
     #[test]

@@ -34,3 +34,8 @@ base64 = "0.22"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
+# Linux 密钥环：直接按 Secret Service（D-Bus）协议读 Safe Storage 密码，
+# 不依赖默认不安装的 secret-tool（上游 issue #80）。zbus 5.19.0 已在
+# 依赖图 / Cargo.lock 里，只多一条依赖边，不新增下载。
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
