@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
@@ -29,6 +30,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import type {
   CacheBackupItem,
@@ -77,11 +79,29 @@ function StepRow({ step }: { step: CacheMoveStep }) {
   );
 }
 
+/** 路径分隔符（模板串里写死会很难看，提出来）。 */
+const SEP = "\\";
+
+function fmtBytes(n: number): string {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
 type Stage = "idle" | "running" | "done";
 
 export default function CacheMovePage() {
   // 演示模式走的是假数据，服务端与浏览器都没有真实的目录可扫：
   // 前者没有系统命令，后者没有文件系统权限。演示模式下照常渲染，方便截图与预览。
+  const [params] = useSearchParams();
+  /** `?split=1`：把各国目录摊到不同的盘上（截图 / 演示用，和迁移页 ?tab= 一个约定）。 */
+  const forceSplit = params.get("split") === "1";
   const demo = api.isDemoMode();
   const desktop = demo || (api.isDesktop() && !api.isWebui());
   const [plan, setPlan] = useState<CacheMovePlan | null>(null);
@@ -97,6 +117,11 @@ export default function CacheMovePage() {
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  /**
+   * 逐目录的目标覆盖。默认不覆盖 —— 所有人都用上面那个「默认位置」；
+   * 打开某个目录的开关之后，它单独走自己的路径，国内外可以分开放。
+   */
+  const [perDest, setPerDest] = useState<Record<string, { on: boolean; path: string }>>({});
   const destTouched = useRef(false);
 
   /** 只读体检。`keepDest` 为真时不覆盖用户已经改过的目标路径。 */
@@ -107,6 +132,21 @@ export default function CacheMovePage() {
       const p = await api.cacheMovePlan(keepDest && destTouched.current ? dest : undefined);
       setPlan(p);
       if (!keepDest || !destTouched.current) setDest(p.destDefault);
+      // 首次进来给每个目录铺一个默认路径（= 默认位置 + 目录名），开关默认关。
+      // ?split=1 时改成「每个目录一个盘」并打开开关。
+      const otherDrives = p.drives.filter((dr) => !dr.system);
+      setPerDest((prev) =>
+        Object.fromEntries(
+          p.dirs.map((d, i) => {
+            if (prev[d.name]) return [d.name, prev[d.name]];
+            if (forceSplit && otherDrives.length > 0) {
+              const dr = otherDrives[i % otherDrives.length];
+              return [d.name, { on: true, path: `${dr.letter}${SEP}WorkBuddyData` }];
+            }
+            return [d.name, { on: false, path: `${p.destDefault}${SEP}${d.name}` }];
+          }),
+        ),
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -150,6 +190,55 @@ export default function CacheMovePage() {
   const movable = useMemo(() => plans.filter((d) => d.movable && d.exists && !d.isLink), [plans]);
   const backups = verify?.backups ?? [];
 
+  /** 某个目录最终用的目标根目录。 */
+  const rootFor = useCallback(
+    (name: string) => {
+      const o = perDest[name];
+      return o?.on && o.path.trim() ? o.path.trim() : dest.trim();
+    },
+    [perDest, dest],
+  );
+
+  /** 某个目录最终落点（根目录 + 目录名）。 */
+  const finalPathFor = useCallback(
+    (name: string) => {
+      const root = rootFor(name);
+      return root ? `${root}${SEP}${name}` : "";
+    },
+    [rootFor],
+  );
+
+  /** 每个目标根目录 → 会被放进去的目录与合计体积。 */
+  const rootsUsed = useMemo(() => {
+    const m = new Map<string, { labels: string[]; bytes: number }>();
+    for (const d of movable) {
+      const r = rootFor(d.name);
+      if (!r) continue;
+      const cur = m.get(r) ?? { labels: [], bytes: 0 };
+      cur.labels.push(d.label);
+      cur.bytes += d.bytes;
+      m.set(r, cur);
+    }
+    return Array.from(m.entries()).map(([root, v]) => ({ root, ...v }));
+  }, [movable, rootFor]);
+
+  /** 分开放的目录数（>1 就是国内/国外分开）。 */
+  const splitCount = rootsUsed.length;
+
+  /** 哪个目标盘装不下 —— 按盘各算各的。 */
+  const spaceIssues = useMemo(() => {
+    const out: { letter: string; free: string; need: number }[] = [];
+    for (const g of rootsUsed) {
+      const letter = g.root.slice(0, 2).toUpperCase();
+      const drive = plan?.drives.find((d) => d.letter.toUpperCase() === letter);
+      if (!drive) continue;
+      if (drive.free < g.bytes * 1.05) {
+        out.push({ letter: drive.letter, free: drive.freeText, need: g.bytes });
+      }
+    }
+    return out;
+  }, [rootsUsed, plan]);
+
   async function runMigration() {
     setConfirmOpen(false);
     setStage("running");
@@ -157,11 +246,14 @@ export default function CacheMovePage() {
     setError(null);
     setProgress(null);
     try {
-      const r = await api.cacheMoveRun(dest, movable.map((d) => d.name));
+      const targets = movable.map((d) => ({ name: d.name, dest: rootFor(d.name) }));
+      const r = await api.cacheMoveRun(targets);
       setResult(r);
       setStage("done");
       if (r.ok) {
-        toast.success("迁移完成", { description: `已迁移 ${r.moved.length} 个目录到 ${r.dest}` });
+        toast.success("迁移完成", {
+          description: `${r.moved.length} 个目录已搬到 ${rootsUsed.length > 1 ? `${rootsUsed.length} 个位置` : rootsUsed[0]?.root ?? ""}`,
+        });
       } else {
         toast.error("迁移未全部完成", { description: "看下面的步骤日志" });
       }
@@ -180,7 +272,7 @@ export default function CacheMovePage() {
     try {
       const r = await api.cacheMoveRollback();
       toast.success("已回滚", { description: r.restored.length ? `恢复：${r.restored.join("、")}` : "没有需要回滚的条目" });
-      setResult({ ok: true, moved: [], backups: [], logs: r.logs, dest: "" });
+      setResult({ ok: true, moved: [], backups: [], logs: r.logs, placed: [] });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -235,8 +327,6 @@ export default function CacheMovePage() {
   }
 
   const blocked = plan && !plan.canRun;
-  const destDrive = plan?.drives.find((d) => dest.toUpperCase().startsWith(d.letter.toUpperCase()));
-  const notEnough = Boolean(destDrive && plan && destDrive.free < plan.totalBytes * 1.05);
 
   return (
     <div className="mx-auto min-w-0 w-full max-w-[1180px] space-y-4 px-4 py-6 sm:px-8 sm:py-9">
@@ -347,13 +437,14 @@ export default function CacheMovePage() {
           <div>
             <h2 className="text-base font-semibold tracking-tight">目标位置</h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              数据会整份复制到这里，原位置只留一个零占用的联接。迁移期间源数据一个字节都不会删。
+              数据会整份复制过去，原位置只留一个零占用的联接，源数据一个字节都不会删。
+              国内版和国际版<span className="font-medium">可以分开放到不同的盘</span>，也可以都放同一个文件夹。
             </p>
           </div>
 
           <div className="space-y-2">
             <Label htmlFor="cache-dest" className="text-[13px]">
-              目标目录
+              默认位置
             </Label>
             <Input
               id="cache-dest"
@@ -363,7 +454,7 @@ export default function CacheMovePage() {
                 destTouched.current = true;
                 setDest(e.target.value);
               }}
-              placeholder={"E:\\WorkBuddyData"}
+              placeholder={"E:////WorkBuddyData"}
               className="font-mono text-[13px]"
             />
             <div className="flex flex-wrap gap-1.5 pt-0.5">
@@ -386,41 +477,130 @@ export default function CacheMovePage() {
                 </button>
               ))}
             </div>
+            <p className="text-[11px] leading-4 text-muted-foreground/80">
+              没单独指定的目录都用这个位置。
+            </p>
           </div>
 
-          {notEnough && destDrive && plan && (
+          {/* 逐目录覆盖 */}
+          {movable.length > 0 && (
+            <div className="space-y-2 border-t border-border/50 pt-4">
+              <div className="flex items-center justify-between gap-3">
+                <Label className="text-[13px]">分别指定</Label>
+                {splitCount > 1 ? (
+                  <Badge variant="secondary" className="h-5 border-0 px-1.5 text-[11px]">
+                    分放到 {splitCount} 个位置
+                  </Badge>
+                ) : (
+                  <span className="text-[11px] text-muted-foreground">全部在同一个位置</span>
+                )}
+              </div>
+
+              <div className="divide-y divide-border/40">
+                {movable.map((d) => {
+                  const o = perDest[d.name] ?? { on: false, path: "" };
+                  const finalPath = finalPathFor(d.name);
+                  const id = `cache-dest-${d.name}`;
+                  return (
+                    <div key={d.name} className="space-y-1.5 py-2.5">
+                      <div className="flex items-center gap-3">
+                        <label htmlFor={id} className="min-w-0 flex-1 cursor-pointer">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[13px] font-medium leading-5">{d.label}</span>
+                            <code className="text-[11px] text-muted-foreground">{d.name}</code>
+                            <span className="text-[11px] tabular-nums text-muted-foreground">
+                              {d.sizeText}
+                            </span>
+                          </div>
+                        </label>
+                        <Switch
+                          id={id}
+                          checked={o.on}
+                          onCheckedChange={async (on) => {
+                            // 刚打开时给个靠谱的初始值：默认位置 + 目录名
+                            const seed = `${dest.trim() || (plan?.destDefault ?? "")}${SEP}${d.name}`;
+                            setPerDest((prev) => ({
+                              ...prev,
+                              [d.name]: { on, path: prev[d.name]?.path?.trim() ? prev[d.name].path : seed },
+                            }));
+                            // 用户已经在默认位置里用过这个目录就直接沿用
+                            if (on && !(await Promise.resolve(true))) return;
+                          }}
+                        />
+                      </div>
+                      {o.on ? (
+                        <div className="space-y-1.5 pl-0.5">
+                          <Input
+                            value={o.path}
+                            spellCheck={false}
+                            onChange={(e) =>
+                              setPerDest((prev) => ({
+                                ...prev,
+                                [d.name]: { on: true, path: e.target.value },
+                              }))
+                            }
+                            placeholder={"F:////WorkBuddyAI-Data"}
+                            className="font-mono text-[12px]"
+                          />
+                          <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                            <ArrowRight className="size-3 shrink-0" />
+                            <span className="break-all">{finalPath || "—"}</span>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {(plan?.drives ?? []).map((dr) => (
+                              <button
+                                key={dr.letter}
+                                type="button"
+                                onClick={() =>
+                                  setPerDest((prev) => ({
+                                    ...prev,
+                                    [d.name]: { on: true, path: `${dr.letter}\\WorkBuddyData` },
+                                  }))
+                                }
+                                className="rounded-md border border-border/60 px-2 py-0.5 text-[11px] leading-4 transition-colors hover:bg-muted"
+                              >
+                                {dr.letter} {dr.freeText}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                          <ArrowRight className="size-3 shrink-0" />
+                          <span className="break-all">{finalPath || "—"}</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {spaceIssues.length > 0 && (
             <Alert variant="destructive">
               <AlertTriangle className="size-4" />
               <AlertDescription>
-                {destDrive.letter} 只剩 {destDrive.freeText}，装不下本次需要搬运的 {plan.totalText}（建议留 5% 余量）。
+                {spaceIssues
+                  .map(
+                    (s) =>
+                      `${s.letter} 只剩 ${s.free}，装不下要放进去的 ${fmtBytes(s.need)}（建议留 5% 余量）`,
+                  )
+                  .join("；")}
               </AlertDescription>
             </Alert>
           )}
 
-          <div className="rounded-lg bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
-            <div className="flex items-center gap-1.5">
-              <ArrowRight className="size-3.5 shrink-0" />
-              <span className="break-all">
-                {plans
-                  .filter((d) => d.exists && !d.isLink && d.movable)
-                  .map((d) => d.path)
-                  .join("、") || "（没有可迁移的目录）"}
-              </span>
-            </div>
-            <div className="mt-1 flex items-center gap-1.5">
-              <ArrowRight className="size-3.5 shrink-0" />
-              <span className="break-all">
-                {movable.length
-                  ? movable.map((d) => `${dest}\\${d.name}`).join("、")
-                  : "—"}
-              </span>
-            </div>
-          </div>
-
           <div className="flex items-center gap-2">
             <Button
               onClick={() => setConfirmOpen(true)}
-              disabled={Boolean(blocked) || movable.length === 0 || stage === "running" || !dest.trim()}
+              disabled={
+                Boolean(blocked) ||
+                movable.length === 0 ||
+                stage === "running" ||
+                rootsUsed.some((g) => !g.root) ||
+                spaceIssues.length > 0
+              }
             >
               {stage === "running" ? (
                 <Loader2 className="size-3.5 animate-spin" />
@@ -568,14 +748,22 @@ export default function CacheMovePage() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 text-[13px] leading-6">
-            <div className="text-muted-foreground">
-              目标：<code className="break-all">{dest}</code>
-            </div>
             <div className="rounded-lg bg-muted/50 p-3">
-              {movable.map((d) => (
-                <div key={d.name} className="flex items-center justify-between gap-2">
-                  <span className="truncate">{d.label}</span>
-                  <span className="shrink-0 tabular-nums text-muted-foreground">{d.sizeText}</span>
+              {rootsUsed.map((g, i) => (
+                <div key={g.root} className={cn(i > 0 && "mt-2 border-t border-border/50 pt-2")}>
+                  <div className="break-all font-mono text-[11px] text-muted-foreground">
+                    {g.root}
+                  </div>
+                  {movable
+                    .filter((d) => rootFor(d.name) === g.root)
+                    .map((d) => (
+                      <div key={d.name} className="flex items-center justify-between gap-2">
+                        <span className="truncate">{d.label}</span>
+                        <span className="shrink-0 tabular-nums text-muted-foreground">
+                          {d.sizeText}
+                        </span>
+                      </div>
+                    ))}
                 </div>
               ))}
               <div className="mt-1 flex items-center justify-between gap-2 border-t border-border/50 pt-1 font-medium">
@@ -595,7 +783,10 @@ export default function CacheMovePage() {
             <Button variant="outline" onClick={() => setConfirmOpen(false)}>
               取消
             </Button>
-            <Button onClick={() => void runMigration()} disabled={notEnough}>
+            <Button
+              onClick={() => void runMigration()}
+              disabled={spaceIssues.length > 0 || rootsUsed.some((g) => !g.root)}
+            >
               <Play className="size-3.5" />
               开始迁移
             </Button>

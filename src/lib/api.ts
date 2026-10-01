@@ -41,6 +41,7 @@ import type {
   TransferImportResult,
   CacheMovePlan,
   CacheMoveResult,
+  CacheMoveTarget,
   CacheMoveRollbackResult,
   CacheMoveCleanupResult,
   CacheBackupItem,
@@ -657,9 +658,14 @@ export function cacheMoveVerify(): Promise<CacheVerifyResult> {
   return call("cache_move_verify");
 }
 
-/** 执行迁移（重 IO，进度走 `cache-move-progress` 事件）。 */
-export function cacheMoveRun(dest: string, only?: string[]): Promise<CacheMoveResult> {
-  return call("cache_move_run", { dest, only });
+/**
+ * 执行迁移（重 IO，进度走 `cache-move-progress` 事件）。
+ *
+ * `targets` 逐目录给目标根目录 —— 国内版与国际版可以分开放，
+ * 也可以都填同一个根目录。
+ */
+export function cacheMoveRun(targets: CacheMoveTarget[]): Promise<CacheMoveResult> {
+  return call("cache_move_run", { targets });
 }
 
 /** 回滚：删联接 + 把备份改名回来。 */

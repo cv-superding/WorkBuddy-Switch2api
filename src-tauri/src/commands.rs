@@ -796,18 +796,20 @@ pub async fn cache_move_verify() -> Result<Value, String> {
 }
 
 /// POST /api/cache-move/run —— 执行迁移，边跑边推 `cache-move-progress`。
+///
+/// `targets` 是逐目录的目标：国内版与国际版可以放在不同的盘/文件夹，
+/// 也可以都指向同一个根目录（默认就是这样）。
 #[tauri::command]
 pub async fn cache_move_run(
     app: tauri::AppHandle,
-    dest: String,
-    only: Option<Vec<String>>,
+    targets: Vec<cache_move::MoveTarget>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let progress = |p: cache_move::Progress| {
             let payload = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
             let _ = app.emit("cache-move-progress", payload);
         };
-        cache_move::run(&dest, only, Some(&progress))
+        cache_move::run(targets, Some(&progress))
     })
     .await
     .map_err(|e| format!("迁移任务异常：{e}"))?

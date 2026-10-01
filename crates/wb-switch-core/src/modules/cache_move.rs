@@ -28,8 +28,9 @@
 //! 任何一步失败都会回滚（删联接、改名还原）。备份目录保留到用户显式清理，
 //! 清理只接受「家目录直接子项 + 名字含 `.moved-` + 不是联接」的路径。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::modules::{edition::Edition, process};
@@ -114,6 +115,19 @@ pub struct StepLog {
     pub name: String,
     pub ok: bool,
     pub message: String,
+}
+
+/// 一条迁移目标：要迁哪个目录 + 它自己的目标根目录。
+///
+/// 国内版与国际版**可以迁到不同的盘/文件夹**（默认建议同一个根目录，
+/// 但每个目录都能单独覆盖，不互相牵制）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveTarget {
+    /// 家目录下的目录名，如 `.workbuddy`。
+    pub name: String,
+    /// 目标根目录；最终落点 = `<dest>\<name>`。
+    pub dest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -670,11 +684,7 @@ fn migrate_one(
 }
 
 /// 执行迁移。`only` 为空表示全部参与条目。
-pub fn run(
-    dest: &str,
-    only: Option<Vec<String>>,
-    progress: Option<&dyn Fn(Progress)>,
-) -> Result<Value, String> {
+pub fn run(targets: Vec<MoveTarget>, progress: Option<&dyn Fn(Progress)>) -> Result<Value, String> {
     if !cfg!(target_os = "windows") {
         return Err("缓存迁移目前只支持 Windows（依赖 NTFS 目录联接）。".to_string());
     }
@@ -685,68 +695,109 @@ pub fn run(
             blocking.join(" / ")
         ));
     }
-
-    let dest_root = normalize_dest(dest)?;
-    let home = home_dir();
-
-    let wanted: Vec<(String, String, bool)> = entries()
-        .into_iter()
-        .filter(|(_, _, m)| *m)
-        .filter(|(n, _, _)| match &only {
-            Some(list) if !list.is_empty() => list.iter().any(|x| x == n),
-            _ => true,
-        })
-        .collect();
-    if wanted.is_empty() {
+    if targets.is_empty() {
         return Err("没有选中任何要迁移的目录。".to_string());
     }
 
-    // 先把要动的源目录体积合计出来，用于空间检查。
-    let mut need = 0u64;
-    for (n, _, _) in &wanted {
-        let p = home.join(n);
-        if p.exists() && !is_reparse(&p) {
-            need += scan(&p).1;
-        }
+    let home = home_dir();
+    let all = entries();
+
+    // 每条目标的最终落点、体积都单算 —— 两个版本可以落在不同的盘。
+    struct Job {
+        name: String,
+        label: String,
+        dest_root: PathBuf,
+        dst: PathBuf,
+        bytes: u64,
+        files: u64,
     }
-    if need == 0 {
+    let mut jobs: Vec<Job> = Vec::new();
+    for t in &targets {
+        let Some((_, label, movable)) = all.iter().find(|(n, _, _)| n == &t.name) else {
+            return Err(format!("未知目录：{}", t.name));
+        };
+        if !movable {
+            return Err(format!("{} 不支持迁移。", t.name));
+        }
+        let src = home.join(&t.name);
+        if !src.exists() {
+            continue;
+        }
+        if is_reparse(&src) {
+            // 已经是联接，跳过（前端一般不会把它传上来）
+            continue;
+        }
+        let dest_root = normalize_dest(&t.dest)?;
+        let dst = dest_root.join(&t.name);
+        let (files, bytes) = scan(&src);
+        if files == 0 && bytes == 0 {
+            return Err(format!("{} 是空目录，已跳过以免误操作。", t.name));
+        }
+        jobs.push(Job {
+            name: t.name.clone(),
+            label: label.clone(),
+            dest_root,
+            dst,
+            bytes,
+            files,
+        });
+    }
+    if jobs.is_empty() {
         return Err("选中的目录都已经是联接或不存在，无需迁移。".to_string());
     }
 
-    let letter = drive_of(&dest_root);
-    if let Some(d) = list_drives()
-        .iter()
-        .find(|d| d.letter.eq_ignore_ascii_case(&letter))
-    {
-        if d.free < need + need / 20 {
-            return Err(format!(
-                "{} 只剩 {} 可用，装不下（需要约 {}）。换一个盘。",
-                d.letter,
-                human(d.free),
-                human(need + need / 20)
-            ));
+    // 空间检查按**盘符**汇总：两个目录可以落在不同的盘，各算各的。
+    let drives = list_drives();
+    let mut per_drive: BTreeMap<String, u64> = BTreeMap::new();
+    for j in &jobs {
+        *per_drive.entry(drive_of(&j.dest_root)).or_insert(0) += j.bytes;
+    }
+    for (letter, need) in &per_drive {
+        if let Some(d) = drives.iter().find(|d| d.letter.eq_ignore_ascii_case(letter)) {
+            if d.free < need + need / 20 {
+                return Err(format!(
+                    "{} 只剩 {} 可用，装不下（这个盘上要放 {}，建议留 5% 余量）。",
+                    d.letter,
+                    human(d.free),
+                    human(*need)
+                ));
+            }
         }
     }
 
-    let total = wanted.len() as u32;
+    let total = jobs.len() as u32;
     let mut logs: Vec<StepLog> = Vec::new();
     let mut moved: Vec<String> = Vec::new();
     let mut backups: Vec<String> = Vec::new();
+    let mut placed: Vec<Value> = Vec::new();
     let mut ok = true;
 
-    for (i, (name, label, _)) in wanted.iter().enumerate() {
-        let (one_ok, mut one_logs, backup) =
-            migrate_one(name, label, &dest_root, i as u32 + 1, total, progress);
+    for (i, job) in jobs.iter().enumerate() {
+        let (one_ok, mut one_logs, backup) = migrate_one(
+            &job.name,
+            &job.label,
+            &job.dest_root,
+            i as u32 + 1,
+            total,
+            progress,
+        );
         logs.append(&mut one_logs);
         if !one_ok {
             ok = false;
             break;
         }
         // 跳过（本来就是联接 / 不存在）也算成功，但不计入「本次迁移」。
-        if !is_reparse(&home.join(name)) {
+        if !is_reparse(&home.join(&job.name)) {
             continue;
         }
-        moved.push(name.clone());
+        moved.push(job.name.clone());
+        placed.push(json!({
+            "name": job.name,
+            "from": home.join(&job.name).to_string_lossy(),
+            "to": job.dst.to_string_lossy(),
+            "files": job.files,
+            "bytes": job.bytes,
+        }));
         if let Some(b) = backup {
             backups.push(b.to_string_lossy().to_string());
         }
@@ -758,7 +809,7 @@ pub fn run(
         "moved": moved,
         "backups": backups,
         "logs": logs,
-        "dest": dest_root.to_string_lossy(),
+        "placed": placed,
     }))
 }
 

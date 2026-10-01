@@ -765,12 +765,30 @@ export interface CacheMoveStep {
   message: string;
 }
 
+/** 一条迁移目标：迁哪个目录 + 它自己的目标根目录。 */
+export interface CacheMoveTarget {
+  /** 目录名，如 .workbuddy。 */
+  name: string;
+  /** 目标根目录；最终落点 = `<dest>\\<name>`。 */
+  dest: string;
+}
+
+/** 一个目录的最终落点。 */
+export interface CacheMovePlaced {
+  name: string;
+  from: string;
+  to: string;
+  files: number;
+  bytes: number;
+}
+
 export interface CacheMoveResult {
   ok: boolean;
   moved: string[];
   backups: string[];
   logs: CacheMoveStep[];
-  dest: string;
+  /** 每个目录实际搬到了哪里（两个版本可以落在不同的盘）。 */
+  placed: CacheMovePlaced[];
 }
 
 export interface CacheMoveRollbackResult {
