@@ -847,6 +847,17 @@ pub async fn cache_move_cleanup(paths: Vec<String>) -> Result<Value, String> {
         .map_err(|e| format!("清理任务异常：{e}"))?
 }
 
+/// POST /api/cache-move/open —— 在文件管理器里打开一个目录。
+///
+/// 迁移之后应用看到的仍是原家目录路径（联接对程序透明），这个口子用来把人
+/// 直接带到数据真正所在的目标盘。
+#[tauri::command]
+pub async fn cache_move_open(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || cache_move::open_path(&path))
+        .await
+        .map_err(|e| format!("打开目录异常：{e}"))?
+}
+
 /// POST /api/transfer/export —— 把选中的工作区 + 配置打成一个 zip。
 ///
 /// 打包是重 IO，可能几秒到几十秒 —— 挪到阻塞线程池，别占着 async runtime。

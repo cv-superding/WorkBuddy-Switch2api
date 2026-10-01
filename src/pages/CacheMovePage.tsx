@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   ArrowRight,
   CheckCircle2,
+  FolderOpen,
   HardDrive,
   Link2,
   Loader2,
@@ -96,6 +97,20 @@ function fmtBytes(n: number): string {
 
 type Stage = "idle" | "running" | "done";
 
+/**
+ * 把「目标根目录」末尾重复的目录名去掉。
+ *
+ * 字段收的是**根目录**，最终落点 = 根 + 目录名。但用户很容易直接填落点本身
+ * （填 `F:\WBcache\.workbuddy-ai` 就变成了 `F:\WBcache\.workbuddy-ai\.workbuddy-ai`）。
+ * 末尾已经是同名目录时按落点理解，不再重复拼一次。
+ */
+function stripTrailingName(root: string, name: string): string {
+  const r = root.trim().replace(/[\\/]+$/, "");
+  const i = Math.max(r.lastIndexOf(SEP), r.lastIndexOf("/"));
+  if (i < 0) return r;
+  return r.slice(i + 1).toLowerCase() === name.toLowerCase() ? r.slice(0, i) || r : r;
+}
+
 export default function CacheMovePage() {
   // 演示模式走的是假数据，服务端与浏览器都没有真实的目录可扫：
   // 前者没有系统命令，后者没有文件系统权限。演示模式下照常渲染，方便截图与预览。
@@ -104,9 +119,11 @@ export default function CacheMovePage() {
   const forceSplit = params.get("split") === "1";
   /**
    * `?only=.workbuddy-ai`：只勾选列出的目录（逗号分隔的目录名）。
-   * 截图 / 演示用 —— 要展示「只迁国际版」这种状态。
+   * `?custom=F:\WBcache\.workbuddy-ai`：给勾中的目录铺一个单独路径。
+   * 两个都是截图 / 演示用 —— 要展示「只迁国际版、且单独指定位置」这种状态。
    */
   const onlyParam = params.get("only");
+  const customParam = params.get("custom");
   const onlySet = useMemo(
     () =>
       onlyParam
@@ -162,6 +179,7 @@ export default function CacheMovePage() {
           p.dirs.map((d, i) => {
             if (prev[d.name]) return [d.name, prev[d.name]];
             if (onlySet && !onlySet.has(d.name)) return [d.name, { on: false, custom: "" }];
+            if (customParam) return [d.name, { on: true, custom: customParam }];
             if (forceSplit && otherDrives.length > 0) {
               const dr = otherDrives[i % otherDrives.length];
               return [d.name, { on: true, custom: `${dr.letter}${SEP}WorkBuddyData` }];
@@ -243,9 +261,9 @@ export default function CacheMovePage() {
     });
   }, [movable]);
 
-  /** 某个目录最终用的目标根目录：单独指定优先，否则用默认位置。 */
+  /** 某个目录最终用的目标根目录：单独指定优先，否则用默认位置。去掉末尾重复的目录名。 */
   const rootFor = useCallback(
-    (name: string) => perDest[name]?.custom?.trim() || dest.trim(),
+    (name: string) => stripTrailingName(perDest[name]?.custom?.trim() || dest.trim(), name),
     [perDest, dest],
   );
 
@@ -318,6 +336,25 @@ export default function CacheMovePage() {
     } finally {
       void load(true);
       void loadVerify();
+    }
+  }
+
+  /**
+   * 在文件管理器里打开一个目录。
+   *
+   * 迁移后应用和资源管理器看到的仍是原家目录路径（联接对程序透明），
+   * 所以需要一个口子把人直接带到数据真正所在的地方。
+   */
+  async function openDir(path: string | null) {
+    if (!path) return;
+    if (demo) {
+      toast.message("演示模式不打开目录", { description: path });
+      return;
+    }
+    try {
+      await api.cacheMoveOpen(path);
+    } catch (e) {
+      toast.error("打不开这个目录", { description: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -443,11 +480,23 @@ export default function CacheMovePage() {
                     )}
                   </div>
                 </div>
-                <div className="shrink-0 text-right">
+                <div className="flex shrink-0 items-center gap-2">
                   {d.isLink ? (
-                    <Badge variant="secondary" className="border-0 bg-emerald-50 text-emerald-700">
-                      已是联接
-                    </Badge>
+                    <>
+                      <Badge variant="secondary" className="border-0 bg-emerald-50 text-emerald-700">
+                        已是联接
+                      </Badge>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 px-1.5 text-[11px] font-normal text-muted-foreground"
+                        onClick={() => void openDir(d.linkTarget)}
+                        title={`打开数据真正所在的位置：${d.linkTarget ?? ""}`}
+                      >
+                        <FolderOpen className="size-3" />
+                        打开
+                      </Button>
+                    </>
                   ) : d.exists ? (
                     <span className="text-[13px] tabular-nums">{d.sizeText}</span>
                   ) : (
@@ -457,6 +506,26 @@ export default function CacheMovePage() {
               </div>
             ))}
           </div>
+
+          {/*
+            这块是给「迁完了但设置页还是老路径」这个疑问准备的。
+            联接对应用透明是设计目标，不是没生效 —— 但不说清楚，谁都会以为失败。
+          */}
+          {plans.some((d) => d.isLink) && (
+            <div className="border-t border-border/50 bg-muted/25 px-5 py-3">
+              <p className="text-[11px] leading-5 text-muted-foreground">
+                <span className="font-medium text-foreground">已经是联接的那几行，原路径不会变。</span>
+                应用自己的「设置 → 系统缓存目录」里显示的仍是原来的家目录路径（例如{" "}
+                <code className="rounded bg-muted px-1">
+                  {plans.find((d) => d.isLink)?.path}
+                </code>
+                ），用资源管理器打开也是这个路径 —— 这是正常的，目录联接对程序完全透明，
+                应用压根不知道数据换盘了。
+                <span className="font-medium text-foreground">判断有没有真的搬走，看两处</span>
+                ：这里的状态是「已是联接」并且指向目标盘；应用设置页里那条「磁盘」容量变成了目标盘的容量。
+              </p>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -535,6 +604,7 @@ export default function CacheMovePage() {
             </div>
             <p className="text-[11px] leading-4 text-muted-foreground/80">
               下面路径留空的目录都放到这里；填了路径的走各自的。
+              填的是<span className="font-medium">根目录</span>，若末尾已经是该目录名就不会重复拼。
             </p>
           </div>
 
@@ -546,6 +616,7 @@ export default function CacheMovePage() {
                   <Label className="text-[13px]">要迁移哪些</Label>
                   <span className="text-[11px] text-muted-foreground">
                     勾了才会动，没勾的这次跳过
+                    {plans.some((d) => d.isLink) && "；已经是联接的目录不在这里列（上面「当前占用」里能看）"}
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -733,6 +804,15 @@ export default function CacheMovePage() {
                 <StepRow key={`${s.name}-${i}`} step={s} />
               ))}
             </div>
+            {result.ok && result.placed.length > 0 && (
+              <p className="mt-3 rounded-lg bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
+                <span className="font-medium text-foreground">怎么确认真的迁好了：</span>
+                往上翻到「当前占用」，被迁的那几行状态会变成
+                <span className="font-medium text-foreground">「已是联接」</span>
+                并指向目标盘。应用自己的设置页仍会显示原来的家目录路径 ——
+                那是正常的（目录联接对程序透明），但它的「磁盘」容量会变成目标盘的。
+              </p>
+            )}
             {result.ok && result.backups.length > 0 && (
               <p className="mt-3 rounded-lg bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
                 源目录没有被删除，只是改名保留了：

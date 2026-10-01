@@ -201,6 +201,7 @@ pub fn run() {
             commands::cache_move_rollback,
             commands::cache_move_backups,
             commands::cache_move_cleanup,
+            commands::cache_move_open,
         ])
         .build(context)
         .expect("error while building tauri application");

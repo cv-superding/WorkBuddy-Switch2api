@@ -904,6 +904,34 @@ fn safe_backup_path(p: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 在文件管理器里打开一个**目录**。
+///
+/// 迁移之后「设置页」和资源管理器看到的仍然是原来的家目录路径（联接对程序透明），
+/// 所以页面上要有个口子能把人带到数据真正所在的地方 —— 这个函数就是那个口子。
+/// 只接受「存在且确实是目录」的绝对路径，不接 URL、不接文件。
+pub fn open_path(path: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("路径为空".to_string());
+    }
+    let p = PathBuf::from(trimmed);
+    if !p.is_absolute() {
+        return Err(format!("不是绝对路径：{}", p.display()));
+    }
+    if !p.is_dir() {
+        return Err(format!("目录不存在或不是文件夹：{}", p.display()));
+    }
+
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("explorer.exe").arg(&p).spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(&p).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = std::process::Command::new("xdg-open").arg(&p).spawn();
+
+    spawned.map(|_| ()).map_err(|e| format!("打不开 {}：{e}", p.display()))
+}
+
 /// 列出当前可清理的备份（带体积）。
 pub fn list_backups() -> Vec<Value> {
     let home = home_dir();
@@ -988,6 +1016,21 @@ pub fn verify() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `open_path` 只接受「存在且确实是目录」的绝对路径；这些输入必须被挡下来，
+    /// 顺带确保测试本身不会真的去拉起文件管理器。
+    #[test]
+    fn open_path_rejects_bad_input() {
+        assert!(open_path("").is_err(), "空路径");
+        assert!(open_path("   ").is_err(), "全空格");
+        assert!(open_path("relative\\path").is_err(), "相对路径");
+        if cfg!(target_os = "windows") {
+            assert!(
+                open_path(r"C:\__no_such_dir_9f8a7b6c__").is_err(),
+                "不存在的目录"
+            );
+        }
+    }
 
     #[test]
     fn human_units() {

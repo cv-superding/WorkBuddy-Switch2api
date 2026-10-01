@@ -688,3 +688,13 @@ export function cacheMoveBackups(): Promise<{ backups: CacheBackupItem[] }> {
 export function cacheMoveCleanup(paths: string[]): Promise<CacheMoveCleanupResult> {
   return call("cache_move_cleanup", { paths });
 }
+
+/**
+ * 在文件管理器里打开一个目录。
+ *
+ * 迁移之后应用看到的仍是原家目录路径（联接对程序透明），
+ * 这个口子用来把人直接带到数据真正所在的目标盘。
+ */
+export function cacheMoveOpen(path: string): Promise<void> {
+  return call("cache_move_open", { path });
+}
