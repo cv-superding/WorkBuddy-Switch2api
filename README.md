@@ -49,11 +49,16 @@ OpenAI 兼容的本地网关：多账号池轮转、按分组挑选出站账号�
 ```bash
 cd npm
 npm i -g .
-workbuddy-switch              # 启动本地服务 + 自动打开浏览器
-workbuddy-switch status       # 终端查看当前账号
+workbuddy-switch                      # 起服务 + 打开浏览器（默认 127.0.0.1:57890）
+workbuddy-switch serve --port 16060   # 换端口：界面里的接口地址跟着页面走，不用改配置
+workbuddy-switch serve --no-open      # 只起服务、不开浏览器（服务器 / WSL / SSH 转发用）
+workbuddy-switch status               # 终端查看当前账号
 ```
 
 webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账号切换、积分到期监控、自动签到、会话复制与共享、API 反代、Token 统计与 token 保活。
+
+前端是**同一份 `dist/`** 分别嵌进桌面 App 与 CLI 二进制的，所以两边观感与功能一致；
+只有「迁移」和「缓存迁移」依赖系统文件对话框 / NTFS 目录联接，在 webui 里会整页提示只在桌面端可用。
 
 ### 桌面 App
 

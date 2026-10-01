@@ -56,7 +56,23 @@ import { screenshotDemoResponse } from "./screenshot-demo";
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
  * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
  */
-const API_BASE = "http://127.0.0.1:57890";
+/**
+ * webui 下 API 与页面**同源**，所以端口要跟着页面走 ——
+ * `workbuddy-switch serve --port 12345` 打开的是 12345，前端就得连 12345。
+ * 原来这里写死 57890，换端口之后页面能开、数据全报「无法连接」。
+ *
+ * 只在「http + 本机回环」时才用页面来源：
+ * - 桌面 App（Tauri）走 invoke，用不到这个常量
+ * - GitHub Pages 上的演示站不是回环地址，保持原样（它有独立的 demo 拦截）
+ */
+const API_BASE = (() => {
+  if (typeof window !== "undefined") {
+    const { protocol, hostname, origin } = window.location;
+    const loopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+    if (protocol === "http:" && loopback) return origin.replace(/\/$/, "");
+  }
+  return "http://127.0.0.1:57890";
+})();
 
 const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",

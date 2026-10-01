@@ -50,16 +50,13 @@ fn build_app_status() -> AppStatus {
     let auth = auth_file::read_auth_file();
     let current = auth.as_ref().and_then(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        // 只取字符串：鉴权文件里的字段可能是对象（加密信封），
+        // 用 core 的共享实现取展示字段：鉴权文件里这些字段可能是对象（加密信封），
         // 原样透传到前端会被当 React 子节点渲染 → React #31 → 整窗白屏。
-        let text = |key: &str| match acct.get(key) {
-            Some(Value::String(s)) if !s.trim().is_empty() => json!(s.clone()),
-            _ => Value::Null,
-        };
+        // 口径只在 account::display_value 里定义一份，webui 通道也走它。
         Some(json!({
-            "uid": text("uid"),
-            "nickname": text("nickname"),
-            "email": text("email"),
+            "uid": account::display_value(&acct, "uid"),
+            "nickname": account::display_value(&acct, "nickname"),
+            "email": account::display_value(&acct, "email"),
         }))
     });
     AppStatus {
