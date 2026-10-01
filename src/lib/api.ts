@@ -39,6 +39,12 @@ import type {
   TransferPreview,
   TransferImportOptions,
   TransferImportResult,
+  CacheMovePlan,
+  CacheMoveResult,
+  CacheMoveRollbackResult,
+  CacheMoveCleanupResult,
+  CacheBackupItem,
+  CacheVerifyResult,
 } from "./types";
 import { EDITIONS } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
@@ -60,6 +66,8 @@ const DEMO_READ_COMMANDS = new Set([
   "get_travel_status", "get_auto_travel_config",
   // 反代页：演示/Pages 里也要能渲染，否则整页只显示一条「演示模式下不可操作」
   "get_proxy_config", "get_proxy_status", "get_proxy_usage", "get_proxy_models",
+  // 缓存迁移页：体检 / 验证 / 备份列表是只读的
+  "cache_move_plan", "cache_move_verify", "cache_move_backups",
 ]);
 
 export function isDemoMode(): boolean {
@@ -633,4 +641,38 @@ export function transferImport(
   edition?: string,
 ): Promise<TransferImportResult> {
   return call("transfer_import", { edition, path, options });
+}
+
+// ---------------------------------------------------------------------------
+// 缓存迁移
+// ---------------------------------------------------------------------------
+
+/** 只读体检：目录体积、目标盘空间、是否有进程占着。 */
+export function cacheMovePlan(dest?: string): Promise<CacheMovePlan> {
+  return call("cache_move_plan", { dest });
+}
+
+/** 只读验证：当前联接状态 + 遗留备份。 */
+export function cacheMoveVerify(): Promise<CacheVerifyResult> {
+  return call("cache_move_verify");
+}
+
+/** 执行迁移（重 IO，进度走 `cache-move-progress` 事件）。 */
+export function cacheMoveRun(dest: string, only?: string[]): Promise<CacheMoveResult> {
+  return call("cache_move_run", { dest, only });
+}
+
+/** 回滚：删联接 + 把备份改名回来。 */
+export function cacheMoveRollback(): Promise<CacheMoveRollbackResult> {
+  return call("cache_move_rollback");
+}
+
+/** 列出可清理的 `.moved-*` 备份。 */
+export function cacheMoveBackups(): Promise<{ backups: CacheBackupItem[] }> {
+  return call("cache_move_backups");
+}
+
+/** 删除选中的备份目录。 */
+export function cacheMoveCleanup(paths: string[]): Promise<CacheMoveCleanupResult> {
+  return call("cache_move_cleanup", { paths });
 }

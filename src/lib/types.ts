@@ -707,3 +707,103 @@ export interface TransferImportResult {
   errors: string[];
   notes: string[];
 }
+
+// ---------------------------------------------------------------------------
+// 缓存迁移（家目录跨盘搬迁 + 目录联接）
+// ---------------------------------------------------------------------------
+
+/** 一个待迁移的家目录数据目录。 */
+export interface CacheDirStatus {
+  /** 目录名，如 .workbuddy。 */
+  name: string;
+  /** 展示名，如「国内版 WorkBuddy」。 */
+  label: string;
+  path: string;
+  exists: boolean;
+  /** 已经是目录联接。 */
+  isLink: boolean;
+  linkTarget: string | null;
+  /** 遗留的 .moved-* 备份目录。 */
+  backup: string | null;
+  files: number;
+  bytes: number;
+  movable: boolean;
+  sizeText: string;
+}
+
+export interface CacheMoveDrive {
+  letter: string;
+  free: number;
+  total: number;
+  system: boolean;
+  freeText: string;
+  totalText: string;
+}
+
+export interface CacheMovePlan {
+  supported: boolean;
+  platformNote: string | null;
+  home: string;
+  destDefault: string;
+  dirs: CacheDirStatus[];
+  totalFiles: number;
+  totalBytes: number;
+  totalText: string;
+  /** 必须退出的进程；非空时 canRun 为 false。 */
+  blocking: string[];
+  /** 建议退出的进程（不阻塞）。 */
+  warnings: string[];
+  canRun: boolean;
+  blockedReason: string | null;
+  drives: CacheMoveDrive[];
+  hasDest: boolean;
+}
+
+export interface CacheMoveStep {
+  name: string;
+  ok: boolean;
+  message: string;
+}
+
+export interface CacheMoveResult {
+  ok: boolean;
+  moved: string[];
+  backups: string[];
+  logs: CacheMoveStep[];
+  dest: string;
+}
+
+export interface CacheMoveRollbackResult {
+  ok: boolean;
+  restored: string[];
+  logs: CacheMoveStep[];
+}
+
+export interface CacheMoveProgress {
+  phase: string;
+  detail: string;
+  index: number;
+  total: number;
+  percent: number;
+}
+
+export interface CacheBackupItem {
+  path: string;
+  name: string;
+  files: number;
+  bytes: number;
+  sizeText: string;
+}
+
+export interface CacheVerifyResult {
+  dirs: CacheDirStatus[];
+  blocking: string[];
+  warnings: string[];
+  backups: CacheBackupItem[];
+}
+
+export interface CacheMoveCleanupResult {
+  ok: boolean;
+  removed: string[];
+  logs: CacheMoveStep[];
+}

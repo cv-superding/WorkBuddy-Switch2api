@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, client_ctl, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits,
+    account, auth_file, cache_move, checkin, client_ctl, codebuddy_cli, codebuddy_cn_ide,
+    credit_usage, credits,
     edition::{edition_of, parse_lenient}, export_import, oauth,
     process, proxy, refresh, rotate, session, switch, token_stats, transfer, travel, update,
 };
@@ -768,6 +769,78 @@ fn opt_str_list(v: &Value, keys: &[&str]) -> Vec<String> {
 pub fn transfer_scan(edition: Option<String>) -> Value {
     let edition = edition.as_deref().map(parse_lenient).unwrap_or_default();
     transfer::scan_exportable(edition)
+}
+
+// ---------------------------------------------------------------- 缓存迁移
+//
+// 把家目录里的 `~/.workbuddy` / `~/.workbuddy-ai` 挪到别的盘，原路径改建
+// NTFS 目录联接。会扫几十万个文件、复制十几 GB，全部挪到阻塞线程池。
+
+/// GET /api/cache-move/plan —— 只读体检（扫体积，重 IO）。
+#[tauri::command]
+pub async fn cache_move_plan(dest: Option<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        serde_json::to_value(cache_move::plan(dest))
+            .unwrap_or_else(|e| json!({ "error": e.to_string() }))
+    })
+    .await
+    .map_err(|e| format!("体检任务异常：{e}"))
+}
+
+/// GET /api/cache-move/verify —— 只读：当前联接状态 + 遗留备份。
+#[tauri::command]
+pub async fn cache_move_verify() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(cache_move::verify)
+        .await
+        .map_err(|e| format!("验证任务异常：{e}"))
+}
+
+/// POST /api/cache-move/run —— 执行迁移，边跑边推 `cache-move-progress`。
+#[tauri::command]
+pub async fn cache_move_run(
+    app: tauri::AppHandle,
+    dest: String,
+    only: Option<Vec<String>>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let progress = |p: cache_move::Progress| {
+            let payload = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
+            let _ = app.emit("cache-move-progress", payload);
+        };
+        cache_move::run(&dest, only, Some(&progress))
+    })
+    .await
+    .map_err(|e| format!("迁移任务异常：{e}"))?
+}
+
+/// POST /api/cache-move/rollback —— 删联接、把备份改名回来。
+#[tauri::command]
+pub async fn cache_move_rollback(app: tauri::AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let progress = |p: cache_move::Progress| {
+            let payload = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
+            let _ = app.emit("cache-move-progress", payload);
+        };
+        cache_move::rollback(Some(&progress))
+    })
+    .await
+    .map_err(|e| format!("回滚任务异常：{e}"))?
+}
+
+/// GET /api/cache-move/backups —— 列出可清理的 `.moved-*` 备份。
+#[tauri::command]
+pub async fn cache_move_backups() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| json!({ "backups": cache_move::list_backups() }))
+        .await
+        .map_err(|e| format!("任务异常：{e}"))
+}
+
+/// POST /api/cache-move/cleanup —— 删除选中的备份目录。
+#[tauri::command]
+pub async fn cache_move_cleanup(paths: Vec<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || cache_move::cleanup(&paths))
+        .await
+        .map_err(|e| format!("清理任务异常：{e}"))?
 }
 
 /// POST /api/transfer/export —— 把选中的工作区 + 配置打成一个 zip。

@@ -4,6 +4,7 @@ import type {
   GithubConfig, ProxyConfig, ProxyModels, ProxyStatus, ProxyUsage, RotateLog, RotateStatus,
   TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals, TravelConfig, TravelStatus,
   UsageBucket,
+  CacheMovePlan, CacheVerifyResult,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
 
@@ -401,6 +402,81 @@ function proxyUsage(): ProxyUsage {
   return { updatedAt: now, total, byAccount, byModel, recent };
 }
 
+/**
+ * 缓存迁移演示数据。
+ *
+ * 演示模式没有真实家目录可扫，所以给一份「已经迁过一半」的样子：
+ * 国内版已建联接，国际版还是普通目录 —— 界面上能同时看到两种状态。
+ */
+function cacheMovePlan(): CacheMovePlan {
+  const dirs = [
+    {
+      name: ".workbuddy",
+      label: "国内版 WorkBuddy",
+      path: "C:\\Users\\demo\\.workbuddy",
+      exists: true,
+      isLink: true,
+      linkTarget: "E:\\WorkBuddyData\\.workbuddy",
+      backup: null,
+      files: 0,
+      bytes: 0,
+      movable: true,
+      sizeText: "0 B",
+    },
+    {
+      name: ".workbuddy-ai",
+      label: "国际版 WorkBuddy",
+      path: "C:\\Users\\demo\\.workbuddy-ai",
+      exists: true,
+      isLink: false,
+      linkTarget: null,
+      backup: null,
+      files: 286087,
+      bytes: 6871947673,
+      movable: true,
+      sizeText: "6.4 GB",
+    },
+    {
+      name: ".workbuddy-key-fallback",
+      label: "凭据回退目录",
+      path: "C:\\Users\\demo\\.workbuddy-key-fallback",
+      exists: true,
+      isLink: false,
+      linkTarget: null,
+      backup: null,
+      files: 10,
+      bytes: 320,
+      movable: true,
+      sizeText: "320 B",
+    },
+  ];
+  return {
+    supported: true,
+    platformNote: null,
+    home: "C:\\Users\\demo",
+    destDefault: "E:\\WorkBuddyData",
+    dirs,
+    totalFiles: 286097,
+    totalBytes: 6871947993,
+    totalText: "6.4 GB",
+    blocking: [],
+    warnings: [],
+    canRun: true,
+    blockedReason: null,
+    drives: [
+      { letter: "E:", free: 324000000000, total: 500000000000, system: false, freeText: "301.7 GB", totalText: "465.7 GB" },
+      { letter: "F:", free: 278000000000, total: 1000000000000, system: false, freeText: "258.9 GB", totalText: "931.3 GB" },
+      { letter: "C:", free: 29000000000, total: 405000000000, system: true, freeText: "27.0 GB", totalText: "377.2 GB" },
+    ],
+    hasDest: true,
+  };
+}
+
+function cacheVerify(): CacheVerifyResult {
+  const plan = cacheMovePlan();
+  return { dirs: plan.dirs, blocking: [], warnings: [], backups: [] };
+}
+
 function proxyModels(): ProxyModels {
   return {
     models: ["auto", "hy4-preview", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "kimi-k3-1", "minimax-m3"],
@@ -507,6 +583,9 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_proxy_status": return proxyStatus();
     case "get_proxy_usage": return proxyUsage();
     case "get_proxy_models": return proxyModels();
+    case "cache_move_plan": return cacheMovePlan();
+    case "cache_move_verify": return cacheVerify();
+    case "cache_move_backups": return { backups: [] };
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }

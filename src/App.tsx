@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from "react-router-dom";
-import { ArrowLeftRight, ArrowUp, MessagesSquare, Network, Settings, Sparkles, User } from "lucide-react";
+import { ArrowLeftRight, ArrowUp, HardDrive, MessagesSquare, Network, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -8,6 +8,7 @@ import type { UpdateInfo } from "@/lib/types";
 import AccountsPage from "@/pages/AccountsPage";
 import ApiProxyPage from "@/pages/ApiProxyPage";
 import TransferPage from "@/pages/TransferPage";
+import CacheMovePage from "@/pages/CacheMovePage";
 import CreditStatsPage from "@/pages/CreditStatsPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
 import SettingsPage from "@/pages/SettingsPage";
@@ -92,6 +93,7 @@ const PAGE_LABELS: Record<string, string | undefined> = {
   "/token-stats": "Token 统计",
   "/credit-stats": "积分统计",
   "/api-proxy": "API 反代",
+  "/cache-move": "缓存迁移",
   "/settings": "设置",
 };
 
@@ -198,6 +200,20 @@ function Layout() {
             迁移
           </NavLink>
           <NavLink
+            to="/cache-move"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <HardDrive className="size-4" />
+            缓存迁移
+          </NavLink>
+          <NavLink
             to="/settings"
             className={({ isActive }) =>
               cn(
@@ -247,6 +263,7 @@ export default function App() {
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/api-proxy" element={<ApiProxyPage />} />
             <Route path="/transfer" element={<TransferPage />} />
+            <Route path="/cache-move" element={<CacheMovePage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

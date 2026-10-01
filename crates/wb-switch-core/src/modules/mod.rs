@@ -1,5 +1,6 @@
 pub mod account;
 pub mod auth_file;
+pub mod cache_move;
 pub mod checkin;
 pub mod client_ctl;
 pub mod codebuddy_cli;
