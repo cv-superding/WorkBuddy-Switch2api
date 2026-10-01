@@ -846,13 +846,16 @@ pub async fn cache_move_backups() -> Result<Value, String> {
 pub async fn cache_move_cleanup(
     app: tauri::AppHandle,
     paths: Vec<String>,
+    permanent: Option<bool>,
 ) -> Result<Value, String> {
+    // permanent = true 时不走回收站，直接永久删除（用户明确要的那条路）。
+    let permanent = permanent.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let progress = |p: cache_move::Progress| {
             let payload = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
             let _ = app.emit("cache-move-progress", payload);
         };
-        cache_move::cleanup(&paths, Some(&progress))
+        cache_move::cleanup(&paths, permanent, Some(&progress))
     })
     .await
     .map_err(|e| format!("清理任务异常：{e}"))?

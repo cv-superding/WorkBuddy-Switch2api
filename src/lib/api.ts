@@ -684,9 +684,17 @@ export function cacheMoveBackups(): Promise<{ backups: CacheBackupItem[] }> {
   return call("cache_move_backups");
 }
 
-/** 删除选中的备份目录。 */
-export function cacheMoveCleanup(paths: string[]): Promise<CacheMoveCleanupResult> {
-  return call("cache_move_cleanup", { paths });
+/**
+ * 删除选中的备份目录。
+ *
+ * `permanent = false`（默认）：整份移入回收站，删错了还能还原，空间要清空回收站才释放。
+ * `permanent = true`：不经过回收站，直接永久删除。
+ */
+export function cacheMoveCleanup(
+  paths: string[],
+  permanent = false,
+): Promise<CacheMoveCleanupResult> {
+  return call("cache_move_cleanup", { paths, permanent });
 }
 
 /**

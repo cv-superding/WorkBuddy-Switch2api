@@ -10,6 +10,7 @@ import {
   Link2,
   Loader2,
   Play,
+  Recycle,
   RefreshCw,
   RotateCcw,
   Trash2,
@@ -150,6 +151,8 @@ export default function CacheMovePage() {
   // `?confirm=1`：直接展开确认弹窗（截图 / 演示用）。
   const [confirmOpen, setConfirmOpen] = useState(params.get("confirm") === "1");
   const [cleanupOpen, setCleanupOpen] = useState(false);
+  /** 删除方式：进回收站（可还原）还是直接永久删掉。 */
+  const [cleanupMode, setCleanupMode] = useState<"recycle" | "permanent">("recycle");
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   /** 正在删备份（几十万个小文件要几十秒，必须给进度）。 */
@@ -385,16 +388,22 @@ export default function CacheMovePage() {
     setProgress(null);
     setCleanupLogs([]);
     try {
-      const r = await api.cacheMoveCleanup(selected);
+      const permanent = cleanupMode === "permanent";
+      const r = await api.cacheMoveCleanup(selected, permanent);
       setCleanupLogs(r.logs);
       const okCount = r.removed.length;
       if (okCount) {
-        toast.success(`${okCount} 个备份已移入回收站`, {
-          description:
-            r.removed.length === selected.length
-              ? "想真正腾出空间，右键回收站 → 清空"
-              : "有没删掉的，看下面的日志",
-        });
+        toast.success(
+          permanent ? `已彻底删除 ${okCount} 个备份` : `${okCount} 个备份已移入回收站`,
+          {
+            description:
+              !permanent && r.removed.length === selected.length
+                ? "想真正腾出空间，右键回收站 → 清空"
+                : r.removed.length === selected.length
+                  ? "空间已经释放了"
+                  : "有没删掉的，看下面的日志",
+          },
+        );
         // 删成功的从选中里去掉，失败的留着方便重试
         setSelected((prev) => prev.filter((p) => !r.removed.includes(p)));
       } else {
@@ -854,24 +863,44 @@ export default function CacheMovePage() {
           <CardContent className="p-5">
             <div className="flex items-center justify-between gap-3">
               <h2 className="text-base font-semibold tracking-tight">遗留备份</h2>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={selected.length === 0 || busy || cleaning}
-                onClick={() => setCleanupOpen(true)}
-              >
-                {cleaning ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : (
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={selected.length === 0 || busy || cleaning}
+                  onClick={() => {
+                    setCleanupMode("recycle");
+                    setCleanupOpen(true);
+                  }}
+                  title="整份移入回收站：文件再多也快，删错了还能还原"
+                >
+                  {cleaning ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Recycle className="size-3.5" />
+                  )}
+                  移到回收站（{selected.length}）
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={selected.length === 0 || busy || cleaning}
+                  onClick={() => {
+                    setCleanupMode("permanent");
+                    setCleanupOpen(true);
+                  }}
+                  className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  title="不经过回收站直接删除，删掉就找不回来了"
+                >
                   <Trash2 className="size-3.5" />
-                )}
-                {cleaning ? "删除中…" : `删除选中（${selected.length}）`}
-              </Button>
+                  彻底删除（{selected.length}）
+                </Button>
+              </div>
             </div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               这些是迁移时改名留下的源目录。确认客户端一切正常之后再删。
-              删除是<span className="font-medium">整份移入回收站</span> —— 文件再多也快，而且删错了还能还原；
-              但空间要<span className="font-medium">清空回收站之后</span>才真正腾出来（右键回收站 → 清空）。
+              <span className="font-medium">移到回收站</span>：整份移走、快，删错了还能还原，
+              但空间要清空回收站之后才腾出来；<span className="font-medium">彻底删除</span>：不经过回收站、空间立刻释放，但不可还原。
             </p>
 
             {cleaning && (
@@ -1010,10 +1039,22 @@ export default function CacheMovePage() {
       <Dialog open={cleanupOpen} onOpenChange={setCleanupOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>删除备份目录</DialogTitle>
+            <DialogTitle>
+              {cleanupMode === "permanent" ? "彻底删除这些备份？" : "把备份移入回收站？"}
+            </DialogTitle>
             <DialogDescription>
-              会把整个备份目录移入回收站 —— 数据可以从回收站还原，但<span className="font-medium">清空回收站之后就没得恢复了</span>。
-              腾出系统盘空间要靠清空回收站那一步。
+              {cleanupMode === "permanent" ? (
+                <>
+                  不经过回收站，<span className="font-medium">直接删掉、无法还原</span>，
+                  但空间立刻释放，不用再去清空回收站。
+                </>
+              ) : (
+                <>
+                  会把整个备份目录移入回收站 —— 数据可以从回收站还原，但
+                  <span className="font-medium">清空回收站之后就没得恢复了</span>。
+                  腾出系统盘空间要靠清空回收站那一步。
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 text-[13px] leading-6">
@@ -1029,7 +1070,9 @@ export default function CacheMovePage() {
               <span>
                 <span className="font-semibold">动手之前先确认：</span>
                 客户端能正常打开、记忆与历史会话都在，并且已经正常使用过一段时间。
-                删除本身可还原（在回收站里），但清空回收站之后就找不回来了。
+                {cleanupMode === "permanent"
+                  ? "这一步不可逆 —— 删掉之后就找不回来了。"
+                  : "这一步可以还原（在回收站里），但清空回收站之后就找不回来了。"}
               </span>
             </div>
           </div>
@@ -1038,8 +1081,12 @@ export default function CacheMovePage() {
               取消
             </Button>
             <Button variant="destructive" onClick={() => void doCleanup()} disabled={busy}>
-              <Trash2 className="size-3.5" />
-              确认删除
+              {cleanupMode === "permanent" ? (
+                <Trash2 className="size-3.5" />
+              ) : (
+                <Recycle className="size-3.5" />
+              )}
+              {cleanupMode === "permanent" ? "彻底删除" : "移入回收站"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -999,20 +999,108 @@ fn remove_with_retry(p: &Path, is_dir: bool) -> std::io::Result<()> {
     Err(last.unwrap_or_else(|| std::io::Error::other("未知错误")))
 }
 
+/// 把「拒绝删除」的 ACL 条目清掉。
+///
+/// 🔴 **这才是 `os error 5` 的真正原因**（前面查了几轮都没查到）：
+/// WorkBuddy 会给**当天的日志目录**加一条显式 ACE
+/// `用户:(OI)(CI)(DENY)(DE,DC)` —— DE = 删除、DC = 删除子项。
+/// 该目录及其下所有文件都继承到它，于是对它们的删除一律返回 `ACCESS_DENIED`。
+/// 真机上 255,927 个文件里只有 `logs\<当天>\` 那 145 个中招，其它全删掉了，
+/// 表现就成了「删到一半停住」。
+///
+/// 做法：从出问题的条目往上，沿途把每个目录的 ACL **重置回继承**（`icacls /reset`），
+/// 直到备份根。被重置的是一整个待删子树，无害。
+#[cfg(windows)]
+fn reset_acl_chain(from: &Path, stop_at: &Path) -> bool {
+    let mut cur = Some(from.to_path_buf());
+    let mut ok = false;
+    while let Some(dir) = cur {
+        if !dir.starts_with(stop_at) {
+            break;
+        }
+        let done = std::process::Command::new("icacls")
+            .arg(&dir)
+            .arg("/reset")
+            .arg("/Q")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok = ok || done;
+        if dir == stop_at {
+            break;
+        }
+        cur = dir.parent().map(Path::to_path_buf);
+    }
+    ok
+}
+
+#[cfg(not(windows))]
+fn reset_acl_chain(_from: &Path, _stop_at: &Path) -> bool {
+    false
+}
+
+/// 对「删不掉的条目」做一轮「解 ACL 保护 → 重试」，返回救回来的个数。
+///
+/// `stuck` 会被就地改写成**仍然**删不掉的那些（连最新错误一起）。
+/// 关键点：**文件阶段和目录阶段都要用** —— 早期版本只在文件阶段做了，
+/// 结果「目录本身被拒绝删除、但里面文件都能删」的情况照样漏（实测复现出来了）。
+fn sweep_acl_denied(
+    stuck: &mut Vec<(PathBuf, String)>,
+    is_dir: bool,
+    root: &Path,
+) -> u32 {
+    if stuck.is_empty() {
+        return 0;
+    }
+    // 按父目录去重：失败通常集中在同一个受保护目录下，
+    // 所以进程调用次数取决于「几个不同的父目录」，跟文件数无关。
+    let mut parents: Vec<PathBuf> = stuck
+        .iter()
+        .map(|(p, _)| p.parent().unwrap_or(root).to_path_buf())
+        .collect();
+    parents.sort();
+    parents.dedup();
+    let mut touched = false;
+    for par in &parents {
+        touched |= reset_acl_chain(par, root);
+    }
+    if !touched {
+        return 0;
+    }
+
+    let mut still: Vec<(PathBuf, String)> = Vec::new();
+    let mut fixed = 0;
+    for (p, _) in stuck.drain(..) {
+        match remove_with_retry(&p, is_dir) {
+            Ok(()) => fixed += 1,
+            Err(e) => still.push((p, e.to_string())),
+        }
+    }
+    *stuck = still;
+    fixed
+}
+
 /// 递归删除目录树，顺带统计「多少个文件 / 多少字节」。
 ///
 /// 刻意不用 `std::fs::remove_dir_all`：它撞到**任何一个**不肯走的条目就整棵放弃，
 /// 而且错误里只有「拒绝访问」、不告诉你是哪个条目 —— 用户看到的
-/// 「删除失败：拒绝访问。(os error 5)」正是这么来的，连查都没法查
-/// （实测那棵树既没有只读目录、也没有重解析点和 ACL 问题）。
+/// 「删除失败：拒绝访问。(os error 5)」正是这么来的，连查都没法查。
 ///
 /// 这里改成：
 /// 1. 一次遍历同时把体积算出来（省掉 `scan()` 那一趟）；
 /// 2. 先自底向上摘掉只读属性（Windows 上只读目录/文件都可能直接拒删）；
 /// 3. 逐条 `remove_file` / `remove_dir`，**单条失败不中断整棵**，
-///    重试 3 次，仍失败就记下来继续删别的；
-/// 4. 最后把「删不掉的到底是哪几个」报出来。
-fn force_remove_dir_all(root: &Path, on_tick: &dyn Fn(u64, u64)) -> Result<(u64, u64), String> {
+///    每条重试 3 次（摘属性 + 等一下），仍失败就记下来继续删别的；
+/// 4. 对删不掉的做一轮「解掉『拒绝删除』的 ACL 保护 → 重试」（见 `sweep_acl_denied`）；
+/// 5. 最后把「删不掉的到底是哪几个」报出来。
+///
+/// 返回值：`(文件数, 字节数, 靠解 ACL 救回来的条目数)`。
+fn force_remove_dir_all(
+    root: &Path,
+    on_tick: &dyn Fn(u64, u64),
+) -> Result<(u64, u64, u32), String> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
     let mut bytes: u64 = 0;
@@ -1031,37 +1119,26 @@ fn force_remove_dir_all(root: &Path, on_tick: &dyn Fn(u64, u64)) -> Result<(u64,
                     bytes += md.len();
                 }
                 files.push(p);
+                // 清点阶段也要报 —— 几十万个文件光遍历就是十几秒，静默会像卡死。
+                if files.len() % 5000 == 0 {
+                    on_tick(files.len() as u64, 0);
+                }
             }
         }
     }
+    on_tick(files.len() as u64, 0);
 
-    let dbg = std::env::var("WB_CM_DEBUG").is_ok();
-    let t_walk = std::time::Instant::now();
-
-    // 1) 先摘属性（文件 + 目录都摘）
+    // 1) 先摘属性（目录也要 —— 只读目录同样删不掉）
     for p in files.iter().chain(dirs.iter()) {
         clear_readonly(p);
     }
-    if dbg {
-        eprintln!("[dbg] 遍历 {} 个目录 + {} 个文件：{:?}", dirs.len(), files.len(), t_walk.elapsed());
-    }
-    let t_attr = std::time::Instant::now();
 
-    if dbg {
-        eprintln!("[dbg] 摘只读属性：{:?}", t_attr.elapsed());
-    }
-    let t_del = std::time::Instant::now();
-
-    // 2) 删文件
+    // 2) 删文件（每 1000 个报一次进度）
     let all = files.len() as u64;
-    let mut failed: u64 = 0;
-    let mut samples: Vec<String> = Vec::new();
+    let mut stuck: Vec<(PathBuf, String)> = Vec::new();
     for (i, p) in files.iter().enumerate() {
         if let Err(e) = remove_with_retry(p, false) {
-            failed += 1;
-            if samples.len() < 3 {
-                samples.push(format!("{}（{e}）", p.display()));
-            }
+            stuck.push((p.clone(), e.to_string()));
         }
         if i % 1000 == 0 {
             on_tick(i as u64, all);
@@ -1069,41 +1146,41 @@ fn force_remove_dir_all(root: &Path, on_tick: &dyn Fn(u64, u64)) -> Result<(u64,
     }
     on_tick(all, all);
 
-    if dbg {
-        eprintln!(
-            "[dbg] 删 {} 个文件：{:?}（{:.2} ms/文件）",
-            all,
-            t_del.elapsed(),
-            t_del.elapsed().as_secs_f64() * 1000.0 / all.max(1) as f64
-        );
-    }
-    let t_dir = std::time::Instant::now();
+    // 2b) 删不掉的：多半继承了「拒绝删除」的 ACL，解掉再重试一轮
+    let mut acl_fixed = sweep_acl_denied(&mut stuck, false, root);
 
     // 3) 删目录：子目录必须先于父目录（按路径层数从深到浅）
     dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    let mut stuck_dirs: Vec<(PathBuf, String)> = Vec::new();
     for d in &dirs {
         if let Err(e) = remove_with_retry(d, true) {
             if d.exists() {
-                failed += 1;
-                if samples.len() < 3 {
-                    samples.push(format!("{}（{e}）", d.display()));
-                }
+                stuck_dirs.push((d.clone(), e.to_string()));
             }
         }
     }
-
-    if dbg {
-        eprintln!("[dbg] 删 {} 个目录：{:?}", dirs.len(), t_dir.elapsed());
-    }
+    // 3b) 目录阶段同样要解一次 ACL —— 只做文件阶段会漏掉
+    //     「目录本身被拒绝删除、但里面文件都删得掉」这种情况（实测复现过）。
+    acl_fixed += sweep_acl_denied(&mut stuck_dirs, true, root);
 
     if root.exists() {
+        let all_stuck: Vec<&(PathBuf, String)> = stuck.iter().chain(stuck_dirs.iter()).collect();
+        let failed = all_stuck.len();
+        let samples: Vec<String> = all_stuck
+            .iter()
+            .take(3)
+            .map(|(p, why)| format!("{}（{why}）", p.display()))
+            .collect();
         return Err(if samples.is_empty() {
             format!("{} 没能删干净，可能有进程正占着它", root.display())
         } else {
-            format!("有 {failed} 个条目删不掉，例如：{}", samples.join("；"))
+            format!(
+                "有 {failed} 个条目删不掉（多半是被「拒绝删除」的权限保护着，或正被程序占用），例如：{}",
+                samples.join("；")
+            )
         });
     }
-    Ok((all, bytes))
+    Ok((all, bytes, acl_fixed))
 }
 
 /// 校验路径是「家目录直接子项 + 名字含 .moved- + 不是联接」。清理的门槛。
@@ -1191,7 +1268,17 @@ pub fn list_backups() -> Vec<Value> {
 }
 
 /// 删除备份目录。只接受显式传入的、通过安全校验的路径。
-pub fn cleanup(paths: &[String], progress: Option<&dyn Fn(Progress)>) -> Result<Value, String> {
+/// `permanent = false`：先试「整目录丢回收站」，失败回退逐条删（可还原）。
+/// `permanent = true`：跳过回收站，直接逐条永久删除（不可还原，但不用再清空回收站）。
+///
+/// 为什么永久删除不做「一次 shell 调用」的快路径：`SHFileOperation` **不支持超过
+/// MAX_PATH(260) 的路径**，而真机上这棵树里就有 261 字符的路径 —— 回收站那条路
+/// 就是在它身上失败的（用户实测：进度条走到了逐条删的回退分支）。
+pub fn cleanup(
+    paths: &[String],
+    permanent: bool,
+    progress: Option<&dyn Fn(Progress)>,
+) -> Result<Value, String> {
     if paths.is_empty() {
         return Err("没有选中要清理的备份。".to_string());
     }
@@ -1211,16 +1298,24 @@ pub fn cleanup(paths: &[String], progress: Option<&dyn Fn(Progress)>) -> Result<
             continue;
         }
 
-        // 快路径：整棵目录丢进回收站。
-        // 这台机器删 1 个文件要 20 ms 上下，25 万个按条删要一个半小时 —— 不能走那条路。
+        // 永久删除时不需要「清空回收站才释放空间」那句 —— 日志里分开写。
+        // 快路径：整棵目录丢进回收站（`permanent` 时跳过，直接永久删）。
         let fast: Result<(), String> = {
             #[cfg(windows)]
             {
-                move_to_recycle_bin(&p)
+                if permanent {
+                    Err("按用户选择：不走回收站".to_string())
+                } else {
+                    move_to_recycle_bin(&p)
+                }
             }
             #[cfg(not(windows))]
             {
-                Err("非 Windows 平台不支持回收站".to_string())
+                Err(if permanent {
+                    "按用户选择：不走回收站".to_string()
+                } else {
+                    "非 Windows 平台不支持回收站".to_string()
+                })
             }
         };
 
@@ -1253,14 +1348,15 @@ pub fn cleanup(paths: &[String], progress: Option<&dyn Fn(Progress)>) -> Result<
                 tick(0, 0);
 
                 match force_remove_dir_all(&p, &tick) {
-                    Ok((files, bytes)) => {
+                    Ok((files, bytes, acl_fixed)) => {
                         removed.push(raw.clone());
-                        push_log(
-                            &mut logs,
-                            raw,
-                            true,
-                            format!("已彻底删除（{} 个文件 / {}）", files, human(bytes)),
-                        );
+                        let mut msg = format!("已彻底删除（{} 个文件 / {}）", files, human(bytes));
+                        if acl_fixed > 0 {
+                            msg.push_str(&format!(
+                                "；其中 {acl_fixed} 个原先被加了「拒绝删除」保护，已解除后删除"
+                            ));
+                        }
+                        push_log(&mut logs, raw, true, msg);
                     }
                     // 这里已经是「具体哪个路径失败」的完整原因
                     Err(e) => push_log(&mut logs, raw, false, format!("{why}；逐条删除也没成功：{e}")),
@@ -1315,9 +1411,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         make_tree(&root);
 
-        let (files, bytes) = force_remove_dir_all(&root, &|_, _| {}).unwrap();
+        let (files, bytes, acl_fixed) = force_remove_dir_all(&root, &|_, _| {}).unwrap();
         assert_eq!(files, 3, "应当统计到 3 个文件");
         assert!(bytes > 0, "字节数要算出来");
+        assert_eq!(acl_fixed, 0, "这棵树没有「拒绝删除」保护，不该触发 ACL 清理");
         assert!(!root.exists(), "整棵树都不该剩下");
     }
 
@@ -1360,9 +1457,9 @@ mod tests {
         assert!(root.is_dir(), "{} 不是目录", root.display());
 
         let t0 = std::time::Instant::now();
-        let (files, bytes) = force_remove_dir_all(&root, &|_, _| {}).expect("删除失败");
+        let (files, bytes, acl_fixed) = force_remove_dir_all(&root, &|_, _| {}).expect("删除失败");
         println!(
-            "✓ 删掉 {files} 个文件 / {}，用时 {:?}  —— {}",
+            "✓ 删掉 {files} 个文件 / {}（其中需解 ACL 保护的 {acl_fixed} 个），用时 {:?}  —— {}",
             human(bytes),
             t0.elapsed(),
             root.display()
