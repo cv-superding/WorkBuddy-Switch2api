@@ -60,6 +60,8 @@ webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账
 前端是**同一份 `dist/`** 分别嵌进桌面 App 与 CLI 二进制的，所以两边观感与功能一致；
 只有「迁移」和「缓存迁移」依赖系统文件对话框 / NTFS 目录联接，在 webui 里会整页提示只在桌面端可用。
 
+<img src="docs/images/webui-accounts.png" alt="webui：浏览器里的账号管理页，与桌面 App 同一套界面" />
+
 ### 桌面 App
 
 前往 [GitHub Releases](https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest) 下载对应平台的安装包：
