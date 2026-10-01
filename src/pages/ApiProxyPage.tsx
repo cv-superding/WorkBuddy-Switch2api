@@ -4,6 +4,7 @@ import { Check, Copy, ListPlus, Loader2, RefreshCw, Save, Trash2, Users } from "
 import { toast } from "sonner";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -20,6 +21,7 @@ import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import {
   accountGroupLabel,
+  EDITIONS,
   type AccountMeta,
   type ProxyConfig,
   type ProxyModels,
@@ -29,13 +31,63 @@ import {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-const GROUP_ORDER = ["proxy", "desktop", ""] as const;
+type AccountGroup = {
+  key: string;
+  label: string;
+  items: AccountMeta[];
+  /** 这一组本身就是按版本拆出来的，行内不用再标版本。 */
+  byEdition: boolean;
+};
 
-function groupAccounts(accounts: AccountMeta[]): Array<{ group: string; items: AccountMeta[] }> {
-  return GROUP_ORDER.map((group) => ({
-    group,
-    items: accounts.filter((a) => (a.group ?? "") === group),
-  })).filter((g) => g.items.length > 0);
+/**
+ * 账号分组。
+ *
+ * 「反代API」这一组**必须按版本再拆开**：国内版和国际版是两套上游，
+ * 模型列表不一样，混在一起既看不出谁是谁，也说不清某个模型该由谁来接。
+ * 其它组不拆，只在每行标一个版本徽标。
+ *
+ * 反代这两节只要有一档有人就都显示（另一档显示 0 个）——
+ * 这样「我没国际版账号」这件事是看得见的，而不是悄悄少一截。
+ */
+function groupAccounts(accounts: AccountMeta[]): AccountGroup[] {
+  const pick = (group: string, edition?: string) =>
+    accounts.filter(
+      (a) =>
+        (a.group ?? "") === group &&
+        (edition === undefined || (a.edition ?? "domestic") === edition),
+    );
+
+  const out: AccountGroup[] = [];
+  const proxyTotal = pick("proxy").length;
+  for (const e of EDITIONS) {
+    out.push({
+      key: `proxy|${e.value}`,
+      label: `反代API · ${e.label}`,
+      items: pick("proxy", e.value),
+      byEdition: true,
+    });
+  }
+  if (proxyTotal === 0) {
+    out.splice(0, out.length);
+  }
+  out.push({
+    key: "desktop",
+    label: accountGroupLabel("desktop"),
+    items: pick("desktop"),
+    byEdition: false,
+  });
+  out.push({
+    key: "ungrouped",
+    label: accountGroupLabel(""),
+    items: pick(""),
+    byEdition: false,
+  });
+  return out.filter((g) => g.byEdition || g.items.length > 0);
+}
+
+/** 一行里显示的版本徽标（分组本身已经按版本拆了就不用再标）。 */
+function editionLabelOf(a: AccountMeta): string {
+  return EDITIONS.find((e) => e.value === (a.edition ?? "domestic"))?.label ?? "国内版";
 }
 
 function num(v?: number): string {
@@ -272,29 +324,37 @@ export default function ApiProxyPage() {
                       onClick={() =>
                         setCfg({ ...cfg, accounts: accounts.filter((a) => a.group === "proxy").map((a) => a.uid ?? "").filter(Boolean) })
                       }
-                      disabled={!groups.some((g) => g.group === "proxy")}
+                      disabled={!accounts.some((a) => a.group === "proxy")}
                     >
                       <Users className="size-3.5" />
                       只选「反代API」分组
                     </Button>
                   </div>
 
-                  {groups.map(({ group, items }) => (
-                    <div key={group || "ungrouped"} className="overflow-hidden rounded-lg border border-border/60">
+                  {groups.map((g) => (
+                    <div key={g.key} className="overflow-hidden rounded-lg border border-border/60">
                       <div className="flex items-center justify-between gap-2 border-b border-border/40 bg-muted/40 px-3 py-1.5">
-                        <span className="text-xs font-medium text-muted-foreground">
-                          {accountGroupLabel(group)}
-                        </span>
-                        <span className="text-xs text-muted-foreground/60">{items.length} 个</span>
+                        <span className="text-xs font-medium text-muted-foreground">{g.label}</span>
+                        <span className="text-xs text-muted-foreground/60">{g.items.length} 个</span>
                       </div>
                       <div className="divide-y divide-border/40">
-                        {items.map((a) => {
+                        {g.items.map((a) => {
                           const uid = a.uid ?? "";
                           return (
                             <div key={a.id} className="flex items-center justify-between gap-3 px-3 py-2">
                               <div className="min-w-0 flex-1">
-                                <div className="truncate text-[13px] leading-4">
-                                  {a.nickname || a.email || uid}
+                                <div className="flex items-center gap-1.5">
+                                  <span className="truncate text-[13px] leading-4">
+                                    {a.nickname || a.email || uid}
+                                  </span>
+                                  {!g.byEdition ? (
+                                    <Badge
+                                      variant="secondary"
+                                      className="h-4 shrink-0 border-0 px-1 text-[10px] leading-4"
+                                    >
+                                      {editionLabelOf(a)}
+                                    </Badge>
+                                  ) : null}
                                 </div>
                                 {a.needsRelogin ? (
                                   <div className="text-xs text-amber-600">需要重新登录，不会参与</div>
@@ -309,6 +369,13 @@ export default function ApiProxyPage() {
                             </div>
                           );
                         })}
+                        {g.items.length === 0 ? (
+                          <div className="px-3 py-2 text-xs text-muted-foreground/70">
+                            {g.byEdition
+                              ? `账号库里没有这一档的号 —— 它那套模型也拉不到`
+                              : "没有账号"}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   ))}
@@ -464,39 +531,83 @@ export default function ApiProxyPage() {
       </p>
 
       <Dialog open={modelsOpen} onOpenChange={setModelsOpen}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>可用模型 ID</DialogTitle>
+            <DialogTitle>可用模型 ID（按版本分开）</DialogTitle>
             <DialogDescription>
-              客户端里的 <code className="rounded bg-muted px-1">model</code> 字段填下面任意一个。
-              {models ? ` 共 ${models.models.length} 个 · 来源：${models.source}` : null}
+              国内版和国际版是两套上游，模型列表不一样，所以分档列。客户端里的{" "}
+              <code className="rounded bg-muted px-1">model</code> 字段填下面任意一个 ——
+              反代会按这个 ID 自动挑对应版本的账号。
             </DialogDescription>
           </DialogHeader>
 
-          <div className="max-h-[46vh] divide-y divide-border/40 overflow-y-auto rounded-lg border border-border/60">
-            {(models?.models ?? []).map((id) => (
-              <div key={id} className="flex items-center justify-between gap-3 px-3 py-2">
-                <code className="min-w-0 flex-1 truncate text-[13px]">{id}</code>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 shrink-0 px-2"
-                  onClick={() => void copyText(id, id)}
-                  aria-label={`复制 ${id}`}
-                >
-                  {copied === id ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-                </Button>
+          <div className="max-h-[52vh] space-y-3 overflow-y-auto">
+            {(models?.editions ?? []).map((g) => (
+              <div key={g.edition} className="overflow-hidden rounded-lg border border-border/60">
+                <div className="flex items-center justify-between gap-2 border-b border-border/40 bg-muted/40 px-3 py-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    {g.label}
+                    {g.source ? ` · ${g.source}` : ""}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground/60">{g.models.length} 个</span>
+                    {g.models.length > 0 ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 px-1.5 text-[11px]"
+                        onClick={() => void copyText(g.models.join("\n"), `__all__${g.edition}`)}
+                      >
+                        {copied === `__all__${g.edition}` ? (
+                          <Check className="size-3" />
+                        ) : (
+                          <Copy className="size-3" />
+                        )}
+                        复制
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+                {g.models.length > 0 ? (
+                  <div className="divide-y divide-border/40">
+                    {g.models.map((id) => (
+                      <div key={`${g.edition}-${id}`} className="flex items-center justify-between gap-3 px-3 py-2">
+                        <code className="min-w-0 flex-1 truncate text-[13px]">{id}</code>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 shrink-0 px-2"
+                          onClick={() => void copyText(id, `${g.edition}-${id}`)}
+                          aria-label={`复制 ${id}`}
+                        >
+                          {copied === `${g.edition}-${id}` ? (
+                            <Check className="size-3.5" />
+                          ) : (
+                            <Copy className="size-3.5" />
+                          )}
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="px-3 py-2.5 text-xs leading-5 text-amber-600">
+                    {g.error ?? "没拉到"}
+                  </div>
+                )}
+                {g.sourceUrl ? (
+                  <div className="border-t border-border/40 px-3 py-1.5 text-[11px] text-muted-foreground/70">
+                    数据来自 <code className="break-all">{g.sourceUrl}</code>
+                  </div>
+                ) : null}
               </div>
             ))}
+            {models && (models.editions?.length ?? 0) === 0 ? (
+              <div className="px-3 py-2 text-xs text-muted-foreground">没有拉到任何模型。</div>
+            ) : null}
           </div>
 
           <p className="text-xs leading-5 text-muted-foreground">
-            列表外的 ID 也能直接发（上游支持就行）；拉不到时会退回一组内置兜底。
-            {models?.sourceUrl ? (
-              <>
-                {" "}数据来自 <code className="rounded bg-muted px-1">{models.sourceUrl}</code>
-              </>
-            ) : null}
+            列表外的 ID 也能直接发（上游支持就行）。两版都会各问一次上游，所以国际版账号缺失时那一档会标出原因。
           </p>
 
           <DialogFooter>
@@ -506,7 +617,7 @@ export default function ApiProxyPage() {
               onClick={() => void copyText((models?.models ?? []).join("\n"), "__all__")}
             >
               {copied === "__all__" ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-              复制全部
+              复制全部（两版并集）
             </Button>
             <Button size="sm" onClick={() => setModelsOpen(false)}>
               关闭

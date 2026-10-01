@@ -207,9 +207,23 @@ export interface ProxyStatus {
 }
 
 /** 「获取模型ID」的结果：客户端 model 字段该填什么。 */
-export interface ProxyModels {
+/** 一档（国内版 / 国际版）的模型列表。两版的模型不一样，所以分开看。 */
+export interface ProxyModelsEdition {
+  /** "domestic" | "international" */
+  edition: string;
+  label: string;
   models: string[];
-  /** 数据来源：「本机反代」= 问了本机 7863，消耗为 0；「上游」= 反代没开，直连拉的。 */
+  source: string;
+  sourceUrl: string;
+  /** 这一档没拉到时的原因；拉到则为 null。 */
+  error: string | null;
+}
+
+export interface ProxyModels {
+  /** 分档明细（拉的是哪一档就有几条）。 */
+  editions: ProxyModelsEdition[];
+  /** 扁平并集，兼容旧用法。 */
+  models: string[];
   source: string;
   sourceUrl: string;
 }

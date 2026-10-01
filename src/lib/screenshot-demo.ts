@@ -24,10 +24,11 @@ interface AccountUsageSeed {
 }
 
 const accounts: AccountMeta[] = [
-  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
-  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
-  // 国际版：账号页的国际版标签页靠 edition 字段过滤，演示数据里保留一个以便展示分档位 UI
-  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, edition: "international" },
+  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, group: "proxy" },
+  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, group: "desktop" },
+  // 分组：A=反代API·国内版 / B=桌面端 / C=反代API·国际版 ——
+// 反代页要按版本拆组，这里得两种版本都有人才看得出效果
+  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, edition: "international", group: "proxy" },
 ];
 
 /** 演示模式中的临时 CLI 当前账号，仅存在于本次页面会话。 */
@@ -353,7 +354,10 @@ function rotateConfig(): AutoRotateConfig {
 
 /** 反代页的演示数据（演示/Pages 构建里也要能完整渲染这一页）。 */
 function proxyConfig(): ProxyConfig {
-  return { enabled: true, listen: "127.0.0.1:7863", api_key: "", accounts: [] };
+  // 故意不勾「使用全部账号」：分组列表只在按组挑选时才显示，
+  // 而按版本拆组正是这一版要展示的东西。
+  const proxyUids = accounts.filter((a) => a.group === "proxy").map((a) => a.uid ?? "");
+  return { enabled: true, listen: "127.0.0.1:7863", api_key: "", accounts: proxyUids };
 }
 
 function proxyStatus(): ProxyStatus {
@@ -478,10 +482,17 @@ function cacheVerify(): CacheVerifyResult {
 }
 
 function proxyModels(): ProxyModels {
+  const cn = ["auto", "hy4-preview", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "kimi-k3-1", "minimax-m3"];
+  const intl = ["auto", "claude-sonnet-4.5", "gpt-5.2-codex", "gemini-3-pro", "deepseek-v4-pro"];
+  const union = Array.from(new Set([...cn, ...intl]));
   return {
-    models: ["auto", "hy4-preview", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "kimi-k3-1", "minimax-m3"],
-    source: "本机反代",
-    sourceUrl: "http://127.0.0.1:7863/v1/models",
+    editions: [
+      { edition: "domestic", label: "国内版", models: cn, source: "上游", sourceUrl: "https://www.codebuddy.cn/v2/enterprises/personal/models", error: null },
+      { edition: "international", label: "国际版", models: intl, source: "上游", sourceUrl: "https://www.workbuddy.ai/v2/enterprises/personal/models", error: null },
+    ],
+    models: union,
+    source: "上游",
+    sourceUrl: "https://www.codebuddy.cn/v2/enterprises/personal/models",
   };
 }
 

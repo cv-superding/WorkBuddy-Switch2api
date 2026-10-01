@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 use super::account::{load_accounts, upsert_account};
 use super::config::{home_dir, now_ms};
-use super::edition::edition_of;
+use super::edition::{edition_of, Edition};
 use super::refresh::refresh_account_token;
 
 const CONFIG_FILE: &str = "proxy.json";
@@ -108,6 +108,9 @@ pub fn save_proxy_config(cfg: &ProxyConfig) -> Result<(), String> {
 
 struct AccountLease {
     uid: String,
+    /// 这个号属于哪一档。国内版和国际版的模型列表不同，
+    /// 拿国际版专属的 model 去打国内版网关会被拒，所以选号必须认版本。
+    edition: Edition,
     failed_at: Option<Instant>,
 }
 
@@ -117,13 +120,14 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(uids: Vec<String>) -> Self {
+    fn new(entries: Vec<(String, Edition)>) -> Self {
         Self {
-            leases: uids
+            leases: entries
                 .into_iter()
-                .map(|uid| {
+                .map(|(uid, edition)| {
                     std::sync::Mutex::new(AccountLease {
                         uid,
+                        edition,
                         failed_at: None,
                     })
                 })
@@ -132,8 +136,11 @@ impl Pool {
         }
     }
 
-    /// 轮转取一个「当前可用」的 uid：跳过冷却中的号；全被冷却时返回 None。
-    fn next_uid(&self) -> Option<String> {
+    /// 同上，但可以只在某一档里取号（`want = None` 表示不限版本）。
+    ///
+    /// 一个版本都没有可用号时**不会**悄悄换另一个版本 —— 那样只会把
+    /// 「模型不存在」的 400 换个地方报出来，不如直接说清楚。
+    fn next_uid_of(&self, want: Option<Edition>) -> Option<String> {
         if self.leases.is_empty() {
             return None;
         }
@@ -143,6 +150,11 @@ impl Pool {
             let Ok(lease) = self.leases[idx].lock() else {
                 continue;
             };
+            if let Some(e) = want {
+                if lease.edition != e {
+                    continue;
+                }
+            }
             if lease
                 .failed_at
                 .map(|t| t.elapsed() < COOLDOWN)
@@ -153,6 +165,15 @@ impl Pool {
             return Some(lease.uid.clone());
         }
         None
+    }
+
+    /// 某一档里还有没有号（用于给出更准确的报错）。
+    fn has_edition(&self, edition: Edition) -> bool {
+        self.leases.iter().any(|slot| {
+            slot.lock()
+                .map(|l| l.edition == edition)
+                .unwrap_or(false)
+        })
     }
 
     fn mark_failed(&self, uid: &str) {
@@ -170,8 +191,8 @@ fn now_ms_i64() -> i64 {
 }
 
 /// 取一个可用的账号（必要时先刷新 token）。
-async fn take_account(pool: &Pool, _cfg: &ProxyConfig) -> Option<Value> {
-    let uid = pool.next_uid()?;
+async fn take_account(pool: &Pool, _cfg: &ProxyConfig, want: Option<Edition>) -> Option<Value> {
+    let uid = pool.next_uid_of(want)?;
     let mut acc = load_accounts().into_iter().find(|a| {
         a.get("uid").and_then(Value::as_str) == Some(uid.as_str())
             && a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
@@ -211,6 +232,48 @@ fn chat_url(acc: &Value) -> String {
 
 fn models_url(acc: &Value) -> String {
     format!("{}/v2/enterprises/personal/models", upstream_endpoint(acc))
+}
+
+/// 模型 id → 属于哪一档。由「拉模型列表」这条路径写入。
+///
+/// 反代池里国内版和国际版的号是混着的，而**两版的模型列表不一样**：
+/// 拿国际版专属的 model 去打国内版网关会被拒。所以请求进来先按 model 查这张表，
+/// 命中就只在该版本的号里选；没命中（还没拉过列表）就退回原来的轮转行为。
+fn model_routes() -> &'static Mutex<HashMap<String, Edition>> {
+    static ROUTES: std::sync::OnceLock<Mutex<HashMap<String, Edition>>> =
+        std::sync::OnceLock::new();
+    ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 记下「这些模型属于这一档」。拉列表成功时调用。
+fn remember_model_routes(edition: Edition, ids: &[String]) {
+    if let Ok(mut m) = model_routes().lock() {
+        for id in ids {
+            m.insert(id.clone(), edition);
+        }
+    }
+}
+
+/// 查某个 model 属于哪一档。
+pub fn model_edition(model: &str) -> Option<Edition> {
+    model_routes().lock().ok().and_then(|m| m.get(model).copied())
+}
+
+/// 解析版本标识（前端传 `domestic` / `international`）。
+pub fn parse_edition_key(s: &str) -> Option<Edition> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "domestic" | "cn" | "国内版" => Some(Edition::Domestic),
+        "international" | "intl" | "ai" | "国际版" => Some(Edition::International),
+        _ => None,
+    }
+}
+
+/// `/v1/models` 里 `owned_by` 的取值：让客户端一眼看出这个模型是哪一档的。
+fn owner_tag(edition: Edition) -> &'static str {
+    match edition {
+        Edition::Domestic => "workbuddy-cn",
+        Edition::International => "workbuddy-intl",
+    }
 }
 
 /// 该账号所在档位的上游基址。
@@ -528,20 +591,10 @@ fn push_unique(ids: &mut Vec<String>, id: &str) {
 }
 
 /// 上游模型列表的兜底（拉不到时给一组可用的，免得客户端因为空列表直接报错）。
-const FALLBACK_MODEL_IDS: [&str; 7] = [
-    "auto",
-    "hy4-preview",
-    "deepseek-v4-pro",
-    "deepseek-v4.1-flash",
-    "glm-5.3",
-    "kimi-k3-1",
-    "minimax-m3",
-];
-
 /// 从上游响应里抠出模型 id。
 /// 上游结构：`{ code, msg, data: { agents: [ { name, models: [...] } ] } }`，
 /// 也可能直接是 `{ data: [...] }` 或裸数组，这里都兜住。
-fn parse_model_ids(v: &Value) -> Vec<String> {
+fn parse_model_ids_raw(v: &Value) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     if let Some(agents) = v.pointer("/data/agents").and_then(Value::as_array) {
         for a in agents {
@@ -568,27 +621,6 @@ fn parse_model_ids(v: &Value) -> Vec<String> {
             push_unique(&mut ids, id);
         }
     }
-    if ids.is_empty() {
-        for s in FALLBACK_MODEL_IDS {
-            push_unique(&mut ids, s);
-        }
-    }
-    ids
-}
-
-/// 本机反代 `/v1/models` 的响应（OpenAI 形状）里抠 id。
-fn parse_openai_model_list(v: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
-    if let Some(items) = v.get("data").and_then(Value::as_array) {
-        for m in items {
-            let id = m
-                .get("id")
-                .or_else(|| m.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            push_unique(&mut ids, id);
-        }
-    }
     ids
 }
 
@@ -601,44 +633,72 @@ fn cut_text(s: &str, max: usize) -> String {
     out
 }
 
+/// 把两档的模型列表合成 OpenAI 形状：两档都有的标 `workbuddy`，
+/// 只在国内版有的标 `workbuddy-cn`，只在国际版有的标 `workbuddy-intl`。
+fn merge_edition_models(dom: &[String], intl: &[String]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for id in dom {
+        let both = intl.iter().any(|x| x == id);
+        out.push(json!({
+            "id": id,
+            "object": "model",
+            "owned_by": if both { "workbuddy" } else { owner_tag(Edition::Domestic) },
+        }));
+    }
+    for id in intl {
+        if dom.iter().any(|x| x == id) {
+            continue;
+        }
+        out.push(json!({
+            "id": id,
+            "object": "model",
+            "owned_by": owner_tag(Edition::International),
+        }));
+    }
+    out
+}
+
+/// `GET /v1/models` —— **两档各拉一次再合并**。
+///
+/// 以前只从轮转到的那个号上拉，于是列表是哪一档全看运气；现在按档分别拉，
+/// `owned_by` 会写清楚来源（`workbuddy-cn` / `workbuddy-intl` / 两档都有 = `workbuddy`）。
 async fn list_models(State(st): State<AppState>) -> Response {
-    let Some(acc) = take_account(&st.pool, &st.cfg).await else {
+    let (dom, intl) = tokio::join!(
+        fetch_edition_models(&st.cfg, Edition::Domestic),
+        fetch_edition_models(&st.cfg, Edition::International),
+    );
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut dom_ids: Vec<String> = Vec::new();
+    let mut intl_ids: Vec<String> = Vec::new();
+    match dom {
+        Ok((ids, _, _)) => dom_ids = ids,
+        Err(e) => errors.push(format!("{}：{e}", Edition::Domestic.label())),
+    }
+    match intl {
+        Ok((ids, _, _)) => intl_ids = ids,
+        Err(e) => errors.push(format!("{}：{e}", Edition::International.label())),
+    }
+
+    if dom_ids.is_empty() && intl_ids.is_empty() {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {"message": "no available account"}})),
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"message": format!("两档都没拉到模型列表 —— {}", errors.join("；"))}})),
         )
             .into_response();
-    };
-    let client = match reqwest::Client::builder().build() {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let mut req = client.get(models_url(&acc));
-    for (k, v) in chat_headers(&acc) {
-        req = req.header(k, v);
     }
-    match req.send().await {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(v) => {
-                let data: Vec<Value> = parse_model_ids(&v)
-                    .into_iter()
-                    .map(|id| json!({"id": id, "object": "model", "owned_by": "workbuddy"}))
-                    .collect();
-                Json(json!({"object": "list", "data": data})).into_response()
-            }
-            Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-        },
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    }
+
+    Json(json!({"object": "list", "data": merge_edition_models(&dom_ids, &intl_ids)})).into_response()
 }
 
 // ---------------------------------------------------------------- 取模型列表（桌面端按钮用）
 
 /// 从账号库里挑一个可用账号（必要时先刷新 token）。不参与轮转、不动失败冷却。
-async fn pick_any_account(cfg: &ProxyConfig) -> Option<Value> {
+async fn pick_account_of(cfg: &ProxyConfig, edition: Option<Edition>) -> Option<Value> {
     let want = cfg.accounts.clone();
     let acc = load_accounts().into_iter().find(|a| {
         a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
+            && edition.map(|e| edition_of(a) == e).unwrap_or(true)
             && (want.is_empty()
                 || a.get("uid")
                     .and_then(Value::as_str)
@@ -662,43 +722,20 @@ async fn pick_any_account(cfg: &ProxyConfig) -> Option<Value> {
     }
 }
 
-/// 「获取模型ID」：先问本机反代（同一份数据、不额外占号），拿不到再直连上游。
-/// 返回 `{ models: [...], source: "本机反代" | "上游", sourceUrl }`。
-pub async fn fetch_models() -> Result<Value, String> {
-    let cfg = load_proxy_config();
-
-    if proxy_running() {
-        let host = cfg.listen.replacen("0.0.0.0", "127.0.0.1", 1);
-        let url = format!("http://{host}/v1/models");
-        if let Ok(client) = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(15))
-            .build()
-        {
-            let mut req = client.get(&url);
-            if !cfg.api_key.trim().is_empty() {
-                req = req.header("authorization", format!("Bearer {}", cfg.api_key.trim()));
-            }
-            if let Ok(r) = req.send().await {
-                if r.status().is_success() {
-                    if let Ok(v) = r.json::<Value>().await {
-                        let ids = parse_openai_model_list(&v);
-                        if !ids.is_empty() {
-                            return Ok(json!({
-                                "models": ids,
-                                "source": "本机反代",
-                                "sourceUrl": url,
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let acc = pick_any_account(&cfg)
-        .await
-        .ok_or_else(|| "没有可用账号：账号库为空，或全部需要重新登录".to_string())?;
+/// 拉某一档的模型列表（用**该档自己的账号**）。
+///
+/// 返回 `(ids, 来源说明, 来源 URL)`；成功时顺手把「模型 → 版本」写进路由表，
+/// 之后 `/v1/chat/completions` 就能按 model 挑对版本。
+async fn fetch_edition_models(
+    cfg: &ProxyConfig,
+    edition: Edition,
+) -> Result<(Vec<String>, String, String), String> {
+    let acc = pick_account_of(cfg, Some(edition)).await.ok_or_else(|| {
+        format!(
+            "没有可用的{}账号（需要重新登录、不在参与名单里，或账号库里就是没有这一档）",
+            edition.label()
+        )
+    })?;
     let url = models_url(&acc);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -712,13 +749,92 @@ pub async fn fetch_models() -> Result<Value, String> {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("上游返回 {status}：{}", cut_text(&text, 200)));
+        return Err(format!("上游返回 {status}：{}", cut_text(&text, 160)));
     }
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("上游返回不是 JSON：{e}"))?;
+    let ids = parse_model_ids_raw(&v);
+    if ids.is_empty() {
+        return Err("上游没有返回任何模型".to_string());
+    }
+    remember_model_routes(edition, &ids);
+    Ok((ids, "上游".to_string(), url))
+}
+
+/// 「获取模型ID」：按版本分别拉。
+///
+/// `edition` 传 `"domestic"` / `"international"` 只拉那一档；不传则**两档都拉**。
+/// 返回值里 `editions[]` 是分档明细（含各自的失败原因），
+/// 另外保留 `models` / `source` / `sourceUrl` 三个扁平字段（= 第一档成功的那份），
+/// 老前端不改也能用。
+pub async fn fetch_models(edition: Option<String>) -> Result<Value, String> {
+    let wanted: Option<Edition> = match edition.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => Some(parse_edition_key(s).ok_or_else(|| {
+            format!("未知版本：{s}（可选 domestic / international）")
+        })?),
+    };
+
+    let cfg = load_proxy_config();
+    let list: Vec<Edition> = match wanted {
+        Some(e) => vec![e],
+        None => Edition::ALL.to_vec(),
+    };
+
+    // 两档并行拉，别串行等。
+    let results = futures::future::join_all(
+        list.iter()
+            .map(|e| fetch_edition_models(&cfg, *e))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+
+    let mut editions: Vec<Value> = Vec::new();
+    let mut flat_models: Vec<String> = Vec::new();
+    let mut flat_source = String::new();
+    let mut flat_url = String::new();
+
+    for (e, res) in list.iter().zip(results) {
+        match res {
+            Ok((ids, source, url)) => {
+                if flat_models.is_empty() {
+                    flat_models = ids.clone();
+                    flat_source = source.clone();
+                    flat_url = url.clone();
+                }
+                editions.push(json!({
+                    "edition": e.key(),
+                    "label": e.label(),
+                    "models": ids,
+                    "source": source,
+                    "sourceUrl": url,
+                    "error": Value::Null,
+                }));
+            }
+            Err(err) => editions.push(json!({
+                "edition": e.key(),
+                "label": e.label(),
+                "models": [],
+                "source": "",
+                "sourceUrl": "",
+                "error": err,
+            })),
+        }
+    }
+
+    if flat_models.is_empty() {
+        let why = editions
+            .iter()
+            .filter_map(|x| x["error"].as_str())
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!("两档都没拉到模型列表 —— {why}"));
+    }
+
     Ok(json!({
-        "models": parse_model_ids(&v),
-        "source": "上游",
-        "sourceUrl": url,
+        "editions": editions,
+        "models": flat_models,
+        "source": flat_source,
+        "sourceUrl": flat_url,
     }))
 }
 
@@ -1214,10 +1330,25 @@ async fn chat_completions(
         .unwrap_or("deepseek-v4-flash")
         .to_string();
 
-    let Some(acc) = take_account(&st.pool, &st.cfg).await else {
+    // 按 model 认版本：国内版和国际版的模型列表不一样，把国际版专属的 model
+    // 打到国内版网关上会被拒。拉过一次模型列表之后这里就能命中。
+    let route = model_edition(&model);
+    let Some(acc) = take_account(&st.pool, &st.cfg, route).await else {
+        let message = match route {
+            Some(e) if st.pool.has_edition(e) => format!(
+                "模型 `{model}` 属于{}，但该版本的账号当前都不可用（冷却中或需要重新登录）",
+                e.label()
+            ),
+            Some(e) => format!(
+                "模型 `{model}` 属于{}，但参与轮转的账号里没有{}的号",
+                e.label(),
+                e.label()
+            ),
+            None => "no available account (all cooling down or needs relogin)".to_string(),
+        };
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {"message": "no available account (all cooling down or needs relogin)"}})),
+            Json(json!({"error": {"message": message}})),
         )
             .into_response();
     };
@@ -1428,12 +1559,12 @@ fn router(st: AppState) -> Router {
 /// 启动反代服务（阻塞，直到监听失败或进程退出）。
 pub async fn run_proxy_server(cfg: ProxyConfig) -> Result<(), String> {
     let addr: SocketAddr = cfg.listen.parse().map_err(|_| format!("监听地址无效: {}", cfg.listen))?;
-    let uids = eligible_uids(&cfg);
-    if uids.is_empty() {
+    let accounts = eligible_accounts(&cfg);
+    if accounts.is_empty() {
         return Err("没有可用账号：账号库为空或全部 needs_relogin".to_string());
     }
     let st = AppState {
-        pool: Arc::new(Pool::new(uids)),
+        pool: Arc::new(Pool::new(accounts)),
         cfg: Arc::new(cfg),
     };
     let listener = tokio::net::TcpListener::bind(addr)
@@ -1452,14 +1583,14 @@ async fn run_proxy_until(
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     let addr: SocketAddr = cfg.listen.parse().map_err(|_| format!("监听地址无效: {}", cfg.listen))?;
-    let uids = eligible_uids(&cfg);
-    if uids.is_empty() {
+    let accounts = eligible_accounts(&cfg);
+    if accounts.is_empty() {
         let msg = "没有可用账号：账号库为空或全部 needs_relogin".to_string();
         let _ = ready.send(Err(msg.clone()));
         return Err(msg);
     }
     let st = AppState {
-        pool: Arc::new(Pool::new(uids)),
+        pool: Arc::new(Pool::new(accounts)),
         cfg: Arc::new(cfg),
     };
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -1481,7 +1612,7 @@ async fn run_proxy_until(
 }
 
 /// 按配置挑出参与反代的 uid。
-fn eligible_uids(cfg: &ProxyConfig) -> Vec<String> {
+fn eligible_accounts(cfg: &ProxyConfig) -> Vec<(String, Edition)> {
     load_accounts()
         .into_iter()
         .filter(|a| a.get("needs_relogin").and_then(Value::as_bool) != Some(true))
@@ -1492,7 +1623,11 @@ fn eligible_uids(cfg: &ProxyConfig) -> Vec<String> {
                     .map(|u| cfg.accounts.iter().any(|x| x == u))
                     .unwrap_or(false)
         })
-        .filter_map(|a| a.get("uid").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|a| {
+            a.get("uid")
+                .and_then(Value::as_str)
+                .map(|u| (u.to_string(), edition_of(&a)))
+        })
         .collect()
 }
 
@@ -1620,6 +1755,74 @@ pub fn restart_proxy_server() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// 版本标识解析：前端传的是 key，也容忍几个常见别名。
+    #[test]
+    fn edition_key_parsing() {
+        assert_eq!(parse_edition_key("domestic"), Some(Edition::Domestic));
+        assert_eq!(parse_edition_key(" INTERNATIONAL "), Some(Edition::International));
+        assert_eq!(parse_edition_key("intl"), Some(Edition::International));
+        assert_eq!(parse_edition_key("国内版"), Some(Edition::Domestic));
+        assert_eq!(parse_edition_key("国际版"), Some(Edition::International));
+        assert_eq!(parse_edition_key("nope"), None);
+        assert_eq!(parse_edition_key(""), None);
+    }
+
+    /// 合并两档：两档都有 → workbuddy；只有一档有 → 各自的 tag。
+    #[test]
+    fn merging_two_editions_tags_ownership() {
+        let dom = vec!["auto".to_string(), "deepseek-v4-pro".to_string()];
+        let intl = vec!["auto".to_string(), "claude-sonnet".to_string()];
+        let merged = merge_edition_models(&dom, &intl);
+        let by: std::collections::HashMap<&str, &str> = merged
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_str().unwrap(),
+                    m["owned_by"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by.get("auto"), Some(&"workbuddy"), "两档都有应标成通用的");
+        assert_eq!(by.get("deepseek-v4-pro"), Some(&"workbuddy-cn"));
+        assert_eq!(by.get("claude-sonnet"), Some(&"workbuddy-intl"));
+        assert_eq!(merged.len(), 3, "同名的不能重复出现");
+        // 国内版在前，保持稳定顺序
+        assert_eq!(merged[0]["id"], "auto");
+    }
+
+    /// 只有一档有号时，另一档的模型不该被路由过去。
+    #[test]
+    fn model_routes_record_and_lookup() {
+        remember_model_routes(
+            Edition::International,
+            &["intl-only-model".to_string()],
+        );
+        assert_eq!(
+            model_edition("intl-only-model"),
+            Some(Edition::International)
+        );
+        assert_eq!(model_edition("never-seen-model"), None);
+    }
+
+    /// 账号池按版本取号：只要国内版时不该给出国际版的号。
+    #[test]
+    fn pool_filters_by_edition() {
+        let pool = Pool::new(vec![
+            ("u-intl".to_string(), Edition::International),
+            ("u-dom".to_string(), Edition::Domestic),
+        ]);
+        assert_eq!(pool.next_uid_of(Some(Edition::Domestic)).as_deref(), Some("u-dom"));
+        assert_eq!(pool.next_uid_of(Some(Edition::International)).as_deref(), Some("u-intl"));
+        assert!(pool.has_edition(Edition::Domestic));
+        assert!(pool.has_edition(Edition::International));
+
+        let only_intl = Pool::new(vec![("u-intl".to_string(), Edition::International)]);
+        assert_eq!(only_intl.next_uid_of(Some(Edition::Domestic)), None);
+        assert!(!only_intl.has_edition(Edition::Domestic));
+        // 不限版本时照常能拿到
+        assert_eq!(only_intl.next_uid_of(None).as_deref(), Some("u-intl"));
+    }
+
     /// 复现线上的 400：客户端把附件当 `{"type":"file"}` 发过来，
     /// 上游回 `Parse message failed: unsupported content type at index 0: file`。
     #[test]
@@ -1734,22 +1937,21 @@ mod tests {
             ]}
         });
         // 去重且保序
-        assert_eq!(parse_model_ids(&v), vec!["glm-5.3", "kimi-k3-1", "deepseek-v4-pro"]);
+        assert_eq!(parse_model_ids_raw(&v), vec!["glm-5.3", "kimi-k3-1", "deepseek-v4-pro"]);
     }
 
-    /// 兜底形态：`{data:[{id}]}`（本机反代 / OpenAI 风格）。
+    /// 上游的另一种形态：`{data:[{id}]}`（OpenAI 风格）。
     #[test]
     fn parse_model_ids_reads_openai_list() {
         let v = json!({ "object": "list", "data": [ {"id": "auto"}, {"id": "glm-5.3"} ] });
-        assert_eq!(parse_model_ids(&v), vec!["auto", "glm-5.3"]);
-        assert_eq!(parse_openai_model_list(&v), vec!["auto", "glm-5.3"]);
+        assert_eq!(parse_model_ids_raw(&v), vec!["auto", "glm-5.3"]);
     }
 
-    /// 啥都拿不到时给内置兜底，别让客户端拿到空列表。
+    /// 拉不到就是空 —— 不再退回内置兜底（那会让客户端以为有这些模型，
+    /// 实际发过去照样 404，不如让调用方把失败原因报出来）。
     #[test]
-    fn parse_model_ids_falls_back() {
-        let ids = parse_model_ids(&json!({ "code": 0 }));
-        assert!(ids.contains(&"auto".to_string()));
-        assert_eq!(ids.len(), FALLBACK_MODEL_IDS.len());
+    fn parse_model_ids_raw_returns_empty_when_nothing() {
+        assert!(parse_model_ids_raw(&json!({})).is_empty());
+        assert!(parse_model_ids_raw(&json!({"data": {"agents": []}})).is_empty());
     }
 }

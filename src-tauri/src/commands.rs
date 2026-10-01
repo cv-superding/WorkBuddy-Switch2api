@@ -731,8 +731,10 @@ pub fn reset_proxy_usage() -> Result<Value, String> {
 ///
 /// async：要走两次可能很慢的网络请求（本地 HTTP + 上游），不能占主线程。
 #[tauri::command]
-pub async fn get_proxy_models() -> Result<Value, String> {
-    proxy::fetch_models().await
+pub async fn get_proxy_models(edition: Option<String>) -> Result<Value, String> {
+    // 不传 edition = 国内版 + 国际版各拉一次再分档返回；
+    // 传 "domestic" / "international" 只拉那一档。两版模型列表不一样，必须分开看。
+    proxy::fetch_models(edition).await
 }
 
 // ---------------------------------------------------------------------------

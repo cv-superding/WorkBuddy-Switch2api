@@ -500,8 +500,14 @@ export function resetProxyUsage(): Promise<{ ok: boolean }> {
 }
 
 /** 「获取模型ID」：拉一次可用模型列表，客户端 model 字段照着填。 */
-export function getProxyModels(): Promise<ProxyModels> {
-  return call("get_proxy_models");
+/**
+ * 拉可用模型列表。
+ *
+ * 不传 `edition` = 国内版和国际版各拉一次、分档返回（两版模型本来就不一样）；
+ * 传 `"domestic"` / `"international"` 只拉那一档。
+ */
+export function getProxyModels(edition?: string): Promise<ProxyModels> {
+  return call("get_proxy_models", { edition });
 }
 
 /** 设置账号分组："desktop"=桌面端 / "proxy"=反代API / ""=未分组。 */
