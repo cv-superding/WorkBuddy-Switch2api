@@ -77,7 +77,12 @@ jobs:
                   "cli_bin": "wb-switch-linux-x64",
                   "platform_tag": "linux-x64",
                   "bundles": "deb,appimage",
-                  "update_arch": "",
+                  "update_os": "linux",
+                  "update_arch": "x86_64",
+                  "update_bundle": "appimage",
+                  # ⚠️ 这个文件名必须与下面 linux 分支里 cp 出来的目标名一致
+                  #    （manifest 里的下载 URL 直接用它）
+                  "update_archive_name": "WorkBuddy-Switch2api-linux-x86_64.AppImage",
               },
           ]
           event = os.environ.get("EVENT_NAME", "")
@@ -250,6 +255,41 @@ jobs:
           fi
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
+          if [ "$UPDATE_OS" = "linux" ]; then
+            # Linux 有 AppImage / deb 两种安装形态：各自收集归档与签名，再生成两份 manifest。
+            # 本分支自己完成全部产物收集，不走下面 macOS / Windows 的公共尾部。
+            LINUX_ROOT="$(dirname "$BUNDLE_DIR")"
+            APPIMAGE="$(find "$LINUX_ROOT/appimage" -maxdepth 1 -type f -name '*.AppImage' | sort)"
+            DEB="$(find "$LINUX_ROOT/deb" -maxdepth 1 -type f -name '*.deb' | sort)"
+            APPIMAGE_COUNT=$(printf '%s\n' "$APPIMAGE" | sed '/^$/d' | wc -l | tr -d ' ')
+            DEB_COUNT=$(printf '%s\n' "$DEB" | sed '/^$/d' | wc -l | tr -d ' ')
+            if [ "$APPIMAGE_COUNT" != 1 ] || [ "$DEB_COUNT" != 1 ]; then
+              echo "error: expected exactly 1 .AppImage and 1 .deb, found $APPIMAGE_COUNT / $DEB_COUNT" >&2
+              printf 'appimage: %s\ndeb: %s\n' "$APPIMAGE" "$DEB" >&2
+              exit 1
+            fi
+            if [ ! -f "$APPIMAGE.sig" ] || [ ! -f "$DEB.sig" ]; then
+              echo "error: missing signature for $APPIMAGE or $DEB" >&2
+              exit 1
+            fi
+            cp "$APPIMAGE" "dist-bin/${PRODUCT}-linux-${UPDATE_ARCH}.AppImage"
+            cp "$APPIMAGE.sig" "dist-bin/${PRODUCT}-linux-${UPDATE_ARCH}.AppImage.sig"
+            cp "$DEB" "dist-bin/${PRODUCT}-linux-${UPDATE_ARCH}.deb"
+            cp "$DEB.sig" "dist-bin/${PRODUCT}-linux-${UPDATE_ARCH}.deb.sig"
+            UPDATE_VERSION="$VER" UPDATE_OS=linux UPDATE_ARCH="$UPDATE_ARCH" UPDATE_BUNDLE=appimage \
+              UPDATE_KEYS="linux-${UPDATE_ARCH}-appimage linux-${UPDATE_ARCH}" \
+              UPDATE_ARCHIVE_NAME="${PRODUCT}-linux-${UPDATE_ARCH}.AppImage" \
+              UPDATE_JSON_NAME="latest-linux-${UPDATE_ARCH}.json" \
+              BUNDLE_DIR="$LINUX_ROOT/appimage" sh scripts/gen-update-json.sh
+            UPDATE_VERSION="$VER" UPDATE_OS=linux UPDATE_ARCH="$UPDATE_ARCH" UPDATE_BUNDLE=deb \
+              UPDATE_KEYS="linux-${UPDATE_ARCH}-deb" \
+              UPDATE_ARCHIVE_NAME="${PRODUCT}-linux-${UPDATE_ARCH}.deb" \
+              UPDATE_JSON_NAME="latest-linux-deb-${UPDATE_ARCH}.json" \
+              BUNDLE_DIR="$LINUX_ROOT/deb" sh scripts/gen-update-json.sh
+            cp "$LINUX_ROOT/appimage/latest-linux-${UPDATE_ARCH}.json" dist-bin/
+            cp "$LINUX_ROOT/deb/latest-linux-deb-${UPDATE_ARCH}.json" dist-bin/
+            exit 0
+          fi
           if [ "$UPDATE_OS" = "windows" ]; then
             ARCHIVE="$BUNDLE_DIR/${PRODUCT}_${VER}_x64-setup.exe"
           else
@@ -321,6 +361,19 @@ jobs:
         run: |
           if ls artifacts/latest-*.json >/dev/null 2>&1; then
             python3 scripts/merge-update-manifests.py artifacts
+            # 缺平台是静默故障（Linux 曾因此收不到更新）→ 合并后强制校验键齐全
+            python3 - <<'PY'
+          import json, pathlib
+          need = {"darwin-aarch64", "darwin-x86_64", "linux-x86_64",
+                  "linux-x86_64-appimage", "linux-x86_64-deb",
+                  "windows-x86_64", "windows-x86_64-nsis"}
+          p = pathlib.Path("artifacts/latest.json")
+          have = set(json.loads(p.read_text(encoding="utf-8"))["platforms"])
+          missing = sorted(need - have)
+          if missing:
+              raise SystemExit(f"updater 清单缺平台: {missing}（有 {sorted(have)}）")
+          print("updater 清单平台齐全:", sorted(have))
+          PY
           else
             echo "没有 latest-*.json（未配置 updater 签名密钥）→ 跳过合并，只发布安装包"
           fi

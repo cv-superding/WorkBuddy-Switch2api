@@ -3,7 +3,8 @@
 # 用法：
 #   UPDATE_OS=macos UPDATE_ARCH=aarch64 sh scripts/gen-update-json.sh [owner] [repo]
 #   UPDATE_OS=windows UPDATE_ARCH=x86_64 sh scripts/gen-update-json.sh [owner] [repo]
-# 可选：BUNDLE_DIR、UPDATE_ARCHIVE_NAME
+#   UPDATE_OS=linux UPDATE_ARCH=x86_64 UPDATE_BUNDLE=appimage|deb sh scripts/gen-update-json.sh [owner] [repo]
+# 可选：BUNDLE_DIR、UPDATE_ARCHIVE_NAME、UPDATE_KEYS、UPDATE_JSON_NAME
 set -e
 cd "$(dirname "$0")/.." || exit 1
 
@@ -17,7 +18,7 @@ UPDATE_ARCHIVE_NAME="${UPDATE_ARCHIVE_NAME:-}"
 case "$UPDATE_ARCH" in
   aarch64|x86_64) ;;
   *)
-    echo "gen-update-json: 不支持的架构：$UPDATE_ARCH（只支持 aarch64 或 x86_64）" >&2
+    echo "gen-update-json: 不支持的架构：${UPDATE_ARCH}（只支持 aarch64 或 x86_64）" >&2
     exit 1
     ;;
 esac
@@ -34,11 +35,37 @@ case "$UPDATE_OS" in
     SIG_GLOB="*_${VERSION}_x64-setup.exe.sig"
     PLATFORM_KEYS="windows-$UPDATE_ARCH-nsis windows-$UPDATE_ARCH"
     ;;
+  linux)
+    # 一次调用只处理一种安装形态：
+    #   appimage → 签名 *.AppImage.sig，keys linux-<arch>-appimage + 兜底 linux-<arch>
+    #   deb      → 签名 *.deb.sig，keys linux-<arch>-deb
+    UPDATE_BUNDLE="${UPDATE_BUNDLE:-appimage}"
+    case "$UPDATE_BUNDLE" in
+      appimage)
+        SIG_GLOB="*.AppImage.sig"
+        PLATFORM_KEYS="linux-$UPDATE_ARCH-appimage linux-$UPDATE_ARCH"
+        ;;
+      deb)
+        SIG_GLOB="*.deb.sig"
+        PLATFORM_KEYS="linux-$UPDATE_ARCH-deb"
+        ;;
+      *)
+        echo "gen-update-json: 不支持的 Linux 安装形态：${UPDATE_BUNDLE}（只支持 appimage 或 deb）" >&2
+        exit 1
+        ;;
+    esac
+    DEFAULT_BUNDLE="$UPDATE_BUNDLE"
+    ;;
   *)
-    echo "gen-update-json: 不支持的系统：$UPDATE_OS（只支持 macos 或 windows）" >&2
+    echo "gen-update-json: 不支持的系统：${UPDATE_OS}（只支持 macos、windows 或 linux）" >&2
     exit 1
     ;;
 esac
+
+# UPDATE_KEYS 覆盖默认 key 列表，由调用方显式声明，避免依赖脚本内部默认值
+if [ -n "${UPDATE_KEYS:-}" ]; then
+  PLATFORM_KEYS="$UPDATE_KEYS"
+fi
 
 BUNDLE_DIR="${BUNDLE_DIR:-target/release/bundle/$DEFAULT_BUNDLE}"
 if [ ! -d "$BUNDLE_DIR" ] && [ -d "src-tauri/target/release/bundle/$DEFAULT_BUNDLE" ]; then
@@ -48,17 +75,19 @@ fi
 SIG_MATCHES=$(find "$BUNDLE_DIR" -maxdepth 2 -type f -name "$SIG_GLOB" | sort)
 SIG_COUNT=$(printf '%s\n' "$SIG_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')
 if [ "$SIG_COUNT" != 1 ]; then
-  echo "gen-update-json: 期望恰好 1 个签名包（$SIG_GLOB），实际 $SIG_COUNT" >&2
+  echo "gen-update-json: 期望恰好 1 个签名包（${SIG_GLOB}），实际 $SIG_COUNT" >&2
+  echo "  命名示例：macOS *.app.tar.gz.sig；Windows *_${VERSION}_x64-setup.exe.sig；Linux *.AppImage.sig / *.deb.sig" >&2
   printf '%s\n' "$SIG_MATCHES" >&2
   ls -la "$BUNDLE_DIR" >&2 || true
   exit 1
 fi
 SIG_FILE=$SIG_MATCHES
 ARCHIVE_FILE="${SIG_FILE%.sig}"
-JSON_FILE="$BUNDLE_DIR/latest-$UPDATE_OS-$UPDATE_ARCH.json"
+# UPDATE_JSON_NAME 覆盖输出文件名：linux 的 deb 条目用 latest-linux-deb-<arch>.json，避免与 appimage 条目互相覆盖
+JSON_FILE="$BUNDLE_DIR/${UPDATE_JSON_NAME:-latest-$UPDATE_OS-$UPDATE_ARCH.json}"
 
 if [ ! -f "$SIG_FILE" ] || [ ! -f "$ARCHIVE_FILE" ]; then
-  echo "gen-update-json: 未找到签名更新包（$SIG_GLOB in $BUNDLE_DIR）" >&2
+  echo "gen-update-json: 未找到签名更新包（$SIG_GLOB in ${BUNDLE_DIR}）" >&2
   ls -la "$BUNDLE_DIR" >&2 || true
   exit 1
 fi
