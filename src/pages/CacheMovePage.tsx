@@ -102,6 +102,23 @@ export default function CacheMovePage() {
   const [params] = useSearchParams();
   /** `?split=1`：把各国目录摊到不同的盘上（截图 / 演示用，和迁移页 ?tab= 一个约定）。 */
   const forceSplit = params.get("split") === "1";
+  /**
+   * `?only=.workbuddy-ai`：只勾选列出的目录（逗号分隔的目录名）。
+   * 截图 / 演示用 —— 要展示「只迁国际版」这种状态。
+   */
+  const onlyParam = params.get("only");
+  const onlySet = useMemo(
+    () =>
+      onlyParam
+        ? new Set(
+            onlyParam
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean),
+          )
+        : null,
+    [onlyParam],
+  );
   const demo = api.isDemoMode();
   const desktop = demo || (api.isDesktop() && !api.isWebui());
   const [plan, setPlan] = useState<CacheMovePlan | null>(null);
@@ -113,15 +130,20 @@ export default function CacheMovePage() {
   const [progress, setProgress] = useState<CacheMoveProgress | null>(null);
   const [result, setResult] = useState<CacheMoveResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [confirmOpen, setConfirmOpen] = useState(false);
+  // `?confirm=1`：直接展开确认弹窗（截图 / 演示用）。
+  const [confirmOpen, setConfirmOpen] = useState(params.get("confirm") === "1");
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   /**
-   * 逐目录的目标覆盖。默认不覆盖 —— 所有人都用上面那个「默认位置」；
-   * 打开某个目录的开关之后，它单独走自己的路径，国内外可以分开放。
+   * 逐目录的迁移设置。
+   *
+   * - `on`     = 本次**是否迁移**这个目录。没勾的完全不碰 —— 这是关键，
+   *              之前这个开关只影响「放哪儿」，结果想只迁国际版也把国内版一起搬了。
+   * - `custom` = 单独指定的目标根目录；**留空表示用上面的「默认位置」**，
+   *              这样改默认位置时没单独指定过的目录会跟着走。
    */
-  const [perDest, setPerDest] = useState<Record<string, { on: boolean; path: string }>>({});
+  const [perDest, setPerDest] = useState<Record<string, { on: boolean; custom: string }>>({});
   const destTouched = useRef(false);
 
   /** 只读体检。`keepDest` 为真时不覆盖用户已经改过的目标路径。 */
@@ -132,18 +154,19 @@ export default function CacheMovePage() {
       const p = await api.cacheMovePlan(keepDest && destTouched.current ? dest : undefined);
       setPlan(p);
       if (!keepDest || !destTouched.current) setDest(p.destDefault);
-      // 首次进来给每个目录铺一个默认路径（= 默认位置 + 目录名），开关默认关。
-      // ?split=1 时改成「每个目录一个盘」并打开开关。
+      // 首次进来每个目录都是「参与迁移 + 用默认位置」；目录各自留空表示沿用默认位置。
+      // ?only= 只勾选列出的；?split=1 时改成「每个目录一个盘」并单独指定路径。
       const otherDrives = p.drives.filter((dr) => !dr.system);
       setPerDest((prev) =>
         Object.fromEntries(
           p.dirs.map((d, i) => {
             if (prev[d.name]) return [d.name, prev[d.name]];
+            if (onlySet && !onlySet.has(d.name)) return [d.name, { on: false, custom: "" }];
             if (forceSplit && otherDrives.length > 0) {
               const dr = otherDrives[i % otherDrives.length];
-              return [d.name, { on: true, path: `${dr.letter}${SEP}WorkBuddyData` }];
+              return [d.name, { on: true, custom: `${dr.letter}${SEP}WorkBuddyData` }];
             }
-            return [d.name, { on: false, path: `${p.destDefault}${SEP}${d.name}` }];
+            return [d.name, { on: true, custom: "" }];
           }),
         ),
       );
@@ -152,7 +175,7 @@ export default function CacheMovePage() {
     } finally {
       setLoading(false);
     }
-  }, [dest]);
+  }, [dest, onlySet]);
 
   const loadVerify = useCallback(async () => {
     setVerifying(true);
@@ -190,12 +213,39 @@ export default function CacheMovePage() {
   const movable = useMemo(() => plans.filter((d) => d.movable && d.exists && !d.isLink), [plans]);
   const backups = verify?.backups ?? [];
 
-  /** 某个目录最终用的目标根目录。 */
+  /** 本次真正要迁移的目录。**没勾的完全不碰**。 */
+  const included = useMemo(
+    () => movable.filter((d) => perDest[d.name]?.on ?? false),
+    [movable, perDest],
+  );
+
+  /** 改某个目录的设置（勾选 / 单独路径）。 */
+  const setRow = useCallback((name: string, patch: Partial<{ on: boolean; custom: string }>) => {
+    setPerDest((prev) => {
+      const cur = prev[name] ?? { on: false, custom: "" };
+      return { ...prev, [name]: { ...cur, ...patch } };
+    });
+  }, []);
+
+  const selectAll = useCallback(() => {
+    setPerDest((prev) => {
+      const next = { ...prev };
+      for (const d of movable) next[d.name] = { on: true, custom: next[d.name]?.custom ?? "" };
+      return next;
+    });
+  }, [movable]);
+
+  const selectNone = useCallback(() => {
+    setPerDest((prev) => {
+      const next = { ...prev };
+      for (const d of movable) next[d.name] = { on: false, custom: next[d.name]?.custom ?? "" };
+      return next;
+    });
+  }, [movable]);
+
+  /** 某个目录最终用的目标根目录：单独指定优先，否则用默认位置。 */
   const rootFor = useCallback(
-    (name: string) => {
-      const o = perDest[name];
-      return o?.on && o.path.trim() ? o.path.trim() : dest.trim();
-    },
+    (name: string) => perDest[name]?.custom?.trim() || dest.trim(),
     [perDest, dest],
   );
 
@@ -208,10 +258,10 @@ export default function CacheMovePage() {
     [rootFor],
   );
 
-  /** 每个目标根目录 → 会被放进去的目录与合计体积。 */
+  /** 每个目标根目录 → 会被放进去的目录与合计体积（只统计本次要迁的）。 */
   const rootsUsed = useMemo(() => {
     const m = new Map<string, { labels: string[]; bytes: number }>();
-    for (const d of movable) {
+    for (const d of included) {
       const r = rootFor(d.name);
       if (!r) continue;
       const cur = m.get(r) ?? { labels: [], bytes: 0 };
@@ -220,10 +270,14 @@ export default function CacheMovePage() {
       m.set(r, cur);
     }
     return Array.from(m.entries()).map(([root, v]) => ({ root, ...v }));
-  }, [movable, rootFor]);
+  }, [included, rootFor]);
 
   /** 分开放的目录数（>1 就是国内/国外分开）。 */
   const splitCount = rootsUsed.length;
+
+  /** 本次要搬的合计体积。 */
+  const includedBytes = useMemo(() => included.reduce((n, d) => n + d.bytes, 0), [included]);
+  const includedText = fmtBytes(includedBytes);
 
   /** 哪个目标盘装不下 —— 按盘各算各的。 */
   const spaceIssues = useMemo(() => {
@@ -246,7 +300,8 @@ export default function CacheMovePage() {
     setError(null);
     setProgress(null);
     try {
-      const targets = movable.map((d) => ({ name: d.name, dest: rootFor(d.name) }));
+      // 只传勾选的目录 —— 没勾的一个字节都不会动。
+      const targets = included.map((d) => ({ name: d.name, dest: rootFor(d.name) }));
       const r = await api.cacheMoveRun(targets);
       setResult(r);
       setStage("done");
@@ -435,10 +490,11 @@ export default function CacheMovePage() {
       <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
         <CardContent className="space-y-4 p-5">
           <div>
-            <h2 className="text-base font-semibold tracking-tight">目标位置</h2>
+            <h2 className="text-base font-semibold tracking-tight">要迁移的目录与目标位置</h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               数据会整份复制过去，原位置只留一个零占用的联接，源数据一个字节都不会删。
-              国内版和国际版<span className="font-medium">可以分开放到不同的盘</span>，也可以都放同一个文件夹。
+              <span className="font-medium">没勾的目录这次完全不碰</span>；
+              国内版和国际版可以分开放到不同的盘，也可以都放同一个文件夹。
             </p>
           </div>
 
@@ -454,7 +510,7 @@ export default function CacheMovePage() {
                 destTouched.current = true;
                 setDest(e.target.value);
               }}
-              placeholder={"E:////WorkBuddyData"}
+              placeholder={`E:${SEP}WorkBuddyData`}
               className="font-mono text-[13px]"
             />
             <div className="flex flex-wrap gap-1.5 pt-0.5">
@@ -464,7 +520,7 @@ export default function CacheMovePage() {
                   type="button"
                   onClick={() => {
                     destTouched.current = true;
-                    setDest(`${d.letter}\\WorkBuddyData`);
+                    setDest(`${d.letter}${SEP}WorkBuddyData`);
                   }}
                   className={cn(
                     "rounded-md border border-border/60 px-2 py-1 text-[11px] leading-4 transition-colors hover:bg-muted",
@@ -478,73 +534,104 @@ export default function CacheMovePage() {
               ))}
             </div>
             <p className="text-[11px] leading-4 text-muted-foreground/80">
-              没单独指定的目录都用这个位置。
+              下面路径留空的目录都放到这里；填了路径的走各自的。
             </p>
           </div>
 
-          {/* 逐目录覆盖 */}
+          {/* 逐目录：勾选参与 + 可单独指定路径 */}
           {movable.length > 0 && (
             <div className="space-y-2 border-t border-border/50 pt-4">
-              <div className="flex items-center justify-between gap-3">
-                <Label className="text-[13px]">分别指定</Label>
-                {splitCount > 1 ? (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Label className="text-[13px]">要迁移哪些</Label>
+                  <span className="text-[11px] text-muted-foreground">
+                    勾了才会动，没勾的这次跳过
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
                   <Badge variant="secondary" className="h-5 border-0 px-1.5 text-[11px]">
-                    分放到 {splitCount} 个位置
+                    已选 {included.length}/{movable.length}
                   </Badge>
-                ) : (
-                  <span className="text-[11px] text-muted-foreground">全部在同一个位置</span>
-                )}
+                  {splitCount > 1 && (
+                    <Badge variant="secondary" className="h-5 border-0 px-1.5 text-[11px]">
+                      分放到 {splitCount} 个位置
+                    </Badge>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px] font-normal text-muted-foreground"
+                    onClick={selectAll}
+                    disabled={included.length === movable.length}
+                  >
+                    全选
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px] font-normal text-muted-foreground"
+                    onClick={selectNone}
+                    disabled={included.length === 0}
+                  >
+                    全不选
+                  </Button>
+                </div>
               </div>
 
               <div className="divide-y divide-border/40">
                 {movable.map((d) => {
-                  const o = perDest[d.name] ?? { on: false, path: "" };
-                  const finalPath = finalPathFor(d.name);
+                  const o = perDest[d.name] ?? { on: false, custom: "" };
+                  const resolved = finalPathFor(d.name);
+                  const usingDefault = !o.custom.trim();
                   const id = `cache-dest-${d.name}`;
                   return (
                     <div key={d.name} className="space-y-1.5 py-2.5">
                       <div className="flex items-center gap-3">
-                        <label htmlFor={id} className="min-w-0 flex-1 cursor-pointer">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[13px] font-medium leading-5">{d.label}</span>
-                            <code className="text-[11px] text-muted-foreground">{d.name}</code>
-                            <span className="text-[11px] tabular-nums text-muted-foreground">
-                              {d.sizeText}
-                            </span>
-                          </div>
-                        </label>
                         <Switch
                           id={id}
                           checked={o.on}
-                          onCheckedChange={async (on) => {
-                            // 刚打开时给个靠谱的初始值：默认位置 + 目录名
-                            const seed = `${dest.trim() || (plan?.destDefault ?? "")}${SEP}${d.name}`;
-                            setPerDest((prev) => ({
-                              ...prev,
-                              [d.name]: { on, path: prev[d.name]?.path?.trim() ? prev[d.name].path : seed },
-                            }));
-                            // 用户已经在默认位置里用过这个目录就直接沿用
-                            if (on && !(await Promise.resolve(true))) return;
-                          }}
+                          onCheckedChange={(on) => setRow(d.name, { on })}
                         />
+                        <label
+                          htmlFor={id}
+                          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2"
+                        >
+                          <span className="text-[13px] font-medium leading-5">{d.label}</span>
+                          <code className="text-[11px] text-muted-foreground">{d.name}</code>
+                          <span className="text-[11px] tabular-nums text-muted-foreground">
+                            {d.sizeText}
+                          </span>
+                        </label>
+                        <span
+                          className={cn(
+                            "shrink-0 text-[11px]",
+                            o.on ? "text-muted-foreground/70" : "text-muted-foreground/45",
+                          )}
+                        >
+                          {!o.on ? "本次跳过" : usingDefault ? "用默认位置" : "单独位置"}
+                        </span>
                       </div>
-                      {o.on ? (
+
+                      {o.on && (
                         <div className="space-y-1.5 pl-0.5">
-                          <Input
-                            value={o.path}
-                            spellCheck={false}
-                            onChange={(e) =>
-                              setPerDest((prev) => ({
-                                ...prev,
-                                [d.name]: { on: true, path: e.target.value },
-                              }))
-                            }
-                            placeholder={"F:////WorkBuddyAI-Data"}
-                            className="font-mono text-[12px]"
-                          />
-                          <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                            <ArrowRight className="size-3 shrink-0" />
-                            <span className="break-all">{finalPath || "—"}</span>
+                          <div className="flex items-center gap-1.5">
+                            <Input
+                              value={o.custom}
+                              spellCheck={false}
+                              onChange={(e) => setRow(d.name, { on: true, custom: e.target.value })}
+                              placeholder={resolved || `填目标根目录，例如 F:${SEP}WorkBuddyAI-Data`}
+                              className="font-mono text-[12px]"
+                            />
+                            {!usingDefault && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 shrink-0 px-2 text-[11px] font-normal text-muted-foreground"
+                                onClick={() => setRow(d.name, { on: true, custom: "" })}
+                              >
+                                用默认
+                              </Button>
+                            )}
                           </div>
                           <div className="flex flex-wrap gap-1.5">
                             {(plan?.drives ?? []).map((dr) => (
@@ -552,10 +639,7 @@ export default function CacheMovePage() {
                                 key={dr.letter}
                                 type="button"
                                 onClick={() =>
-                                  setPerDest((prev) => ({
-                                    ...prev,
-                                    [d.name]: { on: true, path: `${dr.letter}\\WorkBuddyData` },
-                                  }))
+                                  setRow(d.name, { on: true, custom: `${dr.letter}${SEP}WorkBuddyData` })
                                 }
                                 className="rounded-md border border-border/60 px-2 py-0.5 text-[11px] leading-4 transition-colors hover:bg-muted"
                               >
@@ -563,11 +647,10 @@ export default function CacheMovePage() {
                               </button>
                             ))}
                           </div>
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                          <ArrowRight className="size-3 shrink-0" />
-                          <span className="break-all">{finalPath || "—"}</span>
+                          <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                            <ArrowRight className="size-3 shrink-0" />
+                            <span className="break-all">{resolved || "—"}</span>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -591,12 +674,12 @@ export default function CacheMovePage() {
             </Alert>
           )}
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               onClick={() => setConfirmOpen(true)}
               disabled={
                 Boolean(blocked) ||
-                movable.length === 0 ||
+                included.length === 0 ||
                 stage === "running" ||
                 rootsUsed.some((g) => !g.root) ||
                 spaceIssues.length > 0
@@ -610,9 +693,11 @@ export default function CacheMovePage() {
               {stage === "running" ? "迁移中…" : "开始迁移"}
             </Button>
             <span className="text-xs text-muted-foreground">
-              {movable.length
-                ? `将搬运 ${plan?.totalText ?? ""}`
-                : "所有目录都已经是联接，无需迁移"}
+              {movable.length === 0
+                ? "所有目录都已经是联接，无需迁移"
+                : included.length === 0
+                  ? "先勾选要迁移的目录"
+                  : `将迁移 ${included.length} 个目录 · ${includedText}`}
             </span>
           </div>
 
@@ -745,6 +830,7 @@ export default function CacheMovePage() {
             <DialogTitle>确认开始迁移？</DialogTitle>
             <DialogDescription>
               先把数据整份复制到目标盘并逐项校验，全部一致之后才会改名 + 建联接。中途任何一步失败都会自动改回原样。
+              本次只迁移下面列出的 {included.length} 个目录，其它目录不动。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 text-[13px] leading-6">
@@ -754,7 +840,7 @@ export default function CacheMovePage() {
                   <div className="break-all font-mono text-[11px] text-muted-foreground">
                     {g.root}
                   </div>
-                  {movable
+                  {included
                     .filter((d) => rootFor(d.name) === g.root)
                     .map((d) => (
                       <div key={d.name} className="flex items-center justify-between gap-2">
@@ -768,7 +854,7 @@ export default function CacheMovePage() {
               ))}
               <div className="mt-1 flex items-center justify-between gap-2 border-t border-border/50 pt-1 font-medium">
                 <span>合计</span>
-                <span className="tabular-nums">{plan?.totalText}</span>
+                <span className="tabular-nums">{includedText}</span>
               </div>
             </div>
             <div className="flex items-start gap-2 text-xs leading-5 text-muted-foreground">
