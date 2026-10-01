@@ -260,18 +260,28 @@ fn running_procs() -> (Vec<String>, Vec<String>) {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let mut blocking = Vec::new();
-        for img in ["WorkBuddy", "WorkBuddyAI"] {
-            let running = process::cmd_builder("pgrep")
-                .args(["-x", img])
+        // 两个常量在非 Windows 上也要用上：CI 开着 `-D warnings`，
+        // 只要有一个分支没引用它们，mac/Linux 的构建就会因为
+        // 「constant is never used」直接失败（v1.0.4 就是这么挂的）。
+        let probe = |img: &str| {
+            let name = img.strip_suffix(".exe").unwrap_or(img);
+            process::cmd_builder("pgrep")
+                .args(["-x", name])
                 .output()
                 .map(|o| o.status.success() && !o.stdout.is_empty())
-                .unwrap_or(false);
-            if running {
-                blocking.push(img.to_string());
-            }
-        }
-        (blocking, Vec::new())
+                .unwrap_or(false)
+        };
+        let blocking: Vec<String> = BLOCKING_IMAGES
+            .iter()
+            .filter(|img| probe(img))
+            .map(|img| img.to_string())
+            .collect();
+        let warnings: Vec<String> = WARN_IMAGES
+            .iter()
+            .filter(|img| probe(img))
+            .map(|img| img.to_string())
+            .collect();
+        (blocking, warnings)
     }
 }
 
