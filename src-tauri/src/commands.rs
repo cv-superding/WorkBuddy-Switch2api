@@ -840,11 +840,22 @@ pub async fn cache_move_backups() -> Result<Value, String> {
 }
 
 /// POST /api/cache-move/cleanup —— 删除选中的备份目录。
+///
+/// 几十万个小文件，删起来要几十秒 —— 边删边推 `cache-move-progress`，别让界面看着像卡死。
 #[tauri::command]
-pub async fn cache_move_cleanup(paths: Vec<String>) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || cache_move::cleanup(&paths))
-        .await
-        .map_err(|e| format!("清理任务异常：{e}"))?
+pub async fn cache_move_cleanup(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let progress = |p: cache_move::Progress| {
+            let payload = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
+            let _ = app.emit("cache-move-progress", payload);
+        };
+        cache_move::cleanup(&paths, Some(&progress))
+    })
+    .await
+    .map_err(|e| format!("清理任务异常：{e}"))?
 }
 
 /// POST /api/cache-move/open —— 在文件管理器里打开一个目录。

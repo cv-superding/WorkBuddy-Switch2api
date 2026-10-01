@@ -152,6 +152,10 @@ export default function CacheMovePage() {
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  /** 正在删备份（几十万个小文件要几十秒，必须给进度）。 */
+  const [cleaning, setCleaning] = useState(false);
+  /** 上一次清理的步骤日志（失败时能看清是哪个路径删不掉）。 */
+  const [cleanupLogs, setCleanupLogs] = useState<CacheMoveStep[]>([]);
   /**
    * 逐目录的迁移设置。
    *
@@ -376,18 +380,32 @@ export default function CacheMovePage() {
 
   async function doCleanup() {
     setCleanupOpen(false);
-    setBusy(true);
+    setCleaning(true);
     setError(null);
+    setProgress(null);
+    setCleanupLogs([]);
     try {
       const r = await api.cacheMoveCleanup(selected);
+      setCleanupLogs(r.logs);
       const okCount = r.removed.length;
-      if (okCount) toast.success(`已删除 ${okCount} 个备份`);
-      else toast.error("没有删除任何东西", { description: r.logs.find((l) => !l.ok)?.message });
-      setSelected([]);
+      if (okCount) {
+        toast.success(`${okCount} 个备份已移入回收站`, {
+          description:
+            r.removed.length === selected.length
+              ? "想真正腾出空间，右键回收站 → 清空"
+              : "有没删掉的，看下面的日志",
+        });
+        // 删成功的从选中里去掉，失败的留着方便重试
+        setSelected((prev) => prev.filter((p) => !r.removed.includes(p)));
+      } else {
+        toast.error("没有删除任何东西", {
+          description: r.logs.find((l) => !l.ok)?.message,
+        });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      setCleaning(false);
       void loadVerify();
     }
   }
@@ -839,16 +857,44 @@ export default function CacheMovePage() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={selected.length === 0 || busy}
+                disabled={selected.length === 0 || busy || cleaning}
                 onClick={() => setCleanupOpen(true)}
               >
-                <Trash2 className="size-3.5" />
-                删除选中（{selected.length}）
+                {cleaning ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="size-3.5" />
+                )}
+                {cleaning ? "删除中…" : `删除选中（${selected.length}）`}
               </Button>
             </div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              这些是迁移时改名留下的源目录。确认客户端一切正常之后再删，删掉才会真正腾出系统盘空间。
+              这些是迁移时改名留下的源目录。确认客户端一切正常之后再删。
+              删除是<span className="font-medium">整份移入回收站</span> —— 文件再多也快，而且删错了还能还原；
+              但空间要<span className="font-medium">清空回收站之后</span>才真正腾出来（右键回收站 → 清空）。
             </p>
+
+            {cleaning && (
+              <div className="mt-3 space-y-1.5">
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span>
+                    {progress?.phase === "cleanup"
+                      ? `正在删除 · ${progress.detail}`
+                      : "正在移入回收站…（文件多的时候要等一会）"}
+                  </span>
+                  <span className="tabular-nums">{progress?.percent ?? 0}%</span>
+                </div>
+                <ProgressBar percent={progress?.percent ?? 0} />
+              </div>
+            )}
+
+            {cleanupLogs.length > 0 && (
+              <div className="mt-3 divide-y divide-border/40 rounded-lg border border-border/60 px-3 py-1">
+                {cleanupLogs.map((s, i) => (
+                  <StepRow key={`${s.name}-${i}`} step={s} />
+                ))}
+              </div>
+            )}
 
             <div className="mt-3 divide-y divide-border/40">
               {backups.map((b: CacheBackupItem) => (
@@ -965,7 +1011,10 @@ export default function CacheMovePage() {
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>删除备份目录</DialogTitle>
-            <DialogDescription>删除后无法从备份恢复，只能从目标盘的联接目录里访问数据。</DialogDescription>
+            <DialogDescription>
+              会把整个备份目录移入回收站 —— 数据可以从回收站还原，但<span className="font-medium">清空回收站之后就没得恢复了</span>。
+              腾出系统盘空间要靠清空回收站那一步。
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 text-[13px] leading-6">
             <div className="rounded-lg bg-muted/50 p-3">
@@ -978,8 +1027,9 @@ export default function CacheMovePage() {
             <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs leading-5 text-destructive">
               <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
               <span>
-                <span className="font-semibold">此操作不可逆。</span>
-                请先确认客户端能正常打开、记忆与历史会话都在，并且已经正常使用过一段时间。
+                <span className="font-semibold">动手之前先确认：</span>
+                客户端能正常打开、记忆与历史会话都在，并且已经正常使用过一段时间。
+                删除本身可还原（在回收站里），但清空回收站之后就找不回来了。
               </span>
             </div>
           </div>

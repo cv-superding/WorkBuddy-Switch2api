@@ -882,6 +882,230 @@ pub fn rollback(progress: Option<&dyn Fn(Progress)>) -> Result<Value, String> {
     Ok(json!({ "ok": true, "restored": restored, "logs": logs }))
 }
 
+// ---------------------------------------------------------------- 回收站
+
+/// `SHFILEOPSTRUCTW`。`#[repr(C)]` 在 x64/x86 上都对得上 Win32 的布局。
+#[cfg(windows)]
+#[repr(C)]
+struct ShFileOpStructW {
+    hwnd: *mut core::ffi::c_void,
+    w_func: u32,
+    p_from: *const u16,
+    p_to: *const u16,
+    f_flags: u16,
+    f_any_operations_aborted: i32,
+    h_name_mappings: *mut core::ffi::c_void,
+    lpsz_progress_title: *const u16,
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+extern "system" {
+    fn SHFileOperationW(lp_file_op: *mut ShFileOpStructW) -> i32;
+}
+
+/// 把整棵目录丢进回收站。
+///
+/// **为什么要绕这一下**：实测这台机器删一个文件要 **21.6 ms**（而遍历一个条目只要
+/// 0.47 ms）—— 25 万个的备份按条删要**一个半小时**，用户看着就是卡死了。
+/// `SHFileOperation` 把整个目录当一个对象处理，同卷内就是一次移动，毫秒级完成；
+/// 顺带还给了「删错了能从回收站还原」的退路。
+/// 代价是空间要**清空回收站之后**才真正释放，所以调用方必须把这句话告诉用户。
+#[cfg(windows)]
+fn move_to_recycle_bin(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const FO_DELETE: u32 = 3;
+    const FOF_SILENT: u16 = 0x0004;
+    const FOF_NOCONFIRMATION: u16 = 0x0010;
+    const FOF_ALLOWUNDO: u16 = 0x0040;
+    const FOF_NOCONFIRMMKDIR: u16 = 0x0200;
+    const FOF_NOERRORUI: u16 = 0x0400;
+
+    // pFrom 要的是「\0 分隔 + 末尾再来一个 \0 收尾」的宽字符串；单条路径就是双 \0 结尾。
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    from.push(0);
+    from.push(0);
+
+    let mut op = ShFileOpStructW {
+        hwnd: std::ptr::null_mut(),
+        w_func: FO_DELETE,
+        p_from: from.as_ptr(),
+        p_to: std::ptr::null(),
+        f_flags: FOF_SILENT
+            | FOF_NOCONFIRMATION
+            | FOF_ALLOWUNDO
+            | FOF_NOCONFIRMMKDIR
+            | FOF_NOERRORUI,
+        f_any_operations_aborted: 0,
+        h_name_mappings: std::ptr::null_mut(),
+        lpsz_progress_title: std::ptr::null(),
+    };
+
+    let rc = unsafe { SHFileOperationW(&mut op) };
+    if rc != 0 {
+        return Err(format!("移入回收站失败（SHFileOperation 返回 {rc}）"));
+    }
+    if op.f_any_operations_aborted != 0 {
+        return Err("移入回收站被中断".to_string());
+    }
+    Ok(())
+}
+
+/// 清掉只读属性。
+///
+/// Windows 上删除只读文件直接返回 `ERROR_ACCESS_DENIED`（页面上那句
+/// 「拒绝访问。(os error 5)」），所以删之前必须先把只读摘掉。
+/// WorkBuddy 自己写的 `memory\*_memory.md` 就是只读的，备份目录里一定有一批。
+fn clear_readonly(p: &Path) {
+    let Ok(md) = std::fs::metadata(p) else {
+        return;
+    };
+    let mut perm = md.permissions();
+    if perm.readonly() {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        let _ = std::fs::set_permissions(p, perm);
+    }
+}
+
+/// 删一个文件/目录，失败就重试几次（摘掉只读、等一下再试）。
+///
+/// 失败的常见原因是**瞬时占用**（杀软在扫、应用刚写的日志还在句柄上），
+/// 等一下基本就过去了；也可能是只读属性，所以每次重试前都再摘一遍。
+fn remove_with_retry(p: &Path, is_dir: bool) -> std::io::Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..3u32 {
+        let r = if is_dir {
+            std::fs::remove_dir(p)
+        } else {
+            std::fs::remove_file(p)
+        };
+        match r {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // 已经被别人删掉了 = 也算成功
+                if !p.exists() {
+                    return Ok(());
+                }
+                last = Some(e);
+                clear_readonly(p);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("未知错误")))
+}
+
+/// 递归删除目录树，顺带统计「多少个文件 / 多少字节」。
+///
+/// 刻意不用 `std::fs::remove_dir_all`：它撞到**任何一个**不肯走的条目就整棵放弃，
+/// 而且错误里只有「拒绝访问」、不告诉你是哪个条目 —— 用户看到的
+/// 「删除失败：拒绝访问。(os error 5)」正是这么来的，连查都没法查
+/// （实测那棵树既没有只读目录、也没有重解析点和 ACL 问题）。
+///
+/// 这里改成：
+/// 1. 一次遍历同时把体积算出来（省掉 `scan()` 那一趟）；
+/// 2. 先自底向上摘掉只读属性（Windows 上只读目录/文件都可能直接拒删）；
+/// 3. 逐条 `remove_file` / `remove_dir`，**单条失败不中断整棵**，
+///    重试 3 次，仍失败就记下来继续删别的；
+/// 4. 最后把「删不掉的到底是哪几个」报出来。
+fn force_remove_dir_all(root: &Path, on_tick: &dyn Fn(u64, u64)) -> Result<(u64, u64), String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut bytes: u64 = 0;
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(d) = stack.pop() {
+        dirs.push(d.clone());
+        let rd = std::fs::read_dir(&d).map_err(|e| format!("读取 {} 失败：{e}", d.display()))?;
+        for ent in rd {
+            let ent = ent.map_err(|e| format!("读取 {} 的条目失败：{e}", d.display()))?;
+            let p = ent.path();
+            if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(p);
+            } else {
+                if let Ok(md) = ent.metadata() {
+                    bytes += md.len();
+                }
+                files.push(p);
+            }
+        }
+    }
+
+    let dbg = std::env::var("WB_CM_DEBUG").is_ok();
+    let t_walk = std::time::Instant::now();
+
+    // 1) 先摘属性（文件 + 目录都摘）
+    for p in files.iter().chain(dirs.iter()) {
+        clear_readonly(p);
+    }
+    if dbg {
+        eprintln!("[dbg] 遍历 {} 个目录 + {} 个文件：{:?}", dirs.len(), files.len(), t_walk.elapsed());
+    }
+    let t_attr = std::time::Instant::now();
+
+    if dbg {
+        eprintln!("[dbg] 摘只读属性：{:?}", t_attr.elapsed());
+    }
+    let t_del = std::time::Instant::now();
+
+    // 2) 删文件
+    let all = files.len() as u64;
+    let mut failed: u64 = 0;
+    let mut samples: Vec<String> = Vec::new();
+    for (i, p) in files.iter().enumerate() {
+        if let Err(e) = remove_with_retry(p, false) {
+            failed += 1;
+            if samples.len() < 3 {
+                samples.push(format!("{}（{e}）", p.display()));
+            }
+        }
+        if i % 1000 == 0 {
+            on_tick(i as u64, all);
+        }
+    }
+    on_tick(all, all);
+
+    if dbg {
+        eprintln!(
+            "[dbg] 删 {} 个文件：{:?}（{:.2} ms/文件）",
+            all,
+            t_del.elapsed(),
+            t_del.elapsed().as_secs_f64() * 1000.0 / all.max(1) as f64
+        );
+    }
+    let t_dir = std::time::Instant::now();
+
+    // 3) 删目录：子目录必须先于父目录（按路径层数从深到浅）
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for d in &dirs {
+        if let Err(e) = remove_with_retry(d, true) {
+            if d.exists() {
+                failed += 1;
+                if samples.len() < 3 {
+                    samples.push(format!("{}（{e}）", d.display()));
+                }
+            }
+        }
+    }
+
+    if dbg {
+        eprintln!("[dbg] 删 {} 个目录：{:?}", dirs.len(), t_dir.elapsed());
+    }
+
+    if root.exists() {
+        return Err(if samples.is_empty() {
+            format!("{} 没能删干净，可能有进程正占着它", root.display())
+        } else {
+            format!("有 {failed} 个条目删不掉，例如：{}", samples.join("；"))
+        });
+    }
+    Ok((all, bytes))
+}
+
 /// 校验路径是「家目录直接子项 + 名字含 .moved- + 不是联接」。清理的门槛。
 fn safe_backup_path(p: &Path) -> Result<(), String> {
     let home = home_dir();
@@ -967,32 +1191,84 @@ pub fn list_backups() -> Vec<Value> {
 }
 
 /// 删除备份目录。只接受显式传入的、通过安全校验的路径。
-pub fn cleanup(paths: &[String]) -> Result<Value, String> {
+pub fn cleanup(paths: &[String], progress: Option<&dyn Fn(Progress)>) -> Result<Value, String> {
     if paths.is_empty() {
         return Err("没有选中要清理的备份。".to_string());
     }
+    let total = paths.len() as u32;
     let mut removed = Vec::new();
     let mut logs: Vec<StepLog> = Vec::new();
-    for raw in paths {
+
+    for (i, raw) in paths.iter().enumerate() {
         let p = PathBuf::from(raw);
+        let idx = i as u32 + 1;
+        let label = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| raw.clone());
         if let Err(e) = safe_backup_path(&p) {
             push_log(&mut logs, raw, false, e);
             continue;
         }
-        let (files, bytes) = scan(&p);
-        match std::fs::remove_dir_all(&p) {
+
+        // 快路径：整棵目录丢进回收站。
+        // 这台机器删 1 个文件要 20 ms 上下，25 万个按条删要一个半小时 —— 不能走那条路。
+        let fast: Result<(), String> = {
+            #[cfg(windows)]
+            {
+                move_to_recycle_bin(&p)
+            }
+            #[cfg(not(windows))]
+            {
+                Err("非 Windows 平台不支持回收站".to_string())
+            }
+        };
+
+        match fast {
             Ok(()) => {
                 removed.push(raw.clone());
                 push_log(
                     &mut logs,
                     raw,
                     true,
-                    format!("已删除（{} 个文件 / {}）", files, human(bytes)),
+                    "已移入回收站（可以在回收站里还原；清空回收站之后空间才真正释放）".to_string(),
                 );
             }
-            Err(e) => push_log(&mut logs, raw, false, format!("删除失败：{e}")),
+            Err(why) => {
+                // 回退：逐条删。慢，但有进度、单条失败也不会把整棵带停。
+                let base = (i as f64) / (total as f64) * 100.0;
+                let span = 100.0 / (total as f64);
+                let tick = |done: u64, all: u64| {
+                    emit(
+                        progress,
+                        "cleanup",
+                        &format!("{label} · 已处理 {done} 个文件"),
+                        idx,
+                        total,
+                        (base + span * if all == 0 { 0.0 } else { done as f64 / all as f64 })
+                            .round()
+                            .clamp(0.0, 100.0) as u32,
+                    );
+                };
+                tick(0, 0);
+
+                match force_remove_dir_all(&p, &tick) {
+                    Ok((files, bytes)) => {
+                        removed.push(raw.clone());
+                        push_log(
+                            &mut logs,
+                            raw,
+                            true,
+                            format!("已彻底删除（{} 个文件 / {}）", files, human(bytes)),
+                        );
+                    }
+                    // 这里已经是「具体哪个路径失败」的完整原因
+                    Err(e) => push_log(&mut logs, raw, false, format!("{why}；逐条删除也没成功：{e}")),
+                }
+            }
         }
     }
+    emit(progress, "done", "清理完成", total, total, 100);
     Ok(json!({ "ok": !removed.is_empty(), "removed": removed, "logs": logs }))
 }
 
@@ -1016,6 +1292,127 @@ pub fn verify() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一棵「像真备份那样」的树：深层嵌套 + 只读文件 + 隐藏文件。
+    fn make_tree(root: &Path) {
+        let deep = root.join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(root.join("plain.txt"), b"x").unwrap();
+        std::fs::write(deep.join("inner.txt"), b"y").unwrap();
+
+        // 只读文件 —— 真机上 WorkBuddy 的 memory\*_memory.md 就长这样
+        let ro = deep.join("memory.md");
+        std::fs::write(&ro, b"read-only").unwrap();
+        let mut perm = std::fs::metadata(&ro).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&ro, perm).unwrap();
+    }
+
+    /// 整棵删干净，并且「多少个文件 / 多少字节」要在同一次遍历里算对。
+    #[test]
+    fn force_remove_dir_all_removes_everything() {
+        let root = std::env::temp_dir().join(format!("wb-cm-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        make_tree(&root);
+
+        let (files, bytes) = force_remove_dir_all(&root, &|_, _| {}).unwrap();
+        assert_eq!(files, 3, "应当统计到 3 个文件");
+        assert!(bytes > 0, "字节数要算出来");
+        assert!(!root.exists(), "整棵树都不该剩下");
+    }
+
+    /// 保险丝：路径不存在时不该 panic，错误信息里要带上路径。
+    #[test]
+    fn force_remove_dir_all_reports_missing_path() {
+        let missing = std::env::temp_dir().join("wb-cm-not-a-dir-9f8a7b6c");
+        let err = force_remove_dir_all(&missing, &|_, _| {}).unwrap_err();
+        assert!(err.contains("wb-cm-not-a-dir-9f8a7b6c"), "错误里要能看出是哪条路径：{err}");
+    }
+
+    /// 只读属性摘掉之后就是普通文件了（清理能过，备份回滚也不受影响）。
+    #[test]
+    fn clear_readonly_works() {
+        let f = std::env::temp_dir().join(format!("wb-cm-ro-{}.txt", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        let mut perm = std::fs::metadata(&f).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&f, perm).unwrap();
+        assert!(std::fs::metadata(&f).unwrap().permissions().readonly());
+
+        clear_readonly(&f);
+        assert!(!std::fs::metadata(&f).unwrap().permissions().readonly());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 真机排查用：删掉 `WB_CM_DELETE_DIR` 指向的目录树，并报出耗时。
+    ///
+    /// 只在手动执行时跑，且必须显式给环境变量：
+    /// ```bash
+    /// WB_CM_DELETE_DIR='F://tmp//copy' cargo test -p wb-switch-core --lib \
+    ///     cache_move::tests::delete_tree_from_env -- --ignored --nocapture
+    /// ```
+    /// 用途：备份删不掉时，先拿**副本**验证删除逻辑，再决定要不要动真的那份。
+    #[test]
+    #[ignore = "手动执行：需要环境变量 WB_CM_DELETE_DIR"]
+    fn delete_tree_from_env() {
+        let raw = std::env::var("WB_CM_DELETE_DIR").expect("需要环境变量 WB_CM_DELETE_DIR");
+        let root = PathBuf::from(raw);
+        assert!(root.is_dir(), "{} 不是目录", root.display());
+
+        let t0 = std::time::Instant::now();
+        let (files, bytes) = force_remove_dir_all(&root, &|_, _| {}).expect("删除失败");
+        println!(
+            "✓ 删掉 {files} 个文件 / {}，用时 {:?}  —— {}",
+            human(bytes),
+            t0.elapsed(),
+            root.display()
+        );
+        assert!(!root.exists(), "应当删干净");
+    }
+
+    /// 真机验证回收站快路径：`WB_CM_DELETE_DIR` 指的目录应当被**秒级**移入回收站。
+    /// 移进去的东西可以在回收站里还原，不会真的丢。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "手动执行：需要环境变量 WB_CM_DELETE_DIR"]
+    fn recycle_tree_from_env() {
+        let raw = std::env::var("WB_CM_DELETE_DIR").expect("需要环境变量 WB_CM_DELETE_DIR");
+        let root = PathBuf::from(raw);
+        assert!(root.is_dir(), "{} 不是目录", root.display());
+
+        let t0 = std::time::Instant::now();
+        move_to_recycle_bin(&root).expect("移入回收站失败");
+        println!("✓ 移入回收站用时 {:?} —— {}", t0.elapsed(), root.display());
+        assert!(!root.exists(), "原路径应当已经消失");
+    }
+
+    /// 反证用：老写法 `std::fs::remove_dir_all` 在同一棵树上到底行不行。
+    ///
+    /// 只在手动执行时跑：
+    /// ```bash
+    /// WB_CM_DELETE_DIR='F://tmp//copy2' cargo test -p wb-switch-core --lib \
+    ///     cache_move::tests::delete_tree_from_env_legacy -- --ignored --nocapture
+    /// ```
+    /// 它存在的意义：证明「逐条删 + 重试」不是多此一举，而是必需的 ——
+    /// 老写法一旦失败，连是哪条路径都问不出来。
+    #[test]
+    #[ignore = "手动执行：需要环境变量 WB_CM_DELETE_DIR"]
+    fn delete_tree_from_env_legacy() {
+        let raw = std::env::var("WB_CM_DELETE_DIR").expect("需要环境变量 WB_CM_DELETE_DIR");
+        let root = PathBuf::from(raw);
+        assert!(root.is_dir(), "{} 不是目录", root.display());
+
+        let t0 = std::time::Instant::now();
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => println!("老写法成功了（用时 {:?}）", t0.elapsed()),
+            Err(e) => println!(
+                "老写法失败：{e}  raw_os_error={:?}（用时 {:?}），残留={}",
+                e.raw_os_error(),
+                t0.elapsed(),
+                root.exists()
+            ),
+        }
+    }
 
     /// `open_path` 只接受「存在且确实是目录」的绝对路径；这些输入必须被挡下来，
     /// 顺带确保测试本身不会真的去拉起文件管理器。

@@ -54,3 +54,4 @@ build-and-deploy.bat
 
 # 构建前端时被改名移走的临时 dist（删除拦截器绕行产物，见构建说明）
 dist-*
+dist.bak-*
