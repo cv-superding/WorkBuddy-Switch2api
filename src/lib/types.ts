@@ -477,6 +477,11 @@ export interface CodeBuddyCliStatus {
   helperCurrent?: boolean;
   migrationRequired?: boolean;
   syncPending?: boolean;
+  /**
+   * 保活刷新刚写完账号库、settings 尚未跟上的正常中间态：稍候会自动完成，
+   * 不该提示用户「认证脱节」（否则每次启动都要弹一次）。
+   */
+  syncInProgress?: boolean;
   activeIndex: number | null;
   activeAccountId: string | null;
   activeAccountName: string | null;

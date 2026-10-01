@@ -776,7 +776,8 @@ export default function AccountsPage() {
         (!codebuddyCli.configured ||
           (!codebuddyUsesSettingsEnv && !codebuddyCli.helperSupportsAccountIds) ||
           codebuddyCli.migrationRequired ||
-          codebuddyCli.syncPending) && (
+          codebuddyCli.syncPending ||
+          codebuddyCli.syncInProgress) && (
         <Alert className="mb-4">
           <Terminal />
           <AlertTitle>CodeBuddy CLI 接入</AlertTitle>
@@ -785,16 +786,18 @@ export default function AccountsPage() {
               {codebuddyUsesSettingsEnv
                 ? codebuddyCli.environmentOverride
                   ? "检测到进程环境变量 CODEBUDDY_AUTH_TOKEN。它会覆盖 settings.json；请先从 Windows 用户或系统环境变量中删除它，再重启本应用与 CodeBuddy CLI。"
-                  : codebuddyCli.syncPending
-                    ? "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
-                    : codebuddyCli.migrationRequired
-                      ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
-                      : "Windows 使用 CodeBuddy settings.json 中的认证 Token；切换或保活刷新后会自动更新。当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
-                : codebuddyCli.migrationRequired
-                  ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
-                  : codebuddyCli.configured
-                    ? "当前 helper 仍按旧索引读取账号；升级后将按账号 ID 独立切换，账号增删也不会错位。"
-                    : "WorkBuddy 账号与积分功能可正常使用；如需从这里切换 CodeBuddy CLI 账号，点击下方按钮一键接入。"}
+                  : codebuddyCli.syncInProgress
+                    ? "认证正在同步（保活刷新刚写入新 Token，稍候会自动完成），无需操作。"
+                    : codebuddyCli.syncPending
+                      ? "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
+                      : codebuddyCli.migrationRequired
+                        ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
+                        : "Windows 使用 CodeBuddy settings.json 中的认证 Token；切换或保活刷新后会自动更新。当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
+                  : codebuddyCli.migrationRequired
+                    ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
+                    : codebuddyCli.configured
+                      ? "当前 helper 仍按旧索引读取账号；升级后将按账号 ID 独立切换，账号增删也不会错位。"
+                      : "WorkBuddy 账号与积分功能可正常使用；如需从这里切换 CodeBuddy CLI 账号，点击下方按钮一键接入。"}
             </p>
             <DemoAction>
               <Button
