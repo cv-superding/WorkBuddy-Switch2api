@@ -110,6 +110,11 @@ export interface ImportPreviewAccount {
   nickname: string | null;
   email: string | null;
   hasToken: boolean;
+  /**
+   * 凭据是 WorkBuddy 5.6 的加密信封：**可以导入**（切换账号只需原样写回），
+   * 但刷新 token / 签到 / 积分查询这些需要明文 token 的功能用不了。
+   */
+  encrypted?: boolean;
 }
 
 /** 导入结果计数。 */
@@ -118,6 +123,8 @@ export interface ImportResult {
   imported: number;
   skipped: number;
   overwritten: number;
+  /** 其中凭据是加密信封的数量（只能用于切换账号）。 */
+  encrypted: number;
 }
 
 export interface Session {

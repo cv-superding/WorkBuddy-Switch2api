@@ -288,6 +288,7 @@ async fn api_import(Json(body): Json<Value>) -> Response {
             "imported": result.imported,
             "skipped": result.skipped,
             "overwritten": result.overwritten,
+        "encrypted": result.encrypted,
         })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }

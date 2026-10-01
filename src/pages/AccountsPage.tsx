@@ -34,7 +34,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
-import { EDITIONS, editionLabel, isInternational, accountGroupLabel, type AccountMeta, type AppStatus, type CheckinConfig, type CodeBuddyCliStatus, type CodeBuddyCnIdeStatus, type CreditExpiry, type TravelConfig, type TravelStatus } from "@/lib/types";
+import { EDITIONS, editionLabel, isInternational, accountGroupLabel, type AccountMeta, type AppStatus, type CheckinConfig, type CreditExpiry, type TravelConfig, type TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -133,6 +133,8 @@ export default function AccountsPage() {
     ensureCredits,
     refreshCredits,
     setAccountGroupLocal,
+    clientStatus,
+    setClientStatus,
   } = useAccountsStore();
   const [oauthOpen, setOauthOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -147,9 +149,12 @@ export default function AccountsPage() {
   const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
   const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
-  const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
+  /**
+   * 客户端状态来自 store（不是局部 state）：账号页重挂载时先按上次结果渲染，
+   * 不会先闪一下「未接入」再改口（上游 issue #84）。
+   */
+  const { codebuddyCli, codebuddyCnIde } = clientStatus;
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
-  const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
   const [codebuddyCnIdeSwitchingId, setCodebuddyCnIdeSwitchingId] = useState<string | null>(null);
   const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
   /** 刷新按钮触发的批量签到进行中 */
@@ -256,24 +261,35 @@ export default function AccountsPage() {
 
   async function refreshCodebuddyCliStatus() {
     try {
-      setCodebuddyCli(await api.getCodebuddyCliStatus());
+      setClientStatus({ codebuddyCli: await api.getCodebuddyCliStatus() });
     } catch {
-      setCodebuddyCli(null);
+      setClientStatus({ codebuddyCli: null });
     }
   }
 
   async function refreshCodebuddyCnIdeStatus() {
     try {
-      setCodebuddyCnIde(await api.getCodebuddyCnIdeStatus());
+      setClientStatus({ codebuddyCnIde: await api.getCodebuddyCnIdeStatus() });
     } catch {
-      setCodebuddyCnIde(null);
+      setClientStatus({ codebuddyCnIde: null });
     }
   }
 
   useEffect(() => {
     let cancelled = false;
-    void refreshCodebuddyCliStatus();
+
+    /** 读客户端状态：只读本地状态文件与进程，不碰钥匙串，所以不必等下面的登录探测。 */
+    async function refreshClientStatuses() {
+      if (cancelled) return;
+      await refreshCodebuddyCliStatus();
+      if (cancelled) return;
+      await refreshCodebuddyCnIdeStatus();
+    }
+
     void (async () => {
+      // 状态刷新与登录探测**并行**起跑：探测要读钥匙串 / Safe Storage / 注册表 / 进程，
+      // 慢的时候好几秒；排在状态刷新前面会让「已接入」迟迟不显示（上游 issue #84）。
+      const statuses = refreshClientStatuses();
       if (!api.isDemoMode()) {
         try {
           await api.detectCodebuddyCnIdeAccount();
@@ -281,7 +297,9 @@ export default function AccountsPage() {
           /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
         }
       }
-      if (!cancelled) await refreshCodebuddyCnIdeStatus();
+      await statuses;
+      // 探测命中账号时后端会把「当前账号」写回本地状态，再读一次让高亮跟上。
+      if (!cancelled) await refreshClientStatuses();
     })();
     return () => {
       cancelled = true;
@@ -393,10 +411,20 @@ export default function AccountsPage() {
   }
 
   /** 导入完成提示：计数 + token 可能过期提醒，并刷新列表。 */
-  function onImported(result: { imported: number; skipped: number; overwritten: number }) {
+  function onImported(result: {
+    imported: number;
+    skipped: number;
+    overwritten: number;
+    encrypted?: number;
+  }) {
     void fetchAll();
     const overwriteText = result.overwritten > 0 ? `（覆盖 ${result.overwritten} 个）` : "";
-    const text = `已导入 ${result.imported} 个${overwriteText}，跳过 ${result.skipped} 个。token 可能已过期，切换后可能需要重新登录。`;
+    // 加密凭据只能切换：刷新 token / 签到 / 积分查询都要明文，导完就说清楚，别让用户等报错。
+    const encryptedText =
+      result.encrypted && result.encrypted > 0
+        ? ` 其中 ${result.encrypted} 个是加密凭据，只能用于切换账号（刷新/签到/积分需要重新登录）。`
+        : "";
+    const text = `已导入 ${result.imported} 个${overwriteText}，跳过 ${result.skipped} 个。token 可能已过期，切换后可能需要重新登录。${encryptedText}`;
     toast.success("导入成功", { description: text });
   }
 

@@ -19,6 +19,8 @@ pub struct ImportResult {
     pub skipped: usize,
     /// 其中覆盖了同 uid 本地账号的数量。
     pub overwritten: usize,
+    /// 其中凭据是加密信封的数量（这类账号只能用于切换，刷新/签到/积分需要明文 token）。
+    pub encrypted: usize,
 }
 
 /// 解析导出/导入文件文本：必须是 JSON 数组，且每项为 JSON 对象。
@@ -42,6 +44,9 @@ pub fn parse_accounts_json(text: &str) -> Result<Vec<Value>, String> {
 }
 
 /// 生成导入文件的脱敏预览（含文件内索引，不含 token）。
+///
+/// `encrypted=true` 表示该记录的凭据是加密信封：可以导入（切换账号只需要原样写回），
+/// 但刷新 token / 签到 / 积分查询这些需要明文的操作不可用。
 pub fn preview_accounts(text: &str) -> Result<Value, String> {
     let array = parse_accounts_json(text)?;
     let items: Vec<Value> = array
@@ -49,11 +54,15 @@ pub fn preview_accounts(text: &str) -> Result<Value, String> {
         .enumerate()
         .map(|(index, item)| {
             json!({
+                // 展示字段一律折叠成字符串或 null：对象漏到前端会被当 React 子节点
+                // 渲染（React #31 白屏，issue #100）。
                 "index": index,
-                "uid": item.get("uid"),
-                "nickname": item.get("nickname"),
-                "email": item.get("email"),
-                "hasToken": account::get_str(item, "access_token").is_some(),
+                "uid": account::display_value(item, "uid"),
+                "nickname": account::display_value(item, "nickname"),
+                "email": account::display_value(item, "email"),
+                "hasToken": account::secret_value(item, "access_token").is_some(),
+                // 加密信封凭据：可导入，但只能用于切换账号。
+                "encrypted": account::is_envelope(item, "access_token"),
             })
         })
         .collect();
@@ -67,7 +76,7 @@ enum MergeOutcome {
     Appended,
     /// 覆盖同 uid 的本地账号（保留导入记录原样）。
     Overwritten,
-    /// 缺少 access_token，跳过。
+    /// 缺少可导入凭据（缺失 / 空串 / 普通对象），跳过。
     Skipped,
 }
 
@@ -76,7 +85,9 @@ enum MergeOutcome {
 /// 按 uid 去重：同 uid 覆盖（保留导入记录原样）；uid 缺失或无法匹配则追加。
 /// 缺少 access_token 的记录跳过，不进入账号库。
 fn merge_import_record(accounts: &mut Vec<Value>, item: &Value) -> MergeOutcome {
-    if account::get_str(item, "access_token").is_none() {
+    // 凭据判定与采集同口径：非空明文串、或 `$wbEncrypted` 加密信封都放行；
+    // 缺失 / 空串 / 普通对象跳过（加密凭据能切换账号，但刷不了 token）。
+    if account::secret_value(item, "access_token").is_none() {
         return MergeOutcome::Skipped;
     }
     if let Some(uid) = account::get_str(item, "uid").as_deref() {
@@ -116,14 +127,20 @@ pub fn merge_import_records(
     for &index in indexes {
         match array.get(index) {
             None => result.skipped += 1,
-            Some(item) => match merge_import_record(accounts, item) {
-                MergeOutcome::Appended => result.imported += 1,
-                MergeOutcome::Overwritten => {
-                    result.imported += 1;
-                    result.overwritten += 1;
+            Some(item) => {
+                let encrypted = account::is_envelope(item, "access_token");
+                match merge_import_record(accounts, item) {
+                    MergeOutcome::Appended => result.imported += 1,
+                    MergeOutcome::Overwritten => {
+                        result.imported += 1;
+                        result.overwritten += 1;
+                    }
+                    MergeOutcome::Skipped => result.skipped += 1,
                 }
-                MergeOutcome::Skipped => result.skipped += 1,
-            },
+                if encrypted && result.imported > 0 {
+                    result.encrypted += 1;
+                }
+            }
         }
     }
     Ok(result)
@@ -268,6 +285,61 @@ mod tests {
             account::get_str(&accounts[0], "id").is_some(),
             "导入追加的记录必须带 id"
         );
+    }
+
+    /// 加密信封凭据必须放行且原样保留（issue #100）：WorkBuddy 5.6 起 token 是信封。
+    #[test]
+    fn merge_imports_envelope_token_as_is() {
+        let mut accounts: Vec<Value> = vec![];
+        let text = r#"[{
+            "id": "env-1",
+            "uid": "u-env",
+            "nickname": {"$wbEncrypted": 1, "envelope": "nick"},
+            "access_token": {"$wbEncrypted": 1, "envelope": "a"},
+            "refresh_token": {"$wbEncrypted": 1, "envelope": "r"}
+        }]"#;
+        let result = merge_import_records(&mut accounts, text, &[0]).unwrap();
+        assert_eq!(result.imported, 1, "信封凭据应计入 imported");
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.encrypted, 1, "应统计加密凭据数量");
+        assert_eq!(
+            accounts[0]["access_token"],
+            json!({"$wbEncrypted": 1, "envelope": "a"}),
+            "信封凭据必须原样保留"
+        );
+    }
+
+    /// 空串 / 普通对象仍视为没有凭据。
+    #[test]
+    fn merge_still_skips_blank_and_plain_object_token() {
+        let mut accounts: Vec<Value> = vec![];
+        let text = r#"[
+            { "id": "blank", "uid": "u-blank", "access_token": "   " },
+            { "id": "object", "uid": "u-object", "access_token": { "token": "t" } }
+        ]"#;
+        let result = merge_import_records(&mut accounts, text, &[0, 1]).unwrap();
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 2);
+        assert!(accounts.is_empty(), "空串 / 普通对象不得进入账号库");
+    }
+
+    /// 预览：对象字段折叠成 null（防前端 React #31 白屏），信封凭据打 encrypted 标记。
+    #[test]
+    fn preview_folds_object_fields_and_marks_envelope_token() {
+        let text = r#"[{
+            "id": "env-1",
+            "uid": {"$wbEncrypted": 1, "envelope": "u"},
+            "nickname": {"$wbEncrypted": 1, "envelope": "nick"},
+            "email": "a@b.c",
+            "access_token": {"$wbEncrypted": 1, "envelope": "a"}
+        }]"#;
+        let preview = preview_accounts(text).unwrap();
+        let item = &preview["accounts"][0];
+        assert_eq!(item["uid"], Value::Null, "对象字段必须折叠成 null");
+        assert_eq!(item["nickname"], Value::Null);
+        assert_eq!(item["email"], "a@b.c");
+        assert_eq!(item["hasToken"], true, "信封凭据也算有 token");
+        assert_eq!(item["encrypted"], true, "信封凭据要标记 encrypted");
     }
 
     #[test]
@@ -433,12 +505,20 @@ mod tests {
             validate_export_path("relative/out.json").is_err(),
             "必须绝对路径"
         );
-        assert!(validate_export_path("/tmp/out.txt").is_err(), "必须 .json");
+        // 绝对路径用 temp_dir 构造：写死 /tmp 在 Windows 上不是绝对路径，会误判
+        let dir = std::env::temp_dir();
+        let txt = dir.join("out.txt");
+        let upper = dir.join("out.JSON");
+        let json = dir.join("out.json");
         assert!(
-            validate_export_path("/tmp/out.JSON").is_ok(),
+            validate_export_path(&txt.to_string_lossy()).is_err(),
+            "必须 .json"
+        );
+        assert!(
+            validate_export_path(&upper.to_string_lossy()).is_ok(),
             "扩展名不区分大小写"
         );
-        assert!(validate_export_path("/tmp/out.json").is_ok());
+        assert!(validate_export_path(&json.to_string_lossy()).is_ok());
     }
 
     #[test]

@@ -1176,13 +1176,11 @@ mod tests {
 
     #[test]
     fn extracts_node_path_without_accepting_shell_noise() {
-        let output = b"welcome to the shell\n/Users/test/.nvm/versions/node/v22/bin/node\n";
-        assert_eq!(
-            node_path_from_shell_output(output),
-            Some(PathBuf::from(
-                "/Users/test/.nvm/versions/node/v22/bin/node"
-            ))
-        );
+        // 用 temp_dir 拼绝对路径：写死 Unix 路径在 Windows 上不是绝对路径，会误判
+        let node = std::env::temp_dir().join("v22").join("bin").join("node");
+        let stdout = format!("welcome to the shell\n{}\n", node.display());
+        assert_eq!(node_path_from_shell_output(stdout.as_bytes()), Some(node));
+        // 相对路径 / 噪声行不该被当成 node
         assert_eq!(node_path_from_shell_output(b"node\nwelcome\n"), None);
     }
 

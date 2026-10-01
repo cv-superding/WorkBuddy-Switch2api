@@ -1,6 +1,12 @@
 import { create } from "zustand";
 import * as api from "@/lib/api";
-import type { AccountMeta, AppStatus, CreditExpiry } from "@/lib/types";
+import type {
+  AccountMeta,
+  AppStatus,
+  CodeBuddyCliStatus,
+  CodeBuddyCnIdeStatus,
+  CreditExpiry,
+} from "@/lib/types";
 
 /** In-flight credit fetches, shared so a remount does not start a second round. */
 const creditInflight = new Set<string>();
@@ -23,6 +29,18 @@ async function fetchCreditExpiry(id: string): Promise<CreditExpiry> {
   }
 }
 
+/**
+ * 客户端（CodeBuddy CLI / CodeBuddy IDE）状态。
+ *
+ * 放在 store 而不是页面局部 state：账号页每次进入都会重挂载，局部 state 被重置成
+ * `null`，界面先按「未接入」渲染、等探测回来才改口。探测要读钥匙串 / Safe Storage /
+ * 注册表 / 进程，慢的时候有几秒，用户就会看到「先显示未接入、过几秒改口」（上游 issue #84）。
+ */
+export interface ClientStatusState {
+  codebuddyCli: CodeBuddyCliStatus | null;
+  codebuddyCnIde: CodeBuddyCnIdeStatus | null;
+}
+
 interface AccountsState {
   accounts: AccountMeta[];
   status: AppStatus | null;
@@ -34,6 +52,10 @@ interface AccountsState {
   creditUpdatedAtMap: Record<string, number>;
   refreshingCredits: boolean;
   lastCreditRefreshAt: number;
+  /** 各客户端状态（先按上次结果渲染，后台刷新回来自然覆盖）。 */
+  clientStatus: ClientStatusState;
+  /** 局部更新客户端状态，避免为一路状态重设另外几路。 */
+  setClientStatus: (patch: Partial<ClientStatusState>) => void;
   fetchAll: () => Promise<void>;
   refreshStatus: (signal?: AbortSignal) => Promise<void>;
   deleteAccount: (id: string) => Promise<void>;
@@ -62,6 +84,12 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   creditUpdatedAtMap: {},
   refreshingCredits: false,
   lastCreditRefreshAt: 0,
+  clientStatus: { codebuddyCli: null, codebuddyCnIde: null },
+
+  setClientStatus(patch) {
+    set((s) => ({ clientStatus: { ...s.clientStatus, ...patch } }));
+  },
+
 
   async fetchAll() {
     set({ loading: true, error: null });

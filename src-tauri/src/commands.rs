@@ -259,6 +259,7 @@ pub fn import_accounts(file_text: String, indexes: Vec<usize>) -> Result<Value, 
         "imported": result.imported,
         "skipped": result.skipped,
         "overwritten": result.overwritten,
+        "encrypted": result.encrypted,
     }))
 }
 

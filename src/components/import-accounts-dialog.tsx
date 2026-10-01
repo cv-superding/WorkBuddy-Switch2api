@@ -166,6 +166,11 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported }: Props) 
                   />
                   <span className="min-w-0 flex-1 truncate text-sm">{previewLabel(a)}</span>
                   {!a.hasToken && <Badge variant="outline">缺少 token</Badge>}
+                  {a.hasToken && a.encrypted && (
+                    <Badge variant="secondary" title="加密凭据：可以切换账号，但刷新/签到/积分需要明文 token">
+                      加密凭据
+                    </Badge>
+                  )}
                 </label>
               ))}
             </div>

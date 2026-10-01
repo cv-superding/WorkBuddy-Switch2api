@@ -86,6 +86,33 @@ fn str_or_null(v: Option<&Value>) -> Value {
     }
 }
 
+/// 判断字段是否为 WorkBuddy 5.6 的加密信封对象（`{ $wbEncrypted, envelope }`）。
+///
+/// 采集、导出预览、导入判定共用同一实现，不要在调用方各写一份。
+pub fn is_envelope(v: &Value, key: &str) -> bool {
+    matches!(v.get(key), Some(Value::Object(map)) if map.contains_key("$wbEncrypted"))
+}
+
+/// 展示字段（uid / nickname / email …）的统一取值：**折叠成字符串或 null**。
+///
+/// 前端会把这些字段直接当 React 子节点渲染，对象漏过去就是 React #31 整页白屏
+/// （issue #100），所以预览接口必须走这里，不要直接 `item.get(...)`。
+pub fn display_value(v: &Value, key: &str) -> Value {
+    str_or_null(v.get(key))
+}
+
+/// 凭据字段（access_token / refresh_token）的取值口径：
+/// 非空明文串或 `$wbEncrypted` 加密信封都算「有凭据」，空串 / 普通对象不算。
+///
+/// 导入判定与采集保持一致：加密信封可以入库（切换账号只需要原样写回），
+/// 但需要明文 token 的功能（刷新、签到、积分查询）用不了。
+pub fn secret_value(v: &Value, key: &str) -> Option<Value> {
+    if is_envelope(v, key) {
+        return v.get(key).cloned();
+    }
+    get_str(v, key).map(Value::String)
+}
+
 /// 把任意 JSON 值收敛成「数字或 null」（兼容数字型字符串）。
 fn num_or_null(v: Option<&Value>) -> Value {
     match v {
