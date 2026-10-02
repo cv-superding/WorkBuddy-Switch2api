@@ -12,15 +12,24 @@ use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, cache_move, checkin, client_ctl, codebuddy_cli, codebuddy_cn_ide,
     credit_usage, credits,
-    edition::{edition_of, parse_lenient}, export_import, oauth,
+    edition::{edition_of, parse_lenient, Edition}, export_import, oauth,
     process, proxy, refresh, rotate, session, switch, token_stats, transfer, travel, update,
 };
 
 #[derive(Serialize)]
 pub struct AppStatus {
     running: bool,
+    /// 显式 camelCase：前端读的是 `authFile` / `appPath`。
+    /// 之前只靠默认的蛇形命名，桌面端这两个字段一直是 undefined（webui 通道却是驼峰）。
+    #[serde(rename = "authFile")]
     auth_file: String,
+    /// 国内版那份鉴权文件里的当前账号。
     current: Option<Value>,
+    /// 国际版那份鉴权文件里的当前账号。界面要按账号所属版本取，
+    /// 只看 `current` 的话国际版卡片永远显示「设为当前」。
+    #[serde(rename = "currentInternational")]
+    current_international: Option<Value>,
+    #[serde(rename = "appPath")]
     app_path: String,
     version: String,
 }
@@ -47,22 +56,13 @@ pub async fn get_status() -> Result<AppStatus, String> {
 }
 
 fn build_app_status() -> AppStatus {
-    let auth = auth_file::read_auth_file();
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        // 用 core 的共享实现取展示字段：鉴权文件里这些字段可能是对象（加密信封），
-        // 原样透传到前端会被当 React 子节点渲染 → React #31 → 整窗白屏。
-        // 口径只在 account::display_value 里定义一份，webui 通道也走它。
-        Some(json!({
-            "uid": account::display_value(&acct, "uid"),
-            "nickname": account::display_value(&acct, "nickname"),
-            "email": account::display_value(&acct, "email"),
-        }))
-    });
+    // 两个版本各读各的鉴权文件：界面上国际版账号也要能显示「已设为当前」。
+    // 展示字段的口径（加密信封收敛成字符串/null）只在 core 里定义一份。
     AppStatus {
         running: process::is_workbuddy_running(),
         auth_file: auth_file::auth_file_path().to_string_lossy().to_string(),
-        current,
+        current: auth_file::current_account_summary_for(Edition::Domestic),
+        current_international: auth_file::current_account_summary_for(Edition::International),
         app_path: auth_file::workbuddy_app_path()
             .to_string_lossy()
             .to_string(),

@@ -558,7 +558,9 @@ function demoTokenStatistics(days?: number): TokenStatistics {
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
-  const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: "0.1.24" };
+  const demoDomesticCurrent = demoAccounts.find((account) => account.edition !== "international") ?? demoAccounts[0];
+  const demoInternationalCurrent = demoAccounts.find((account) => account.edition === "international");
+  const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoDomesticCurrent.uid, nickname: demoDomesticCurrent.nickname, email: demoDomesticCurrent.email }, currentInternational: demoInternationalCurrent ? { uid: demoInternationalCurrent.uid, nickname: demoInternationalCurrent.nickname, email: demoInternationalCurrent.email } : null, appPath: "/demo/WorkBuddy.app", version: "0.1.24" };
   const activeIndex = Math.max(0, demoAccounts.findIndex((account) => account.id === demoActiveCliAccountId));
   const activeAccount = demoAccounts[activeIndex] ?? demoAccounts[0];
   const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };

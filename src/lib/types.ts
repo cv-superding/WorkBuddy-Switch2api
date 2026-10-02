@@ -59,14 +59,20 @@ export function accountGroupLabel(group?: string | null): string {
   return "未分组";
 }
 
+/** 鉴权文件里的「当前账号」展示字段（加密信封已被后端收敛成字符串或 null）。 */
+export interface CurrentAccount {
+  uid: string | null;
+  nickname: string | null;
+  email: string | null;
+}
+
 export interface AppStatus {
   running: boolean;
   authFile: string;
-  current: {
-    uid: string | null;
-    nickname: string | null;
-    email: string | null;
-  } | null;
+  /** 国内版那份鉴权文件（`workbuddy-desktop.info`）里的当前账号。 */
+  current: CurrentAccount | null;
+  /** 国际版那份鉴权文件（`workbuddy-desktop-ai.info`）里的当前账号。 */
+  currentInternational: CurrentAccount | null;
   appPath: string;
   version: string;
 }

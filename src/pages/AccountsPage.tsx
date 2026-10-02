@@ -63,7 +63,15 @@ function creditPriorityRank(credit?: CreditExpiry): number {
   return 2;
 }
 
-function isWorkbuddyCurrent(account: AccountMeta, current: AppStatus["current"] | undefined): boolean {
+/**
+ * 账号是不是「该版本客户端的当前登录账号」。
+ *
+ * 两个版本各有自己的鉴权文件（`workbuddy-desktop.info` / `workbuddy-desktop-ai.info`），
+ * 所以国际版要比 `currentInternational`、国内版比 `current`。
+ * 只比 `current` 的话，国际版卡片永远显示「设为当前」——2026-10-02 修的 bug。
+ */
+function isWorkbuddyCurrent(account: AccountMeta, status: AppStatus | null | undefined): boolean {
+  const current = isInternational(account) ? status?.currentInternational : status?.current;
   if (!current) return false;
   return Boolean(
     (current.uid && (account.uid === current.uid || account.id === current.uid)) ||
@@ -181,6 +189,9 @@ export default function AccountsPage() {
    */
   const [editionTab, setEditionTab] = useState<string>(() => {
     try {
+      // `?tab=international` 直接落到国际版标签页（截图 / 演示用，和缓存迁移页 `?split=1` 一个约定）
+      const forced = new URLSearchParams(window.location.search).get("tab");
+      if (forced === "international" || forced === "domestic") return forced;
       const saved = localStorage.getItem("wb-switch.edition-tab");
       return saved === "international" ? "international" : "domestic";
     } catch {
@@ -616,7 +627,6 @@ export default function AccountsPage() {
     }
   }
 
-  const current = status?.current;
   /** 各档位账号数（标签页角标）。 */
   const editionCounts: Record<string, number> = { domestic: 0, international: 0 };
   for (const a of accounts) {
@@ -653,9 +663,19 @@ export default function AccountsPage() {
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
-  const workbuddyCurrentName = current
-    ? current.nickname || current.email || current.uid || "未知账号"
-    : "未登录";
+  /** 头部那行「当前账号」要跟着标签页走：两个版本各有一份鉴权文件。 */
+  const currentSummary =
+    editionTab === "international" ? status?.currentInternational : status?.current;
+  /**
+   * 鉴权文件里的昵称/手机号是加密信封（后端收敛成 null），所以拿 uid 回账号库换回显示名，
+   * 否则这一行只能显示一串 UUID。
+   */
+  const workbuddyCurrentName = (() => {
+    if (!currentSummary) return "未登录";
+    const uid = currentSummary.uid;
+    const matched = uid ? accounts.find((a) => a.uid === uid || a.id === uid) : undefined;
+    return matched?.nickname || currentSummary.nickname || currentSummary.email || uid || "未知账号";
+  })();
   const codebuddyCurrentName = codebuddyCli?.configured
     ? codebuddyCli.activeAccountName || "未检测到"
     : "尚未接入";
@@ -976,7 +996,7 @@ export default function AccountsPage() {
                 creditLoading={creditLoadingMap[a.id]}
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}
                 creditPriority={a.id === priorityAccountId}
-                workbuddyActive={isWorkbuddyCurrent(a, current)}
+                workbuddyActive={isWorkbuddyCurrent(a, status)}
                 codebuddyCliConfigured={codebuddyCli?.configured && !codebuddyCli.migrationRequired && !codebuddyCli.syncPending}
                 codebuddyCliActive={a.id === cliCurrentAccountId}
                 codebuddyCliBusy={codebuddyCliSwitchingId !== null}

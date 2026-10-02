@@ -17,7 +17,8 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
+    edition::Edition, export_import,
     oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
 };
 
@@ -126,23 +127,13 @@ fn json_err(e: String, code: StatusCode) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn api_status() -> Response {
-    let auth = auth_file::read_auth_file();
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        // 必须走 display_value 收敛成「字符串或 null」：鉴权文件里这些字段可能是
-        // `{ $wbEncrypted, envelope }` 加密信封对象，原样透传会被前端当 React 子节点
-        // 渲染 → React #31 → 整页渲染出错。桌面端（commands.rs）早就这么做了，
-        // 这条 HTTP 通道当时漏了，正好在 webui 里炸出来。
-        Some(json!({
-            "uid": account::display_value(&acct, "uid"),
-            "nickname": account::display_value(&acct, "nickname"),
-            "email": account::display_value(&acct, "email"),
-        }))
-    });
+    // 桌面通道（commands.rs）同款：两个版本各读各的鉴权文件；
+    // 展示字段口径走 core 的共享实现，别在这条路上重写一遍。
     json_ok(json!({
         "running": cached_workbuddy_running(),
         "authFile": auth_file::auth_file_path().to_string_lossy(),
-        "current": current,
+        "current": auth_file::current_account_summary_for(Edition::Domestic),
+        "currentInternational": auth_file::current_account_summary_for(Edition::International),
         "appPath": auth_file::workbuddy_app_path().to_string_lossy(),
         "version": update::APP_VERSION,
     }))

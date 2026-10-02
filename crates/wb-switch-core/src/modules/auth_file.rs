@@ -63,6 +63,32 @@ pub fn read_auth_file_for(edition: Edition) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+/// 从鉴权文件 JSON 取「当前登录账号」的展示字段（uid / nickname / email）。
+///
+/// 加密信封（`{$wbEncrypted, envelope}`）一律收敛成字符串或 null —— 原样透传到前端
+/// 会被当 React 子节点渲染 → React #31 → 整页白屏。
+fn current_summary_from_auth(auth: &Value) -> Value {
+    let acct = auth.get("account").cloned().unwrap_or_else(|| json!({}));
+    json!({
+        "uid": crate::modules::account::display_value(&acct, "uid"),
+        "nickname": crate::modules::account::display_value(&acct, "nickname"),
+        "email": crate::modules::account::display_value(&acct, "email"),
+    })
+}
+
+/// 指定版本「当前登录账号」的展示字段。
+///
+/// 🔴 **必须按版本取**：两个版本各有自己的鉴权文件（`workbuddy-desktop.info` /
+/// `workbuddy-desktop-ai.info`）。早先这里只有 `read_auth_file()`（= 国内版），
+/// 于是 `status.current` 永远只反映国内版账号 —— 国际版账号在界面上**永远不会**
+/// 显示「已设为当前」，只能一直显示「设为当前」（2026-10-02 用户报的 bug）。
+///
+/// 桌面端（commands.rs）与 webui 端（api.rs）都走这里，口径只定义一份。
+pub fn current_account_summary_for(edition: Edition) -> Option<Value> {
+    let auth = read_auth_file_for(edition)?;
+    Some(current_summary_from_auth(&auth))
+}
+
 /// 切换前备份当前认证文件，返回备份路径。对照 server.py `backup_auth_file`。
 pub fn backup_auth_file() -> Option<PathBuf> {
     backup_auth_file_for(Edition::Domestic)
@@ -427,6 +453,29 @@ fn parse_ts(v: Option<&Value>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    /// 加密信封必须收敛成 null：原样透传到前端会被当 React 子节点渲染 → React #31。
+    #[test]
+    fn current_summary_converges_encrypted_envelope() {
+        let auth = json!({
+            "account": {
+                "uid": "3753da10-1a3b-4ef1-8995-7d0cd95183ab",
+                "nickname": {"$wbEncrypted": 1, "envelope": "eyJ..."},
+                "email": "someone@example.com"
+            }
+        });
+        let s = current_summary_from_auth(&auth);
+        assert_eq!(s["uid"], "3753da10-1a3b-4ef1-8995-7d0cd95183ab");
+        assert_eq!(s["email"], "someone@example.com");
+        assert!(s["nickname"].is_null(), "加密信封必须收敛成 null");
+    }
+
+    /// 鉴权文件缺 account 字段时不能 panic，三个字段都给 null。
+    #[test]
+    fn current_summary_tolerates_missing_account() {
+        let s = current_summary_from_auth(&json!({}));
+        assert!(s["uid"].is_null() && s["nickname"].is_null() && s["email"].is_null());
+    }
+
     use super::*;
     use serde_json::json;
 
