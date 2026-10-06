@@ -212,41 +212,38 @@ fn scan(p: &Path) -> (u64, u64) {
 /// 「复制 + 校验」这一轮的结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyVerdict {
-    /// 目标与「复制完成时的源」一致 —— 可以改名建联接了。
+    /// 预演后一个文件都不差 —— 目标已完整覆盖源，可以改名建联接。
     Ok,
-    /// 目标对不上，但还没到重试上限 —— 增量再拷一轮。
+    /// 还差文件，但没到重试上限 —— 增量再拷一轮。
     Recopy,
     /// 源在复制期间被持续写入，重拷到上限仍不收敛。
     SourceBusy,
-    /// 源压根没动过，目标就是不一样 —— 真的出问题了。
+    /// 源压根没动过，却还是搬不全 —— 多半有文件被别的程序占着。
     Mismatch,
 }
 
 /// 复制完成后怎么走。
 ///
-/// 🔴 **为什么不能只比「复制前的源快照」**：源目录可能**在复制期间被写入**
-/// （客户端没退干净，或者复制中途被打开）。只要源动过一次，快照就过期，
-/// 严格相等必然失败 —— 用户看到的是「副本校验不一致（文件 N→N，字节 A→B）」，
-/// 完全看不出真正原因，而数据其实是好的。
-/// 实测（2026-10-06）：报错时目标字节数**比快照还多** 1,214,959 ——
-/// 目标只会由 robocopy 写，多出来的唯一解释就是源在复制期间长大了。
+/// `pending` = robocopy 预演出来的「还需要复制的文件数」（见 `robocopy_pending`）。
 ///
-/// 所以判定以**复制完成时的源**为准；对不上先增量重拷（robocopy 只搬变化的
-/// 部分，第二轮通常只要几十秒），最多 `MAX_ATTEMPTS` 轮再报错。
-fn classify_copy_result(
-    before: (u64, u64),
-    src_now: (u64, u64),
-    dst: (u64, u64),
-    attempt: u32,
-) -> CopyVerdict {
+/// 🔴 **为什么不用「两边的文件数 / 总字节」比大小**：源目录可能**在复制期间
+/// 被写入**（客户端没退干净，或者复制中途被打开）。这会造成两种后果 ——
+/// ① 复制前的快照过期；② 目标里留下源中已不存在的残留（应用轮转/删掉了
+/// `logs/`、LevelDB 的 `.ldb` 等）。聚合计数对这两种情况都无能为力：
+/// 前者报出来的话完全看不出原因，后者更是**重试多少次都过不去**
+/// （实测 2026-10-06：一次失败留下 34 个残留，用户会以为数据坏了）。
+///
+/// 改成以「预演还剩几个要复制」为准之后，两种情况都自然收敛：
+/// 残留不参与判定；源被写入时增量重拷几轮就对齐了。
+fn classify_copy_result(pending: u64, src_moved: bool, attempt: u32) -> CopyVerdict {
     const MAX_ATTEMPTS: u32 = 3;
-    if dst == src_now {
+    if pending == 0 {
         return CopyVerdict::Ok;
     }
     if attempt < MAX_ATTEMPTS {
         return CopyVerdict::Recopy;
     }
-    if src_now != before {
+    if src_moved {
         CopyVerdict::SourceBusy
     } else {
         CopyVerdict::Mismatch
@@ -578,6 +575,48 @@ fn robocopy(_src: &Path, _dst: &Path) -> Result<i32, String> {
     Err("当前平台不支持 robocopy".to_string())
 }
 
+/// 预演一次复制（`/L`，只列清单不写盘），返回**还需要复制的文件数**。
+///
+/// 用它当校验，而不是拿两边「文件数 / 总字节」比大小 —— 后者会被
+/// **目标里的残留**永久卡住：源目录在复制期间被写入时（客户端没退干净、
+/// 或中途被打开），应用会把 `logs/`、`audit-log/spool/`、LevelDB 的 `.ldb`
+/// 这类文件轮转或删掉，于是目标里留下源中已不存在的文件，
+/// 聚合计数怎么比都对不上，重试多少次都失败 —— 而那些残留对使用毫无影响。
+/// 实测（2026-10-06）：一次失败留下 34 个这种文件，重试永远过不去。
+///
+/// robocopy 自己的判定标准是「大小 + 时间戳都一致才跳过」，和真正复制时
+/// 用的是同一套规则，所以「预演 0 个待复制」= 目标已经完整覆盖源，这才是
+/// 真正该验证的东西。目标里多出来的残留不参与判定（`/E` 不删东西）。
+///
+/// ⚠️ 不要为了「让数目对上」改成 `/MIR`：那会删掉目标里源没有的文件，
+/// 一旦用户把目标指到有别的数据的文件夹，就是不可逆的数据丢失。
+#[cfg(target_os = "windows")]
+fn robocopy_pending(src: &Path, dst: &Path) -> Result<u64, String> {
+    let out = process::cmd_builder("robocopy")
+        .arg(src)
+        .arg(dst)
+        .args([
+            "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:0", "/W:0", "/XJ", "/L", "/NS", "/NC", "/NDL",
+            "/NJH", "/NJS", "/NP",
+        ])
+        .output()
+        .map_err(|e| format!("调用 robocopy 预演失败：{e}"))?;
+    let code = out.status.code().unwrap_or(-1);
+    if code >= 8 {
+        return Err(format!(
+            "robocopy 预演返回 {code}（≥8 表示列清单时就出错了）。源目录未改动。"
+        ));
+    }
+    // 表头/汇总已用 `/NJH /NJS` 关掉，所以「非空行数」就是待复制文件数。
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn robocopy_pending(_src: &Path, _dst: &Path) -> Result<u64, String> {
+    Err("当前平台不支持 robocopy".to_string())
+}
+
 // ---------------------------------------------------------------- 迁移
 
 /// 人类可读的体积。
@@ -676,7 +715,7 @@ fn migrate_one(
             emit(
                 progress,
                 "copy",
-                &format!("重拷 {name}（第 {attempt} 轮 · 上次源目录被改动）"),
+                &format!("重拷 {name}（第 {attempt} 轮）"),
                 idx,
                 total,
                 at(2),
@@ -688,28 +727,45 @@ fn migrate_one(
         }
 
         emit(progress, "verify", &format!("校验 {name}"), idx, total, at(3));
+        let pending = match robocopy_pending(&src, &dst) {
+            Ok(n) => n,
+            Err(e) => {
+                push_log(&mut logs, label, false, e);
+                return (false, logs, None);
+            }
+        };
         let (sf, sb) = scan(&src);
-        let (df, db) = scan(&dst);
         if (sf, sb) != (nf, nb) {
             src_moved = true;
         }
 
-        match classify_copy_result((nf, nb), (sf, sb), (df, db), attempt) {
+        match classify_copy_result(pending, src_moved, attempt) {
             CopyVerdict::Ok => {
                 if attempt > 1 {
                     push_log(
                         &mut logs,
                         label,
                         true,
-                        if src_moved {
-                            format!("复制期间源目录被写入过，已自动重拷 {attempt} 轮对齐")
-                        } else {
-                            format!("上一次有文件没搬全，已自动重拷 {attempt} 轮补齐")
-                        },
+                        format!("目标与源对齐经过了 {attempt} 轮（复制期间源目录被写入过）"),
                     );
                 }
                 nf = sf;
                 nb = sb;
+                // 源里已经没有、目标里还在的残留（复制期间被应用轮转/删掉的
+                // 日志、LevelDB 片段等）。它们不影响使用，但会让「两边文件数」
+                // 看着不一样，所以主动说一句，免得下次又被当成故障。
+                let (df, _) = scan(&dst);
+                let extra = df.saturating_sub(sf);
+                if extra > 0 {
+                    push_log(
+                        &mut logs,
+                        label,
+                        true,
+                        format!(
+                            "目标里另有 {extra} 个源中已不存在的文件（复制期间被应用轮转/删除的残留），不影响使用"
+                        ),
+                    );
+                }
                 break;
             }
             CopyVerdict::Recopy => {
@@ -728,21 +784,22 @@ fn migrate_one(
                     )
                 };
                 let why = if matches!(
-                    classify_copy_result((nf, nb), (sf, sb), (df, db), attempt),
+                    classify_copy_result(pending, src_moved, attempt),
                     CopyVerdict::SourceBusy
                 ) {
                     format!(
-                        "复制期间源目录被持续写入（文件 {nf}→{sf}，字节 {nb}→{sb}），                         已自动增量重拷 {attempt} 轮仍未收敛。{hint}"
+                        "复制期间源目录被持续写入（还有 {pending} 个文件没对上），已自动重拷 {attempt} 轮仍未收敛。{hint}"
                     )
                 } else {
-                    format!("副本校验不一致（文件 {sf}→{df}，字节 {sb}→{db}）。{hint}")
+                    format!(
+                        "复制完成后仍有 {pending} 个文件没搬全（源目录本身没动过，可能有文件被别的程序占用）。{hint}"
+                    )
                 };
                 push_log(&mut logs, label, false, format!("{why}源目录未改动。"));
                 return (false, logs, None);
             }
         }
     }
-
     let backup = backup_path_for(&src);
     emit(
         progress,
@@ -1493,41 +1550,26 @@ pub fn verify() -> Value {
 mod tests {
     use super::*;
 
-    /// 判定规则：目标 == 复制完成时的源 → 通过（哪怕源在复制期间被写过）。
+    /// 预演 0 个待复制 → 通过（目标里有源没有的残留也不管）。
     #[test]
-    fn classify_ok_when_dst_matches_live_src() {
-        // 源复制期间从 100 长到 200，目标也是 200 —— 数据是齐的，只是快照过期
-        assert_eq!(
-            classify_copy_result((10, 100), (10, 200), (10, 200), 1),
-            CopyVerdict::Ok
-        );
+    fn classify_ok_when_nothing_left_to_copy() {
+        assert_eq!(classify_copy_result(0, false, 1), CopyVerdict::Ok);
+        // 源在复制期间被写过，但最终一个文件都不差 —— 照样通过
+        assert_eq!(classify_copy_result(0, true, 1), CopyVerdict::Ok);
     }
 
-    /// 目标对不上、还没到上限 → 增量重拷，而不是直接报「不一致」。
+    /// 还差文件、没到上限 → 增量重拷，而不是直接报「不一致」。
     #[test]
     fn classify_recopies_before_giving_up() {
-        assert_eq!(
-            classify_copy_result((10, 100), (10, 200), (10, 100), 1),
-            CopyVerdict::Recopy
-        );
-        // 源没动过也对不上（比如上次有文件被占用没搬全）—— 同样先重拷
-        assert_eq!(
-            classify_copy_result((10, 100), (10, 100), (9, 99), 2),
-            CopyVerdict::Recopy
-        );
+        assert_eq!(classify_copy_result(191, true, 1), CopyVerdict::Recopy);
+        assert_eq!(classify_copy_result(3, false, 2), CopyVerdict::Recopy);
     }
 
-    /// 重拷到上限：源一直在动 → 说「源被写入」；源没动 → 说「真的不一致」。
+    /// 重拷到上限：源一直在动 → 说「源被写入」；源没动 → 说「搬不全」。
     #[test]
     fn classify_distinguishes_busy_source_from_broken_copy() {
-        assert_eq!(
-            classify_copy_result((10, 100), (10, 300), (10, 100), 3),
-            CopyVerdict::SourceBusy
-        );
-        assert_eq!(
-            classify_copy_result((10, 100), (10, 100), (9, 99), 3),
-            CopyVerdict::Mismatch
-        );
+        assert_eq!(classify_copy_result(50, true, 3), CopyVerdict::SourceBusy);
+        assert_eq!(classify_copy_result(50, false, 3), CopyVerdict::Mismatch);
     }
 
     /// 造一棵「像真备份那样」的树：深层嵌套 + 只读文件 + 隐藏文件。
