@@ -44,6 +44,22 @@ const BACKUP_MARK: &str = ".moved-";
 /// 迁移期间必须退出的进程（这两个才是这些目录的持有者）。
 const BLOCKING_IMAGES: [&str; 2] = ["WorkBuddy.exe", "WorkBuddyAI.exe"];
 
+/// 每个数据目录的持有者进程映像名。
+///
+/// 🔴 **为什么必须按目录分开判**：以前 `running_procs()` 不管要迁哪个目录，
+/// 一律把两个进程都当阻塞项 —— 于是「只想迁国际版」也被要求把国内版一起关掉。
+/// 两个应用的数据目录本来就是分开的（`.workbuddy` / `.workbuddy-ai`），
+/// 谁来写谁，就该只拦谁。实测唯一会写 `.workbuddy` 的是 `WorkBuddy.exe`，
+/// 唯一会写 `.workbuddy-ai` 的是 `WorkBuddyAI.exe`。
+fn holders_of(dir_name: &str) -> &'static [&'static str] {
+    match dir_name {
+        ".workbuddy" => &["WorkBuddy.exe"],
+        ".workbuddy-ai" => &["WorkBuddyAI.exe"],
+        // 凭据回退目录等 EXTRA_DIRS：两个客户端都可能碰，保守起见都算持有者。
+        _ => &BLOCKING_IMAGES,
+    }
+}
+
 /// 不阻塞迁移、但会在界面上提示的进程（CodeBuddy IDE 可能间接占用运行时目录）。
 const WARN_IMAGES: [&str; 1] = ["CodeBuddy.exe"];
 
@@ -73,6 +89,10 @@ pub struct CacheDir {
     pub movable: bool,
     /// 前端展示用的体积字符串。
     pub size_text: String,
+    /// 这个目录的持有者应用此刻在跑（迁它之前必须先退掉那个应用）。
+    pub held: bool,
+    /// 持有者进程名（`held` 为真时），如 `WorkBuddy.exe`。
+    pub held_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,6 +316,9 @@ fn list_drives() -> Vec<Drive> {
 }
 
 /// 当前在跑的、与迁移相关的进程 → (必须退出的, 建议退出的)。
+///
+/// ⚠️ 这是**全局**探测，只适合用来做界面提示。真正的「能不能迁」判定要走
+/// `running_holders_for`（按目标目录），否则「只迁国际版」会连国内版一起拦。
 fn running_procs() -> (Vec<String>, Vec<String>) {
     #[cfg(target_os = "windows")]
     {
@@ -338,6 +361,38 @@ fn running_procs() -> (Vec<String>, Vec<String>) {
             .collect();
         (blocking, warnings)
     }
+}
+
+/// 某个映像名是否正在运行。
+#[cfg(target_os = "windows")]
+fn image_running(img: &str) -> bool {
+    !process::windows_tasklist_image_rows(img).is_empty()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn image_running(img: &str) -> bool {
+    let name = img.strip_suffix(".exe").unwrap_or(img);
+    process::cmd_builder("pgrep")
+        .args(["-x", name])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// 一组目录里，**实际挡路的**进程 → 目录名列表。
+///
+/// 只看 `names` 里列出的目录的持有者进程；没被本次迁移选中的目录
+/// 即使应用在跑也不拦。返回空 = 这次可以放心迁。
+fn running_holders_for(names: &[String]) -> Vec<String> {
+    let mut hit: Vec<String> = Vec::new();
+    for name in names {
+        for img in holders_of(name) {
+            if image_running(img) && !hit.iter().any(|h| h == img) {
+                hit.push((*img).to_string());
+            }
+        }
+    }
+    hit
 }
 
 // ---------------------------------------------------------------- 条目 / 计划
@@ -396,6 +451,12 @@ fn dir_status(name: &str, label: &str, movable: bool, with_size: bool) -> CacheD
     } else {
         (0, 0)
     };
+    // 只看这个目录自己的持有者 —— 另一个版本的进程在跑不影响它。
+    let held_by: Vec<String> = holders_of(name)
+        .iter()
+        .filter(|img| image_running(img))
+        .map(|img| (*img).to_string())
+        .collect();
     CacheDir {
         name: name.to_string(),
         label: label.to_string(),
@@ -408,6 +469,8 @@ fn dir_status(name: &str, label: &str, movable: bool, with_size: bool) -> CacheD
         bytes,
         movable,
         size_text: human(bytes),
+        held: !held_by.is_empty(),
+        held_by,
     }
 }
 
@@ -448,14 +511,11 @@ pub fn plan(dest: Option<String>) -> Plan {
     let has_dest = drives.iter().any(|d| !d.system);
     let blocked_reason = if !supported {
         platform_note.clone()
-    } else if !blocking.is_empty() {
-        Some(format!(
-            "{} 正在运行。窗口关掉不够，要在托盘图标上右键 → 退出，两个应用都退。",
-            blocking.join(" / ")
-        ))
     } else if !has_dest {
         Some("没有可用的非系统盘。".to_string())
     } else {
+        // ⚠️ 这里**不再**因为有客户端在跑就整体禁掉 —— 用户可能只迁没在跑的那个。
+        // 真正挡路的判定在 run() 里按目标目录做；界面上每行会标出谁被占用。
         None
     };
 
@@ -774,12 +834,13 @@ fn migrate_one(
                 continue;
             }
             CopyVerdict::SourceBusy | CopyVerdict::Mismatch => {
-                let (procs, _) = running_procs();
+                // 只报**这个目录自己的**持有者，别把另一个版本的进程也列出来误导人。
+                let procs = running_holders_for(&[name.to_string()]);
                 let hint = if procs.is_empty() {
-                    "请确认客户端已完全退出后重试。".to_string()
+                    "请确认这个目录对应的客户端已完全退出后重试。".to_string()
                 } else {
                     format!(
-                        "{} 正在运行 —— 请完全退出（托盘图标右键 → 退出，两个应用都退）后重试。",
+                        "{} 正在运行 —— 请退出这个应用（托盘图标右键 → 退出）后重试；另一个版本不用关。",
                         procs.join(" / ")
                     )
                 };
@@ -849,15 +910,32 @@ pub fn run(targets: Vec<MoveTarget>, progress: Option<&dyn Fn(Progress)>) -> Res
     if !cfg!(target_os = "windows") {
         return Err("缓存迁移目前只支持 Windows（依赖 NTFS 目录联接）。".to_string());
     }
-    let (blocking, _) = running_procs();
-    if !blocking.is_empty() {
-        return Err(format!(
-            "{} 正在运行。请先完全退出（托盘图标右键 → 退出，两个应用都退）再迁移。",
-            blocking.join(" / ")
-        ));
-    }
     if targets.is_empty() {
         return Err("没有选中任何要迁移的目录。".to_string());
+    }
+
+    // 🔴 只拦「本次要迁的那些目录」的持有者。
+    // 以前这里不分青红皂白要求两个应用都退 —— 想只迁国际版也做不到。
+    // 现在：没选中的目录，它的应用在跑也不管；选中的目录，只要求它自己的应用退出。
+    let names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+    let held = running_holders_for(&names);
+    if !held.is_empty() {
+        // 说清楚是哪个应用挡了哪几个目录。
+        let detail: Vec<String> = targets
+            .iter()
+            .filter(|t| holders_of(&t.name).iter().any(|img| held.contains(&img.to_string())))
+            .map(|t| format!("{}（{}）", t.name, holders_of(&t.name).join(" / ")))
+            .collect();
+        return Err(format!(
+            "{} 正在运行，占用着{}。请只退出这个应用（托盘图标右键 → 退出）再迁移；\
+             其它应用不用关。窗口关掉不够，要真正退出。",
+            held.join(" / "),
+            if detail.is_empty() {
+                "要迁移的目录".to_string()
+            } else {
+                detail.join("、")
+            }
+        ));
     }
 
     let home = home_dir();
@@ -981,16 +1059,26 @@ pub fn rollback(progress: Option<&dyn Fn(Progress)>) -> Result<Value, String> {
     if !cfg!(target_os = "windows") {
         return Err("缓存迁移目前只支持 Windows。".to_string());
     }
-    let (blocking, _) = running_procs();
-    if !blocking.is_empty() {
+    let home = home_dir();
+    let list = entries();
+    // 只对**真的要回滚的那些**（当前是联接的）要求应用退出 —— 回滚不碰的目录，
+    // 它的应用在跑也无所谓。
+    let linked: Vec<String> = list
+        .iter()
+        .map(|(n, _, _)| n.clone())
+        .filter(|n| {
+            let p = home.join(n);
+            p.exists() && is_reparse(&p)
+        })
+        .collect();
+    let held = running_holders_for(&linked);
+    if !held.is_empty() {
         return Err(format!(
-            "{} 正在运行，请先完全退出再回滚。",
-            blocking.join(" / ")
+            "{} 正在运行，占用着要回滚的目录。请先退出这个应用（托盘图标右键 → 退出）再回滚。",
+            held.join(" / ")
         ));
     }
 
-    let home = home_dir();
-    let list = entries();
     let total = list.len() as u32;
     let mut logs: Vec<StepLog> = Vec::new();
     let mut restored: Vec<String> = Vec::new();
@@ -1556,6 +1644,63 @@ mod tests {
         assert_eq!(classify_copy_result(0, false, 1), CopyVerdict::Ok);
         // 源在复制期间被写过，但最终一个文件都不差 —— 照样通过
         assert_eq!(classify_copy_result(0, true, 1), CopyVerdict::Ok);
+    }
+
+    /// 🔴 关键回归：每个数据目录只认自己的持有者。
+    ///
+    /// 这条是「只迁国际版却要求两个应用都关」的修复核心 ——
+    /// 一旦有人把 `holders_of` 改回「返回全部两个进程」，这里立刻红。
+    #[test]
+    fn holders_are_scoped_per_directory() {
+        let cn = holders_of(".workbuddy");
+        let ai = holders_of(".workbuddy-ai");
+        assert_eq!(cn, ["WorkBuddy.exe"], "国内版目录的持有者只能是 WorkBuddy.exe");
+        assert_eq!(
+            ai,
+            ["WorkBuddyAI.exe"],
+            "国际版目录的持有者只能是 WorkBuddyAI.exe"
+        );
+        // 两个目录的持有者集合必须没有交集，否则按目录判定就失去意义
+        assert!(
+            !cn.iter().any(|i| ai.contains(i)),
+            "两个版本的持有者不能重叠"
+        );
+        // 未知目录保守处理：两个都算持有者
+        assert_eq!(holders_of(".workbuddy-key-fallback").len(), 2);
+    }
+
+    /// 迁移目标与「挡路进程」的对应关系要能算对：
+    /// 只迁国际版时，不该把 WorkBuddy.exe 算进来。
+    #[test]
+    fn selected_holders_exclude_the_other_edition() {
+        let pick = |dirs: &[&str], running: &[&str]| -> Vec<String> {
+            let mut hit: Vec<String> = Vec::new();
+            for name in dirs {
+                for img in holders_of(name) {
+                    if running.contains(img) && !hit.iter().any(|h| h == img) {
+                        hit.push((*img).to_string());
+                    }
+                }
+            }
+            hit
+        };
+        // 两个应用都在跑，但只迁国际版 → 只该拦 WorkBuddyAI.exe
+        assert_eq!(
+            pick(&[".workbuddy-ai"], &["WorkBuddy.exe", "WorkBuddyAI.exe"]),
+            vec!["WorkBuddyAI.exe".to_string()]
+        );
+        // 只迁国内版 → 只该拦 WorkBuddy.exe
+        assert_eq!(
+            pick(&[".workbuddy"], &["WorkBuddy.exe", "WorkBuddyAI.exe"]),
+            vec!["WorkBuddy.exe".to_string()]
+        );
+        // 国内版在跑、这次只迁国际版且国际版没开 → 一个都不拦，可以迁
+        assert!(pick(&[".workbuddy-ai"], &["WorkBuddy.exe"]).is_empty());
+        // 两个都迁且都在跑 → 两个都要退
+        assert_eq!(
+            pick(&[".workbuddy", ".workbuddy-ai"], &["WorkBuddy.exe", "WorkBuddyAI.exe"]).len(),
+            2
+        );
     }
 
     /// 还差文件、没到上限 → 增量重拷，而不是直接报「不一致」。

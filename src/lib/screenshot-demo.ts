@@ -426,6 +426,8 @@ function cacheMovePlan(): CacheMovePlan {
       bytes: 0,
       movable: true,
       sizeText: "0 B",
+      held: false,
+      heldBy: [],
     },
     {
       name: ".workbuddy-ai",
@@ -439,6 +441,8 @@ function cacheMovePlan(): CacheMovePlan {
       bytes: 6871947673,
       movable: true,
       sizeText: "6.4 GB",
+      held: false,
+      heldBy: [],
     },
     {
       name: ".workbuddy-key-fallback",
@@ -452,6 +456,8 @@ function cacheMovePlan(): CacheMovePlan {
       bytes: 320,
       movable: true,
       sizeText: "320 B",
+      held: false,
+      heldBy: [],
     },
   ];
   return {

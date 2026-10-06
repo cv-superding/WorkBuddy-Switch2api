@@ -244,6 +244,14 @@ export default function CacheMovePage() {
     [movable, perDest],
   );
 
+  /**
+   * 勾选中、且它自己的应用正在跑的目录。
+   *
+   * 🔴 只拦这些 —— 没勾的目录，它的应用在跑也无所谓。
+   * 这是「只想迁国际版，却被要求把国内版也关掉」的修复点。
+   */
+  const heldSelected = useMemo(() => included.filter((d) => d.held), [included]);
+
   /** 改某个目录的设置（勾选 / 单独路径）。 */
   const setRow = useCallback((name: string, patch: Partial<{ on: boolean; custom: string }>) => {
     setPerDest((prev) => {
@@ -445,8 +453,9 @@ export default function CacheMovePage() {
     );
   }
 
+  // 只有「勾选中且被占用」才禁掉开始按钮；全局的 canRun 只管平台/目标盘这类硬条件。
   const blocked = plan && !plan.canRun;
-
+  const anyHeldSelected = heldSelected.length > 0;
   return (
     <div className="mx-auto min-w-0 w-full max-w-[1180px] space-y-4 px-4 py-6 sm:px-8 sm:py-9">
       {header}
@@ -525,7 +534,18 @@ export default function CacheMovePage() {
                       </Button>
                     </>
                   ) : d.exists ? (
-                    <span className="text-[13px] tabular-nums">{d.sizeText}</span>
+                    <>
+                      {d.held && (
+                        <Badge
+                          variant="secondary"
+                          className="border-0 bg-amber-50 text-amber-700"
+                          title={`${d.heldBy.join(" / ")} 正在运行，占用着这个目录`}
+                        >
+                          应用中
+                        </Badge>
+                      )}
+                      <span className="text-[13px] tabular-nums">{d.sizeText}</span>
+                    </>
                   ) : (
                     <span className="text-xs text-muted-foreground">—</span>
                   )}
@@ -556,20 +576,39 @@ export default function CacheMovePage() {
         </CardContent>
       </Card>
 
-      {/* ---------------------------------------------------------- 阻塞提示 */}
+      {/*
+        🔴 阻塞提示**不再是全局的**：只拦「本次勾选、且它自己的应用在跑」的目录。
+        以前不管迁哪个都要求两个应用都退 —— 只想迁国际版也做不到。
+      */}
       {plan?.platformNote && (
         <Alert>
           <AlertDescription>{plan.platformNote}</AlertDescription>
         </Alert>
       )}
 
-      {plan && plan.blocking.length > 0 && (
+      {heldSelected.length > 0 && (
         <Alert variant="destructive">
           <AlertTriangle className="size-4" />
           <AlertDescription>
-            {plan.blockedReason}
+            要迁的目录里有 {heldSelected.length} 个正被应用占用，先退掉
+            <span className="font-medium">
+              {" "}
+              {Array.from(new Set(heldSelected.flatMap((d) => d.heldBy))).join(" / ")}{" "}
+            </span>
+            再迁移（托盘图标右键 → 退出，窗口关掉不够）。
+            <span className="font-medium">另一个版本不用关</span>；
+            把被占用的那几行取消勾选，也能立刻开迁。
             <br />
-            检测到正在运行：<span className="font-medium">{plan.blocking.join(" / ")}</span>
+            被占用：<span className="font-medium">{heldSelected.map((d) => d.label).join("、")}</span>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {heldSelected.length === 0 && plan && plan.blocking.length > 0 && (
+        <Alert>
+          <AlertDescription>
+            {plan.blocking.map((p) => (p === "WorkBuddyAI.exe" ? "国际版" : "国内版")).join(" / ")}
+            在运行，但不在本次要迁移的目录里 —— <span className="font-medium">不影响，可以直接迁</span>。
           </AlertDescription>
         </Alert>
       )}
@@ -703,10 +742,20 @@ export default function CacheMovePage() {
                         <span
                           className={cn(
                             "shrink-0 text-[11px]",
-                            o.on ? "text-muted-foreground/70" : "text-muted-foreground/45",
+                            !o.on
+                              ? "text-muted-foreground/45"
+                              : d.held
+                                ? "font-medium text-amber-600"
+                                : "text-muted-foreground/70",
                           )}
                         >
-                          {!o.on ? "本次跳过" : usingDefault ? "用默认位置" : "单独位置"}
+                          {!o.on
+                            ? "本次跳过"
+                            : d.held
+                              ? "应用在跑，先退出"
+                              : usingDefault
+                                ? "用默认位置"
+                                : "单独位置"}
                         </span>
                       </div>
 
@@ -778,6 +827,7 @@ export default function CacheMovePage() {
               disabled={
                 Boolean(blocked) ||
                 included.length === 0 ||
+                anyHeldSelected ||
                 stage === "running" ||
                 rootsUsed.some((g) => !g.root) ||
                 spaceIssues.length > 0
@@ -795,7 +845,9 @@ export default function CacheMovePage() {
                 ? "所有目录都已经是联接，无需迁移"
                 : included.length === 0
                   ? "先勾选要迁移的目录"
-                  : `将迁移 ${included.length} 个目录 · ${includedText}`}
+                  : anyHeldSelected
+                    ? `有 ${heldSelected.length} 个目录被应用占用，先退出或取消勾选`
+                    : `将迁移 ${included.length} 个目录 · ${includedText}`}
             </span>
           </div>
 
@@ -1015,8 +1067,8 @@ export default function CacheMovePage() {
             <div className="flex items-start gap-2 text-xs leading-5 text-muted-foreground">
               <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
               <span>
-                迁移期间确保 WorkBuddy 已完全退出，并且不要中途启动它。源目录不会删除，只是改名成 <code>.moved-*</code>{" "}
-                保留，之后可以清理或回滚。
+                复制期间不要中途启动上面列出的那几个应用（没在列表里的版本不用管，可以照常开着）。
+                源目录不会删除，只是改名成 <code>.moved-*</code> 保留，之后可以清理或回滚。
               </span>
             </div>
           </div>

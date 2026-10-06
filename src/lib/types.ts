@@ -749,6 +749,10 @@ export interface CacheDirStatus {
   bytes: number;
   movable: boolean;
   sizeText: string;
+  /** 这个目录的持有者应用此刻在跑（迁它之前必须先退掉那个应用）。 */
+  held: boolean;
+  /** 持有者进程名（held 为真时），如 WorkBuddy.exe。 */
+  heldBy: string[];
 }
 
 export interface CacheMoveDrive {
