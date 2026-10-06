@@ -209,6 +209,50 @@ fn scan(p: &Path) -> (u64, u64) {
     (files, bytes)
 }
 
+/// 「复制 + 校验」这一轮的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyVerdict {
+    /// 目标与「复制完成时的源」一致 —— 可以改名建联接了。
+    Ok,
+    /// 目标对不上，但还没到重试上限 —— 增量再拷一轮。
+    Recopy,
+    /// 源在复制期间被持续写入，重拷到上限仍不收敛。
+    SourceBusy,
+    /// 源压根没动过，目标就是不一样 —— 真的出问题了。
+    Mismatch,
+}
+
+/// 复制完成后怎么走。
+///
+/// 🔴 **为什么不能只比「复制前的源快照」**：源目录可能**在复制期间被写入**
+/// （客户端没退干净，或者复制中途被打开）。只要源动过一次，快照就过期，
+/// 严格相等必然失败 —— 用户看到的是「副本校验不一致（文件 N→N，字节 A→B）」，
+/// 完全看不出真正原因，而数据其实是好的。
+/// 实测（2026-10-06）：报错时目标字节数**比快照还多** 1,214,959 ——
+/// 目标只会由 robocopy 写，多出来的唯一解释就是源在复制期间长大了。
+///
+/// 所以判定以**复制完成时的源**为准；对不上先增量重拷（robocopy 只搬变化的
+/// 部分，第二轮通常只要几十秒），最多 `MAX_ATTEMPTS` 轮再报错。
+fn classify_copy_result(
+    before: (u64, u64),
+    src_now: (u64, u64),
+    dst: (u64, u64),
+    attempt: u32,
+) -> CopyVerdict {
+    const MAX_ATTEMPTS: u32 = 3;
+    if dst == src_now {
+        return CopyVerdict::Ok;
+    }
+    if attempt < MAX_ATTEMPTS {
+        return CopyVerdict::Recopy;
+    }
+    if src_now != before {
+        CopyVerdict::SourceBusy
+    } else {
+        CopyVerdict::Mismatch
+    }
+}
+
 /// 目录是否非空（迁移后的可读性探测）。
 fn dir_has_entries(p: &Path) -> bool {
     std::fs::read_dir(p)
@@ -608,7 +652,7 @@ fn migrate_one(
     }
 
     emit(progress, "scan", &format!("统计 {name}"), idx, total, at(1));
-    let (nf, nb) = scan(&src);
+    let (mut nf, mut nb) = scan(&src);
     if nf == 0 && nb == 0 {
         push_log(&mut logs, label, false, "目录为空，跳过以免误操作".to_string());
         return (false, logs, None);
@@ -622,21 +666,81 @@ fn migrate_one(
         total,
         at(2),
     );
-    if let Err(e) = robocopy(&src, &dst) {
-        push_log(&mut logs, label, false, e);
-        return (false, logs, None);
-    }
 
-    emit(progress, "verify", &format!("校验 {name}"), idx, total, at(3));
-    let (df, db) = scan(&dst);
-    if (df, db) != (nf, nb) {
-        push_log(
-            &mut logs,
-            label,
-            false,
-            format!("副本校验不一致（文件 {nf}→{df}，字节 {nb}→{db}）。源目录未改动。"),
-        );
-        return (false, logs, None);
+    // 复制 → 校验 →（必要时）增量重拷。判定规则见 `classify_copy_result`。
+    let mut attempt: u32 = 0;
+    let mut src_moved = false;
+    loop {
+        attempt += 1;
+        if attempt > 1 {
+            emit(
+                progress,
+                "copy",
+                &format!("重拷 {name}（第 {attempt} 轮 · 上次源目录被改动）"),
+                idx,
+                total,
+                at(2),
+            );
+        }
+        if let Err(e) = robocopy(&src, &dst) {
+            push_log(&mut logs, label, false, e);
+            return (false, logs, None);
+        }
+
+        emit(progress, "verify", &format!("校验 {name}"), idx, total, at(3));
+        let (sf, sb) = scan(&src);
+        let (df, db) = scan(&dst);
+        if (sf, sb) != (nf, nb) {
+            src_moved = true;
+        }
+
+        match classify_copy_result((nf, nb), (sf, sb), (df, db), attempt) {
+            CopyVerdict::Ok => {
+                if attempt > 1 {
+                    push_log(
+                        &mut logs,
+                        label,
+                        true,
+                        if src_moved {
+                            format!("复制期间源目录被写入过，已自动重拷 {attempt} 轮对齐")
+                        } else {
+                            format!("上一次有文件没搬全，已自动重拷 {attempt} 轮补齐")
+                        },
+                    );
+                }
+                nf = sf;
+                nb = sb;
+                break;
+            }
+            CopyVerdict::Recopy => {
+                nf = sf;
+                nb = sb;
+                continue;
+            }
+            CopyVerdict::SourceBusy | CopyVerdict::Mismatch => {
+                let (procs, _) = running_procs();
+                let hint = if procs.is_empty() {
+                    "请确认客户端已完全退出后重试。".to_string()
+                } else {
+                    format!(
+                        "{} 正在运行 —— 请完全退出（托盘图标右键 → 退出，两个应用都退）后重试。",
+                        procs.join(" / ")
+                    )
+                };
+                let why = if matches!(
+                    classify_copy_result((nf, nb), (sf, sb), (df, db), attempt),
+                    CopyVerdict::SourceBusy
+                ) {
+                    format!(
+                        "复制期间源目录被持续写入（文件 {nf}→{sf}，字节 {nb}→{sb}），                         已自动增量重拷 {attempt} 轮仍未收敛。{hint}"
+                    )
+                } else {
+                    format!("副本校验不一致（文件 {sf}→{df}，字节 {sb}→{db}）。{hint}")
+                };
+                push_log(&mut logs, label, false, format!("{why}源目录未改动。"));
+                return (false, logs, None);
+            }
+        }
     }
 
     let backup = backup_path_for(&src);
@@ -1388,6 +1492,43 @@ pub fn verify() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 判定规则：目标 == 复制完成时的源 → 通过（哪怕源在复制期间被写过）。
+    #[test]
+    fn classify_ok_when_dst_matches_live_src() {
+        // 源复制期间从 100 长到 200，目标也是 200 —— 数据是齐的，只是快照过期
+        assert_eq!(
+            classify_copy_result((10, 100), (10, 200), (10, 200), 1),
+            CopyVerdict::Ok
+        );
+    }
+
+    /// 目标对不上、还没到上限 → 增量重拷，而不是直接报「不一致」。
+    #[test]
+    fn classify_recopies_before_giving_up() {
+        assert_eq!(
+            classify_copy_result((10, 100), (10, 200), (10, 100), 1),
+            CopyVerdict::Recopy
+        );
+        // 源没动过也对不上（比如上次有文件被占用没搬全）—— 同样先重拷
+        assert_eq!(
+            classify_copy_result((10, 100), (10, 100), (9, 99), 2),
+            CopyVerdict::Recopy
+        );
+    }
+
+    /// 重拷到上限：源一直在动 → 说「源被写入」；源没动 → 说「真的不一致」。
+    #[test]
+    fn classify_distinguishes_busy_source_from_broken_copy() {
+        assert_eq!(
+            classify_copy_result((10, 100), (10, 300), (10, 100), 3),
+            CopyVerdict::SourceBusy
+        );
+        assert_eq!(
+            classify_copy_result((10, 100), (10, 100), (9, 99), 3),
+            CopyVerdict::Mismatch
+        );
+    }
 
     /// 造一棵「像真备份那样」的树：深层嵌套 + 只读文件 + 隐藏文件。
     fn make_tree(root: &Path) {
