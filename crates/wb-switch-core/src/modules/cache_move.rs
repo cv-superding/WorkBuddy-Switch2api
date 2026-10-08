@@ -704,6 +704,12 @@ fn robocopy_pending(src: &Path, dst: &Path) -> Result<u64, String> {
 /// 判断 robocopy 列出的这一行是不是**源树里的**文件。
 ///
 /// 比对时统一处理盘符大小写、结尾分隔符、以及长路径的 `\\?\` 前缀。
+///
+/// 🔴 **必须 cfg 到 Windows**：它只被 Windows 版的 `robocopy_pending` 调用，
+/// 而 CI 用的 `actions-rust-lang/setup-rust-toolchain` **默认带 `-D warnings`** ——
+/// 不加这个 cfg，mac/linux 上它就是死代码，警告直接变错误、整个构建挂掉。
+/// （v1.5.0 首次发布就是这么挂的：win-x64 过、linux/mac 全失败。）
+#[cfg(target_os = "windows")]
 fn is_under_root(line: &str, root: &Path) -> bool {
     let line = line.trim().trim_start_matches(r"\\?\");
     let root = root.to_string_lossy();
@@ -1759,6 +1765,10 @@ mod tests {
     ///
     /// 2026-10-08 实测：列表里 7810 行中 7644 行是 `F:\.WBcache\...`（目标侧），
     /// 真正的待复制只有 166 个 —— 不筛就永远收敛不了、迁移永远报失败。
+    ///
+    /// cfg 到 Windows 是因为被测的 `is_under_root` 本身只在 Windows 分支存在
+    /// （见它的文档注释）。
+    #[cfg(target_os = "windows")]
     #[test]
     fn pending_only_counts_paths_under_source() {
         let src = Path::new(r"C:\Users\me\.workbuddy");
