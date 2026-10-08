@@ -43,7 +43,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::modules::{config, edition::Edition, process};
+use crate::modules::{config, edition::Edition};
+// ⚠️ 只在 Windows 上用得到。写成条件导入是必须的 —— 非 Windows 上多一个未使用的
+// import，CI 的 `-D warnings` 就会直接把 mac/linux 构建打挂（v1.0.4 栽过一次）。
+#[cfg(target_os = "windows")]
+use crate::modules::process;
 
 /// 控制更新源的用户级环境变量（asar 里明确写了它优先级最高）。
 pub const UPDATE_URL_ENV: &str = "WORKBUDDY_UPDATE_URL";
@@ -510,6 +514,28 @@ mod winenv {
 
 // ---------------------------------------------------------------- 对外接口
 
+/// 当前在跑的客户端进程名。
+///
+/// 非 Windows 上不探测：这一页本身只在 Windows 上有意义（要写注册表），
+/// 而 `process::windows_tasklist_image_rows` 是 Windows 专属的 ——
+/// 无条件调用会让 mac/linux 构建直接编译失败（v1.0.17 首推时就是这么挂的）。
+fn running_clients() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut out = Vec::new();
+        for img in ["WorkBuddy.exe", "WorkBuddyAI.exe"] {
+            if !process::windows_tasklist_image_rows(img).is_empty() {
+                out.push(img.to_string());
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
 /// 只读体检。
 pub fn status() -> GuardStatus {
     let supported = cfg!(target_os = "windows");
@@ -530,13 +556,7 @@ pub fn status() -> GuardStatus {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "（读不到 LOCALAPPDATA）".to_string());
     let cache_active = cache_files.iter().any(|f| is_active_package(&f.name));
-
-    let mut running = Vec::new();
-    for img in ["WorkBuddy.exe", "WorkBuddyAI.exe"] {
-        if !process::windows_tasklist_image_rows(img).is_empty() {
-            running.push(img.to_string());
-        }
-    }
+    let running = running_clients();
 
     GuardStatus {
         supported,
