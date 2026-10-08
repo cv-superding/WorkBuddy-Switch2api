@@ -5,6 +5,7 @@ import type {
   TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals, TravelConfig, TravelStatus,
   UsageBucket,
   CacheMovePlan, CacheVerifyResult,
+  UpdateGuardStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
 
@@ -487,6 +488,70 @@ function cacheVerify(): CacheVerifyResult {
   return { dirs: plan.dirs, blocking: [], warnings: [], backups: [] };
 }
 
+/**
+ * 更新防护演示数据。
+ *
+ * 刻意摆成「刚被更新包覆盖过」的样子：缓存里躺着一个已下载的包，
+ * 而两个安装目录里都同时有两个启动器 exe、身份却都是国际版 ——
+ * 这正是 2026-10-08 那次事故的指纹，截图里能一眼看出问题。
+ */
+function updateGuardStatus(): UpdateGuardStatus {
+  return {
+    supported: true,
+    platformNote: null,
+    disabled: false,
+    envName: "WORKBUDDY_UPDATE_URL",
+    envValue: null,
+    blackhole: "http://127.0.0.1:1",
+    cacheDir: "C:\\Users\\demo\\AppData\\Local\\@genieworkbuddy-desktop-updater",
+    cacheExists: true,
+    cacheFiles: [
+      {
+        name: "installer.exe",
+        bytes: 498569856,
+        sizeText: "475.5 MB",
+        modified: "2026-10-08 15:37",
+      },
+      {
+        name: "installer.exe.quarantine-20261001-231621",
+        bytes: 551277352,
+        sizeText: "525.7 MB",
+        modified: "2026-10-01 20:54",
+      },
+    ],
+    cacheBytes: 1049847208,
+    cacheText: "1001.3 MB",
+    cacheActive: true,
+    installs: [
+      {
+        dir: "F:\\AdobeAll\\WorkBuddy",
+        edition: "international",
+        label: "国际版",
+        dataDirName: ".workbuddy-ai",
+        endpoint: "https://www.workbuddy.ai",
+        isOversea: true,
+        version: "37.10.3-24",
+        exes: ["WorkBuddy.exe", "WorkBuddyAI.exe"],
+        warning:
+          "这个目录里 WorkBuddy.exe / WorkBuddyAI.exe 都在，但身份是国际版 —— 用另一个名字的 exe 启动也会按国际版跑。",
+      },
+      {
+        dir: "F:\\AdobeAll\\WB-Overseas",
+        edition: "international",
+        label: "国际版",
+        dataDirName: ".workbuddy-ai",
+        endpoint: "https://www.workbuddy.ai",
+        isOversea: true,
+        version: "37.10.3-24",
+        exes: ["WorkBuddy.exe", "WorkBuddyAI.exe"],
+        warning:
+          "这个目录里 WorkBuddy.exe / WorkBuddyAI.exe 都在，但身份是国际版 —— 用另一个名字的 exe 启动也会按国际版跑。",
+      },
+    ],
+    running: [],
+  };
+}
+
 function proxyModels(): ProxyModels {
   const cn = ["auto", "hy4-preview", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "kimi-k3-1", "minimax-m3"];
   const intl = ["auto", "claude-sonnet-4.5", "gpt-5.2-codex", "gemini-3-pro", "deepseek-v4-pro"];
@@ -605,6 +670,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "cache_move_plan": return cacheMovePlan();
     case "cache_move_verify": return cacheVerify();
     case "cache_move_backups": return { backups: [] };
+    case "update_guard_status": return updateGuardStatus();
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }

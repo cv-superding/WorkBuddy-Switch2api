@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
     edition::Edition, export_import,
-    oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
+    oauth, process, refresh, rotate, session, switch, token_stats, travel, update, update_guard,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -110,6 +110,12 @@ pub fn router() -> Router {
         .route(
             "/api/update/config",
             get(api_update_config).post(api_save_update_config),
+        )
+        .route("/api/update-guard/status", get(api_update_guard_status))
+        .route("/api/update-guard/set", post(api_update_guard_set))
+        .route(
+            "/api/update-guard/clear-cache",
+            post(api_update_guard_clear_cache),
         )
         .fallback(static_handler)
 }
@@ -610,6 +616,53 @@ async fn api_save_update_config(Json(body): Json<Value>) -> Response {
     match update::save_github_config(&body) {
         Ok(()) => json_ok(json!({ "ok": true, "config": update::load_github_config() })),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 更新防护
+//
+// WorkBuddy 的更新缓存按用户共用、不分产品，A 版下载的包会被 B 版套用并把对方
+// 程序目录覆盖掉。这里把更新源指到黑洞 + 隔离已下载的包。
+// 要读写注册表、扫安装目录，一律 spawn_blocking。
+// ---------------------------------------------------------------------------
+
+async fn api_update_guard_status() -> Response {
+    match tokio::task::spawn_blocking(update_guard::status).await {
+        Ok(s) => json_ok(
+            serde_json::to_value(s).unwrap_or_else(|e| json!({ "error": e.to_string() })),
+        ),
+        Err(e) => json_err(
+            format!("读取更新防护状态异常：{e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+async fn api_update_guard_set(Json(body): Json<Value>) -> Response {
+    let disabled = body.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let clear = body
+        .get("clearCache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match tokio::task::spawn_blocking(move || update_guard::set_disabled(disabled, clear)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("设置更新防护异常：{e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+async fn api_update_guard_clear_cache() -> Response {
+    match tokio::task::spawn_blocking(update_guard::clear_cache).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("清理更新缓存异常：{e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 

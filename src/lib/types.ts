@@ -849,3 +849,58 @@ export interface CacheMoveCleanupResult {
   removed: string[];
   logs: CacheMoveStep[];
 }
+
+// ---------------------------------------------------------------------------
+// 更新防护
+// ---------------------------------------------------------------------------
+
+export interface UpdateGuardCacheFile {
+  name: string;
+  bytes: number;
+  sizeText: string;
+  modified: string;
+}
+
+/** 一个 WorkBuddy 安装目录的身份（从 product.json 读出来）。 */
+export interface UpdateGuardInstall {
+  dir: string;
+  /** "domestic" | "international"；读不到就是 null。 */
+  edition: string | null;
+  label: string;
+  dataDirName: string | null;
+  endpoint: string | null;
+  isOversea: boolean | null;
+  version: string | null;
+  /** 目录里存在哪些启动器 exe。 */
+  exes: string[];
+  /** 身份与目录里的 exe 对不上时的提醒。 */
+  warning: string | null;
+}
+
+export interface UpdateGuardStatus {
+  supported: boolean;
+  platformNote: string | null;
+  /** 总开关：是否已禁用更新。 */
+  disabled: boolean;
+  envName: string;
+  envValue: string | null;
+  blackhole: string;
+  cacheDir: string;
+  cacheExists: boolean;
+  cacheFiles: UpdateGuardCacheFile[];
+  cacheBytes: number;
+  cacheText: string;
+  /** 缓存里还有「会被应用」的包。 */
+  cacheActive: boolean;
+  installs: UpdateGuardInstall[];
+  running: string[];
+}
+
+export interface UpdateGuardActionResult {
+  ok: boolean;
+  disabled?: boolean;
+  quarantined: string[];
+  freed: number;
+  freedText: string;
+  status: UpdateGuardStatus;
+}

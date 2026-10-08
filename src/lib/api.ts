@@ -46,6 +46,8 @@ import type {
   CacheMoveCleanupResult,
   CacheBackupItem,
   CacheVerifyResult,
+  UpdateGuardStatus,
+  UpdateGuardActionResult,
 } from "./types";
 import { EDITIONS } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
@@ -85,6 +87,8 @@ const DEMO_READ_COMMANDS = new Set([
   "get_proxy_config", "get_proxy_status", "get_proxy_usage", "get_proxy_models",
   // 缓存迁移页：体检 / 验证 / 备份列表是只读的
   "cache_move_plan", "cache_move_verify", "cache_move_backups",
+  // 更新防护页：状态是只读的（开关本身在演示模式下不可用）
+  "update_guard_status",
 ]);
 
 export function isDemoMode(): boolean {
@@ -156,6 +160,9 @@ const ROUTES: Record<string, Route> = {
   save_github_config: { method: "POST", path: "/api/update/config" },
   check_update: { method: "GET", path: "/api/update/check" },
   switch_progress: { method: "GET", path: "/api/switch/progress" },
+  update_guard_status: { method: "GET", path: "/api/update-guard/status" },
+  update_guard_set: { method: "POST", path: "/api/update-guard/set" },
+  update_guard_clear_cache: { method: "POST", path: "/api/update-guard/clear-cache" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -721,4 +728,35 @@ export function cacheMoveCleanup(
  */
 export function cacheMoveOpen(path: string): Promise<void> {
   return call("cache_move_open", { path });
+}
+
+// ---------------------------------------------------------------------------
+// 更新防护
+// ---------------------------------------------------------------------------
+
+/**
+ * 只读体检：开关状态 + 更新缓存内容 + 两个安装目录的身份。
+ *
+ * 要读注册表、扫安装目录，可能几百毫秒。
+ */
+export function updateGuardStatus(): Promise<UpdateGuardStatus> {
+  return call("update_guard_status");
+}
+
+/**
+ * 开/关「禁止 WorkBuddy 自动更新」。
+ *
+ * 开的时候会把更新源指到黑洞（用户级 `WORKBUDDY_UPDATE_URL`），并默认顺带
+ * 隔离缓存里已下载的包 —— 只设环境变量拦不住已经下好的包。
+ */
+export function updateGuardSet(
+  disabled: boolean,
+  clearCache = true,
+): Promise<UpdateGuardActionResult> {
+  return call("update_guard_set", { disabled, clearCache });
+}
+
+/** 只隔离缓存里已下载的包，不动开关。 */
+export function updateGuardClearCache(): Promise<UpdateGuardActionResult> {
+  return call("update_guard_clear_cache");
 }

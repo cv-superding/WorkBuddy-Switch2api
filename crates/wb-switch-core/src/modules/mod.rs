@@ -23,6 +23,7 @@ pub mod token_stats;
 pub mod transfer;
 pub mod travel;
 pub mod update;
+pub mod update_guard;
 pub mod vscode_cn_inject;
 pub mod zipreader;
 pub mod zipwriter;

@@ -14,6 +14,7 @@ use wb_switch_core::modules::{
     credit_usage, credits,
     edition::{edition_of, parse_lenient, Edition}, export_import, oauth,
     process, proxy, refresh, rotate, session, switch, token_stats, transfer, travel, update,
+    update_guard,
 };
 
 #[derive(Serialize)]
@@ -867,6 +868,42 @@ pub async fn cache_move_open(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || cache_move::open_path(&path))
         .await
         .map_err(|e| format!("打开目录异常：{e}"))?
+}
+
+// ---------------------------------------------------------------------------
+// 更新防护
+//
+// WorkBuddy 的更新缓存按用户共用、不分产品，A 版下载的包会被 B 版套用，
+// 把对方程序目录覆盖掉（2026-10-01 / 10-08 各发生一次）。这里把更新源指到黑洞
+// 并隔离已下载的包。要读写注册表 + 扫安装目录，挪到阻塞线程池。
+
+/// GET /api/update-guard/status —— 只读：开关状态 + 缓存内容 + 两个安装目录的身份。
+#[tauri::command]
+pub async fn update_guard_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        serde_json::to_value(update_guard::status())
+            .unwrap_or_else(|e| json!({ "error": e.to_string() }))
+    })
+    .await
+    .map_err(|e| format!("读取更新防护状态异常：{e}"))
+}
+
+/// POST /api/update-guard/set —— 开/关更新防护；开启时可顺带隔离已下载的包。
+#[tauri::command]
+pub async fn update_guard_set(disabled: bool, clear_cache: Option<bool>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        update_guard::set_disabled(disabled, clear_cache.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| format!("设置更新防护异常：{e}"))?
+}
+
+/// POST /api/update-guard/clear-cache —— 只隔离缓存里已下载的包，不动开关。
+#[tauri::command]
+pub async fn update_guard_clear_cache() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(update_guard::clear_cache)
+        .await
+        .map_err(|e| format!("清理更新缓存异常：{e}"))?
 }
 
 /// POST /api/transfer/export —— 把选中的工作区 + 配置打成一个 zip。
