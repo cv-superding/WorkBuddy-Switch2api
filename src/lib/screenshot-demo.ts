@@ -499,9 +499,9 @@ function updateGuardStatus(): UpdateGuardStatus {
   return {
     supported: true,
     platformNote: null,
-    disabled: false,
+    disabled: true,
     envName: "WORKBUDDY_UPDATE_URL",
-    envValue: null,
+    envValue: "http://127.0.0.1:1",
     blackhole: "http://127.0.0.1:1",
     cacheDir: "C:\\Users\\demo\\AppData\\Local\\@genieworkbuddy-desktop-updater",
     cacheExists: true,

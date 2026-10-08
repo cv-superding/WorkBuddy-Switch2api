@@ -185,6 +185,54 @@ export default function UpdateGuardPage() {
         </Alert>
       )}
 
+      {/*
+        一眼给结论 —— 之前状态拆在两张卡片里（开关说「已启用」、缓存说「有待处理的包」），
+        到底生效没有得自己拼，用户会来问「成功了嘛」。这里直接下判断。
+      */}
+      {status?.supported && (
+        disabled ? (
+          cacheActive ? (
+            <Alert variant="destructive">
+              <AlertTriangle className="size-4" />
+              <AlertDescription>
+                <span className="font-medium">防护只生效了一半。</span>
+                更新源已经指向黑洞、不会再下载新包，但缓存里还留着
+                <span className="font-medium">
+                  {" "}
+                  {status.cacheFiles.filter((f) => !f.name.includes(".disabled-") && !f.name.includes(".quarantine-")).length}{" "}
+                  个会被应用的包
+                </span>
+                {" "}—— 它们不看更新源地址，应用启动时照样可能被套用。
+                <span className="mt-2 flex">
+                  <Button size="sm" variant="outline" onClick={() => void clearCache()} disabled={busy || demo}>
+                    <Trash2 className="size-3.5" />
+                    立即隔离
+                  </Button>
+                </span>
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <Alert className="border-emerald-200 bg-emerald-50/60">
+              <CheckCircle2 className="size-4 text-emerald-600" />
+              <AlertDescription className="text-emerald-800">
+                <span className="font-medium">防护已完全生效。</span>
+                更新源指向黑洞（不会下载新包），缓存里也没有待处理的包。
+                重启两个应用后彻底生效。
+              </AlertDescription>
+            </Alert>
+          )
+        ) : (
+          <Alert>
+            <AlertDescription>
+              <span className="font-medium">还没开启。</span>
+              {cacheActive
+                ? "缓存里已经有下载好的包，随时可能被应用 —— 建议打开下面的开关。"
+                : "目前 WorkBuddy 会自己检查并安装更新。"}
+            </AlertDescription>
+          </Alert>
+        )
+      )}
+
       {status?.platformNote && (
         <Alert>
           <AlertDescription>{status.platformNote}</AlertDescription>
