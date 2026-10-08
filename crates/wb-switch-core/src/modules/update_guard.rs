@@ -55,8 +55,29 @@ pub const UPDATE_URL_ENV: &str = "WORKBUDDY_UPDATE_URL";
 /// 黑洞地址：连不上、也永远不会返回更新信息。
 pub const BLACKHOLE: &str = "http://127.0.0.1:1";
 
-/// 共用的更新缓存目录名（Electron updater 按 appId 生成，实测就是这个名字）。
+/// 🚨 **更新包会被暂存到两个地方，两个都要管**。
+///
+/// 2026-10-08 实测：只盯第 1 个是不够的 —— 真正被启动安装的是第 2 个里的 NSIS 包。
+/// 日志原文（`~/.workbuddy/logs/update/update-<date>.log`）：
+///
+/// ```text
+/// [win32] Update downloaded:  ...\AppData\Local\Temp\workbuddy-update-x64\WorkBuddy-Setup-5.7.6.40409493.exe
+/// [win32] Restored downloaded update from cache: version=5.7.6.40409493
+/// [win32] Launching installer: ...\Temp\workbuddy-update-x64\WorkBuddy-Setup-5.7.6.40409493.exe
+/// [win32] Using NSIS silent mode (/S --updated /UPDATE=1 /D=<安装目录>)
+/// ```
 const CACHE_DIR_NAME: &str = "@genieworkbuddy-desktop-updater";
+
+/// `%TEMP%` 下自定义 updater 的暂存目录前缀（实测 `workbuddy-update-x64`）。
+const TEMP_STAGING_PREFIX: &str = "workbuddy-update";
+
+/// 🔴 **`product.json` 里控制「启动时静默强制更新」的开关** ——
+/// 就是今晚把 5.7.6 装上去的那条路径。日志原文：
+/// `[early-silent-startup-update] enabled=true source=product-base`
+///
+/// 它是**每份安装各自**的配置，所以这里能做到真正的「按版本」禁用，
+/// 而不像环境变量那样只能全局。默认值是 `true`。
+const STARTUP_UPDATE_KEY: &str = "startupForceAutoUpdate";
 
 /// 隔离已下载包时加的后缀。
 const QUARANTINE_MARK: &str = ".disabled-";
@@ -69,6 +90,8 @@ const PRODUCT_JSON_REL: &str = "resources/app.asar.unpacked/cli/product.json";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheFile {
+    /// 所在暂存目录（两个位置里的哪一个）。
+    pub dir: String,
     pub name: String,
     pub bytes: u64,
     pub size_text: String,
@@ -89,6 +112,8 @@ pub struct InstallInfo {
     pub version: Option<String>,
     /// 目录里存在哪些启动器 exe。
     pub exes: Vec<String>,
+    /// `updates.startupForceAutoUpdate` 的当前值 —— `false` 才是「已禁用启动静默更新」。
+    pub startup_update: Option<bool>,
     /// 身份与「国内版」这个档位不符时的提醒（非空即值得注意）。
     pub warning: Option<String>,
 }
@@ -104,14 +129,16 @@ pub struct GuardStatus {
     pub env_value: Option<String>,
     /// 期望值（禁用时应等于它）。
     pub blackhole: String,
-    pub cache_dir: String,
-    pub cache_exists: bool,
+    /// 两个暂存目录（都列出来，别让用户以为只有一个）。
+    pub cache_dirs: Vec<String>,
     pub cache_files: Vec<CacheFile>,
     pub cache_bytes: u64,
     pub cache_text: String,
-    /// 缓存里还有「会被应用」的包（未隔离的 installer）。
+    /// 暂存目录里还有「会被应用」的包（未隔离的安装包）。
     pub cache_active: bool,
     pub installs: Vec<InstallInfo>,
+    /// 还没关掉「启动静默更新」的安装目录数。
+    pub installs_needing_patch: u32,
     pub running: Vec<String>,
 }
 
@@ -144,43 +171,58 @@ fn mtime_text(p: &Path) -> String {
 
 // ---------------------------------------------------------------- 更新缓存
 
-fn cache_dir() -> Option<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA").ok()?;
-    if local.trim().is_empty() {
-        return None;
+/// 所有会暂存更新包的位置。**两个都要**，缺一个就等于没防住。
+fn staging_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.trim().is_empty() {
+            let local = PathBuf::from(local);
+            // ① electron-updater 的缓存
+            out.push(local.join(CACHE_DIR_NAME));
+            // ② 自定义 updater 真正启动的那个 NSIS 包（`%TEMP%` 就在 LOCALAPPDATA 下）
+            let temp = local.join("Temp");
+            if let Ok(rd) = std::fs::read_dir(&temp) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                    if name.starts_with(TEMP_STAGING_PREFIX) {
+                        out.push(e.path());
+                    }
+                }
+            } else {
+                out.push(temp.join("workbuddy-update-x64"));
+            }
+        }
     }
-    Some(PathBuf::from(local).join(CACHE_DIR_NAME))
+    out
 }
 
-/// 列出缓存里的文件。`active` 判定：名字里不含隔离后缀。
-fn read_cache() -> (bool, Vec<CacheFile>, u64) {
-    let Some(dir) = cache_dir() else {
-        return (false, Vec::new(), 0);
-    };
-    if !dir.is_dir() {
-        return (false, Vec::new(), 0);
-    }
+/// 列出所有暂存目录里的文件。
+fn read_cache() -> (Vec<CacheFile>, u64) {
     let mut files: Vec<CacheFile> = Vec::new();
     let mut bytes = 0u64;
-    if let Ok(rd) = std::fs::read_dir(&dir) {
+    for dir in staging_dirs() {
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
             let p = e.path();
             let Ok(meta) = e.metadata() else { continue };
             if !meta.is_file() {
                 continue;
             }
-            let name = e.file_name().to_string_lossy().to_string();
             bytes += meta.len();
             files.push(CacheFile {
-                name,
+                dir: dir.to_string_lossy().to_string(),
+                name: e.file_name().to_string_lossy().to_string(),
                 bytes: meta.len(),
                 size_text: human(meta.len()),
                 modified: mtime_text(&p),
             });
         }
     }
-    files.sort_by(|a, b| a.name.cmp(&b.name));
-    (true, files, bytes)
+    files.sort_by(|a, b| (a.dir.clone(), a.name.clone()).cmp(&(b.dir.clone(), b.name.clone())));
+    (files, bytes)
 }
 
 /// 缓存里的这个文件**会不会被应用**：未隔离的安装包才算。
@@ -191,35 +233,102 @@ fn is_active_package(name: &str) -> bool {
     !name.contains(QUARANTINE_MARK) && name.to_ascii_lowercase().ends_with(".exe")
 }
 
-/// 把缓存里**未隔离**的包改名隔离掉（不动已经隔离过的）。
+/// 把所有暂存目录里**未隔离**的包改名隔离掉（不动已经隔离过的）。
 fn quarantine_cache() -> Result<(Vec<String>, u64), String> {
-    let Some(dir) = cache_dir() else {
-        return Err("读不到 LOCALAPPDATA，无法定位更新缓存目录。".to_string());
-    };
-    if !dir.is_dir() {
-        return Ok((Vec::new(), 0));
-    }
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let mut moved = Vec::new();
     let mut freed = 0u64;
-    let rd = std::fs::read_dir(&dir).map_err(|e| format!("读取缓存目录失败：{e}"))?;
-    for e in rd.flatten() {
-        let p = e.path();
-        let Ok(meta) = e.metadata() else { continue };
-        if !meta.is_file() {
+    for dir in staging_dirs() {
+        if !dir.is_dir() {
             continue;
         }
-        let name = e.file_name().to_string_lossy().to_string();
-        if name.contains(QUARANTINE_MARK) {
-            continue;
-        }
-        let dst = p.with_file_name(format!("{name}{QUARANTINE_MARK}{stamp}"));
-        if std::fs::rename(&p, &dst).is_ok() {
-            freed += meta.len();
-            moved.push(name);
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.contains(QUARANTINE_MARK) {
+                continue;
+            }
+            let dst = p.with_file_name(format!("{name}{QUARANTINE_MARK}{stamp}"));
+            if std::fs::rename(&p, &dst).is_ok() {
+                freed += meta.len();
+                moved.push(format!("{}（{}）", name, human(meta.len())));
+            }
         }
     }
     Ok((moved, freed))
+}
+
+// ---------------------------------------------------------------- 改 product.json
+
+/// 就地改 `updates.startupForceAutoUpdate`，返回改好的文本。
+///
+/// 🔴 **只做定点文本替换，不重新序列化整个文件** —— `product.json` 是程序的身份文件，
+/// 用 serde 读进来再写出去会打乱键序、抹掉原有格式，没必要冒这个险。
+///
+/// 🔴 **国际版实测根本没声明这个键**（`updates` 里只有 `apiVersion` / `download` / `checkVersion`），
+/// 所以「找不到就跳过」是不够的 —— 缺省行为不可控，得**显式补进去**才算关掉。
+/// 反过来，要「恢复更新」时若键本来就不存在，就什么都不做（别擅自塞一个 `true`，
+/// 那等于改了厂商默认行为）。
+fn patch_startup_flag(text: &str, disable_update: bool) -> Option<String> {
+    if let Some(out) = flip_existing_flag(text, disable_update) {
+        return Some(out);
+    }
+    if !disable_update {
+        return Some(text.to_string()); // 恢复更新 + 本来就没这个键 → 无需改动
+    }
+    insert_flag_into_updates(text)
+}
+
+/// 键存在时：把值改成想要的那个。
+fn flip_existing_flag(text: &str, disable_update: bool) -> Option<String> {
+    let key = format!("\"{STARTUP_UPDATE_KEY}\"");
+    let at = text.find(&key)?;
+    let after_key = &text[at + key.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = &after_key[colon + 1..];
+    let value_at = after_colon.find(|c: char| !c.is_whitespace())?;
+    let rest = &after_colon[value_at..];
+
+    let (from, to) = if rest.starts_with("false") {
+        ("false", "true")
+    } else if rest.starts_with("true") {
+        ("true", "false")
+    } else {
+        return None;
+    };
+    // `disable_update == true` 想看到的是 false。
+    let currently_false = from == "false";
+    if disable_update == currently_false {
+        return Some(text.to_string()); // 已经是想要的值，原样返回
+    }
+
+    let abs = at + key.len() + colon + 1 + value_at;
+    let mut out = String::with_capacity(text.len() + 1);
+    out.push_str(&text[..abs]);
+    out.push_str(to);
+    out.push_str(&text[abs + from.len()..]);
+    Some(out)
+}
+
+/// 键不存在时：插到 `"updates": {` 的第一项。JSON 键序无所谓，放最前面最省事。
+fn insert_flag_into_updates(text: &str) -> Option<String> {
+    let key = "\"updates\"";
+    let at = text.find(key)?;
+    let after = &text[at + key.len()..];
+    let brace = after.find('{')?;
+    let pos = at + key.len() + brace + 1;
+    let mut out = String::with_capacity(text.len() + STARTUP_UPDATE_KEY.len() + 12);
+    out.push_str(&text[..pos]);
+    out.push_str(&format!("\"{STARTUP_UPDATE_KEY}\": false,"));
+    out.push_str(&text[pos..]);
+    // 插完必须仍是合法 JSON，否则宁可不改。
+    serde_json::from_str::<Value>(&out).ok()?;
+    Some(out)
 }
 
 // ---------------------------------------------------------------- 安装目录发现
@@ -232,6 +341,12 @@ fn read_install(dir: &Path) -> Option<InstallInfo> {
     }
     let text = std::fs::read_to_string(&pj).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
+
+    // `updates.startupForceAutoUpdate` —— 启动静默强制更新的开关（默认 true）。
+    let startup_update = v
+        .get("updates")
+        .and_then(|u| u.get(STARTUP_UPDATE_KEY))
+        .and_then(|x| x.as_bool());
 
     let is_oversea = v.get("isOversea").and_then(|x| x.as_bool());
     let data_dir_name = v
@@ -289,8 +404,40 @@ fn read_install(dir: &Path) -> Option<InstallInfo> {
         is_oversea: Some(overseas),
         version,
         exes,
+        startup_update,
         warning,
     })
+}
+
+/// 把一份安装的 `updates.startupForceAutoUpdate` 改成想要的值。
+///
+/// 这是**按安装目录**生效的，所以能做到「只关国内版」或「两个都关」。
+/// 返回值：(是否真的改动了, 改动后的值)。改不动就 Err，让上层报给用户。
+fn apply_startup_flag(dir: &Path, disable_update: bool) -> Result<(bool, bool), String> {
+    let pj = dir.join(PRODUCT_JSON_REL);
+    if !pj.is_file() {
+        return Err(format!("找不到 {}", pj.to_string_lossy()));
+    }
+    let text = std::fs::read_to_string(&pj)
+        .map_err(|e| format!("读不了 {}：{e}", pj.to_string_lossy()))?;
+    let patched = patch_startup_flag(&text, disable_update).ok_or_else(|| {
+        format!(
+            "{} 里没有 {} 这个键（可能版本变了），没法用配置的方式关更新",
+            pj.to_string_lossy(),
+            STARTUP_UPDATE_KEY
+        )
+    })?;
+    if patched != text {
+        // 备份一次原文件，方便手动还原。
+        let bak = pj.with_extension("json.bak-switch");
+        if !bak.exists() {
+            let _ = std::fs::write(&bak, &text);
+        }
+        std::fs::write(&pj, &patched)
+            .map_err(|e| format!("写不了 {}：{e}", pj.to_string_lossy()))?;
+        return Ok((true, !disable_update));
+    }
+    Ok((false, !disable_update))
 }
 
 /// 候选父目录 → 逐个看一级子目录里有没有产品身份文件。
@@ -546,17 +693,27 @@ pub fn status() -> GuardStatus {
     };
 
     let env_value = winenv::get(UPDATE_URL_ENV).ok().flatten();
-    let disabled = env_value
+    let env_disabled = env_value
         .as_deref()
         .map(|v| v.trim() == BLACKHOLE)
         .unwrap_or(false);
 
-    let (cache_exists, cache_files, cache_bytes) = read_cache();
-    let cache_dir = cache_dir()
+    let (cache_files, cache_bytes) = read_cache();
+    let cache_dirs = staging_dirs()
+        .iter()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "（读不到 LOCALAPPDATA）".to_string());
+        .collect();
     let cache_active = cache_files.iter().any(|f| is_active_package(&f.name));
     let running = running_clients();
+    let installs = discover_installs();
+    // 还开着「启动静默更新」的安装数。这个是**真正**决定会不会被静默升级的开关
+    // （环境变量只挡得住新进程发起的检查，挡不住已下载的包在启动时被应用）。
+    let installs_needing_patch = installs
+        .iter()
+        .filter(|i| i.startup_update != Some(false))
+        .count() as u32;
+    // 两项都满足才算「防护生效」：更新源黑洞 + 没有安装还开着启动静默更新。
+    let disabled = env_disabled && installs_needing_patch == 0 && !installs.is_empty();
 
     GuardStatus {
         supported,
@@ -565,24 +722,48 @@ pub fn status() -> GuardStatus {
         env_name: UPDATE_URL_ENV.to_string(),
         env_value,
         blackhole: BLACKHOLE.to_string(),
-        cache_dir,
-        cache_exists,
+        cache_dirs,
         cache_files,
         cache_bytes,
         cache_text: human(cache_bytes),
         cache_active,
-        installs: discover_installs(),
+        installs,
+        installs_needing_patch,
         running,
     }
 }
 
-/// 开/关更新防护。`clear_cache` 为真时顺带隔离已下载的包。
+/// 开/关更新防护。
+///
+/// 「禁用」做三件事，**少一件都挡不住**（2026-10-08 实测教训）：
+///
+/// 1. 把 `WORKBUDDY_UPDATE_URL` 指到黑洞 —— 拦住*新进程*发起的更新检查。
+///    ⚠️ 对**已经在跑**的进程无效（进程环境在创建时就固定了），所以单靠它挡不住。
+/// 2. 把每份安装的 `updates.startupForceAutoUpdate` 改成 `false` ——
+///    关掉「启动时静默安装已下载的包」这条路径（今晚 5.7.6 就是走这条装上去的）。
+///    这个是**按安装目录**的，所以是真正的按版本生效。
+/// 3. 隔离两个暂存目录里已下载的包。
 pub fn set_disabled(disabled: bool, clear_cache: bool) -> Result<Value, String> {
     if !cfg!(target_os = "windows") {
         return Err("更新防护目前只支持 Windows。".to_string());
     }
     let mut quarantined: Vec<String> = Vec::new();
     let mut freed = 0u64;
+    let mut patched: Vec<String> = Vec::new();
+    let mut patch_errors: Vec<String> = Vec::new();
+
+    // 先改配置文件：这是真正管住「启动静默更新」的那一环，失败了要如实报出来。
+    for info in discover_installs() {
+        let dir = PathBuf::from(&info.dir);
+        match apply_startup_flag(&dir, disabled) {
+            Ok((changed, _)) => {
+                if changed {
+                    patched.push(info.label.clone());
+                }
+            }
+            Err(e) => patch_errors.push(e),
+        }
+    }
 
     if disabled {
         winenv::set(UPDATE_URL_ENV, BLACKHOLE)?;
@@ -603,11 +784,13 @@ pub fn set_disabled(disabled: bool, clear_cache: bool) -> Result<Value, String> 
         "quarantined": quarantined,
         "freed": freed,
         "freedText": human(freed),
+        "patched": patched,
+        "patchErrors": patch_errors,
         "status": status(),
     }))
 }
 
-/// 只隔离缓存里已下载的包，不动环境变量。
+/// 只隔离暂存目录里已下载的包，不动开关。
 pub fn clear_cache() -> Result<Value, String> {
     let (moved, freed) = quarantine_cache()?;
     Ok(json!({
@@ -638,7 +821,7 @@ mod tests {
         // 关键字段都要能算出来，不依赖机器上装没装 WorkBuddy。
         assert_eq!(s.env_name, UPDATE_URL_ENV);
         assert_eq!(s.blackhole, BLACKHOLE);
-        assert!(!s.cache_dir.is_empty());
+        assert!(!s.cache_dirs.is_empty());
         // 未启用时 disabled 必须是 false（除非用户自己设过黑洞地址）。
         if s.env_value.is_none() {
             assert!(!s.disabled);
@@ -676,6 +859,70 @@ mod tests {
         assert_eq!(human(0), "0 B");
         assert_eq!(human(1024), "1.0 KB");
         assert_eq!(human(1024 * 1024), "1.0 MB");
+    }
+
+    /// 🔴 这是本功能唯一真正管住「启动静默更新」的地方，必须只动那一个布尔值
+    /// —— `product.json` 是程序的身份文件，多改一个字节都可能出事。
+    #[test]
+    fn patch_startup_flag_is_surgical() {
+        let src = "{\n  \"applicationName\": \"workbuddy\",\n  \
+                   \"updates\": { \"apiVersion\": \"v2\", \"startupForceAutoUpdate\": true },\n  \
+                   \"dataFolderName\": \".workbuddy\"\n}";
+
+        let off = patch_startup_flag(src, true).expect("应当找得到这个键");
+        assert!(off.contains("\"startupForceAutoUpdate\": false"),
+                "应当被改成 false：{off}");
+        // 除那一个词之外，其余内容必须逐字节相同
+        assert_eq!(off.replace("false", "true"), src, "别的字节不许动");
+        assert_eq!(off.len(), src.len() + 1, "true→false 正好长 1");
+
+        // 已经是想要的值 → 原样返回（不算改动）
+        assert_eq!(patch_startup_flag(&off, true).as_deref(), Some(off.as_str()));
+
+        // 还原
+        assert_eq!(patch_startup_flag(&off, false).as_deref(), Some(src));
+
+        // 键不存在（版本变了）→ None，上层要如实报错，不能假装成功
+        assert!(patch_startup_flag("{\"updates\":{}}", true).is_none());
+        assert!(patch_startup_flag("{}", true).is_none());
+    }
+
+    /// 🔴 国际版实测**没有**声明这个键（`updates` 里只有 apiVersion/download/checkVersion）。
+    /// 缺省值不可控，所以必须显式补进去才算关掉；反过来恢复时不能擅自塞 `true`。
+    #[test]
+    fn patch_inserts_flag_when_absent() {
+        let src = "{\"updates\": {\"apiVersion\": \"v2\"}}";
+
+        let off = patch_startup_flag(src, true).expect("应当能补进去");
+        let v: Value = serde_json::from_str(&off).expect("补完必须仍是合法 JSON");
+        assert_eq!(
+            v.get("updates")
+                .and_then(|u| u.get(STARTUP_UPDATE_KEY))
+                .and_then(|x| x.as_bool()),
+            Some(false),
+            "补进去的值必须是 false：{off}"
+        );
+
+        // 恢复更新 + 本来就没这个键 → 原样返回，别擅自写一个 true
+        assert_eq!(patch_startup_flag(src, false).as_deref(), Some(src));
+
+        // 连 updates 都没有 → 放弃，由上层如实报错
+        assert!(patch_startup_flag("{}", true).is_none());
+        assert!(patch_startup_flag("{\"a\":1}", true).is_none());
+    }
+
+    /// 两个暂存目录都要覆盖到：只盯 `@genieworkbuddy-desktop-updater` 是不够的，
+    /// 真正被启动安装的 NSIS 包在 `%TEMP%\workbuddy-update-*` 里。
+    #[test]
+    fn staging_dirs_cover_both_locations() {
+        let dirs = staging_dirs();
+        if std::env::var("LOCALAPPDATA").is_ok() {
+            assert!(!dirs.is_empty(), "至少要能算出一个暂存目录");
+            assert!(
+                dirs.iter().any(|d| d.to_string_lossy().contains(CACHE_DIR_NAME)),
+                "必须包含 electron-updater 的缓存目录"
+            );
+        }
     }
 
     /// 注册表 FFI 的往返验证：写 → 读回 → 删。

@@ -855,6 +855,8 @@ export interface CacheMoveCleanupResult {
 // ---------------------------------------------------------------------------
 
 export interface UpdateGuardCacheFile {
+  /** 所在暂存目录（会暂存到两个位置）。 */
+  dir: string;
   name: string;
   bytes: number;
   sizeText: string;
@@ -873,6 +875,8 @@ export interface UpdateGuardInstall {
   version: string | null;
   /** 目录里存在哪些启动器 exe。 */
   exes: string[];
+  /** product.json 里 `updates.startupForceAutoUpdate`，false 才是已关掉启动静默更新。 */
+  startupUpdate: boolean | null;
   /** 身份与目录里的 exe 对不上时的提醒。 */
   warning: string | null;
 }
@@ -880,19 +884,21 @@ export interface UpdateGuardInstall {
 export interface UpdateGuardStatus {
   supported: boolean;
   platformNote: string | null;
-  /** 总开关：是否已禁用更新。 */
+  /** 总开关：更新源黑洞 + 所有安装都关掉了启动静默更新。 */
   disabled: boolean;
   envName: string;
   envValue: string | null;
   blackhole: string;
-  cacheDir: string;
-  cacheExists: boolean;
+  /** 会暂存更新包的所有目录（两个）。 */
+  cacheDirs: string[];
   cacheFiles: UpdateGuardCacheFile[];
   cacheBytes: number;
   cacheText: string;
-  /** 缓存里还有「会被应用」的包。 */
+  /** 暂存目录里还有「会被应用」的包。 */
   cacheActive: boolean;
   installs: UpdateGuardInstall[];
+  /** 还没关掉「启动静默更新」的安装数。 */
+  installsNeedingPatch: number;
   running: string[];
 }
 
@@ -902,5 +908,9 @@ export interface UpdateGuardActionResult {
   quarantined: string[];
   freed: number;
   freedText: string;
+  /** 被改了 product.json 的版本名。 */
+  patched?: string[];
+  /** 改 product.json 失败的原因。 */
+  patchErrors?: string[];
   status: UpdateGuardStatus;
 }

@@ -61,6 +61,23 @@ function InstallRow({ info }: { info: UpdateGuardInstall }) {
             启动器 <code className="rounded bg-muted px-1">{info.exes.join(" / ")}</code>
           </span>
         )}
+        {/* 这个开关才是真正决定「启动时会不会被静默升级」的那一个 */}
+        {info.startupUpdate !== null && (
+          <span
+            className={cn(
+              "flex items-center gap-1",
+              info.startupUpdate === false ? "text-emerald-700" : "text-amber-700",
+            )}
+          >
+            {info.startupUpdate === false ? (
+              <CheckCircle2 className="size-3" />
+            ) : (
+              <AlertTriangle className="size-3" />
+            )}
+            启动静默更新：
+            {info.startupUpdate === false ? "已关闭" : "开着"}
+          </span>
+        )}
       </div>
       {info.warning && (
         <div className="mt-2 flex items-start gap-1.5 rounded-md border border-amber-200 bg-amber-50/70 px-2.5 py-2 text-[11px] leading-5 text-amber-800">
@@ -109,12 +126,16 @@ export default function UpdateGuardPage() {
     try {
       const r = await api.updateGuardSet(disabledNext, clearCache);
       setStatus(r.status);
+      const bits: string[] = [];
+      if (disabledNext) bits.push("更新源已指向黑洞");
+      if (r.patched?.length) bits.push(`已关掉 ${r.patched.join(" / ")} 的启动静默更新`);
+      if (r.quarantined.length) bits.push(`隔离了 ${r.quarantined.length} 个已下载的包（${r.freedText}）`);
+      if (r.patchErrors?.length) {
+        toast.warning("有一处没改成", { description: r.patchErrors.join("；") });
+      }
       if (disabledNext) {
-        const extra = r.quarantined.length
-          ? `，并隔离了 ${r.quarantined.length} 个已下载的包（${r.freedText}）`
-          : "";
-        toast.success("已禁止自动更新", {
-          description: `更新源已指向黑洞${extra}。重启两个应用后生效。`,
+        toast.success("已开启更新防护", {
+          description: `${bits.join("，") || "无需改动"}。重启两个应用后彻底生效。`,
         });
       } else {
         toast.success("已恢复自动更新", { description: "重启两个应用后生效。" });
@@ -149,11 +170,14 @@ export default function UpdateGuardPage() {
   async function openCacheDir() {
     if (!status) return;
     if (demo) {
-      toast.message("演示模式不打开目录", { description: status.cacheDir });
+      toast.message("演示模式不打开目录", { description: status.cacheDirs.join("\n") });
       return;
     }
     try {
-      await api.cacheMoveOpen(status.cacheDir);
+      // 两个暂存目录都打开 —— 哪个里面有包就打开哪个最省事。
+      for (const d of status.cacheDirs) {
+        await api.cacheMoveOpen(d);
+      }
     } catch (e) {
       toast.error("打不开这个目录", { description: e instanceof Error ? e.message : String(e) });
     }
@@ -164,13 +188,18 @@ export default function UpdateGuardPage() {
       <h1 className="text-[28px] font-semibold tracking-tight">更新防护</h1>
       <p className="mt-2 text-sm leading-6 text-muted-foreground">
         WorkBuddy 的更新缓存是<span className="font-medium text-foreground">按用户放的、不分产品</span>
-        —— 国内版和国际版共用同一个{" "}
-        <code className="rounded bg-muted px-1 py-0.5">
-          %LOCALAPPDATA%\@genieworkbuddy-desktop-updater
-        </code>
-        。任一版本下载的安装包，另一个版本启动时看到「版本号更高」就会直接套用，
+        ，国内版和国际版共用同一套暂存目录。任一版本下载的安装包，另一个版本启动时看到
+        「版本号更高」就会直接套用，
         <span className="font-medium text-foreground">不校验包属于哪个产品</span>
         ，于是把对方的程序目录整个覆盖掉。
+      </p>
+      <p className="mt-2 text-sm leading-6 text-muted-foreground">
+        真正把包装上去的那一步叫
+        <span className="font-medium text-foreground">「启动静默更新」</span>
+        （<code className="rounded bg-muted px-1">updates.startupForceAutoUpdate</code>），
+        开关在每份安装的 <code className="rounded bg-muted px-1">cli/product.json</code> 里 ——
+        它<span className="font-medium text-foreground">不看更新源地址</span>
+        ，所以光设环境变量挡不住，必须一起关掉。
       </p>
     </header>
   );
@@ -186,48 +215,58 @@ export default function UpdateGuardPage() {
       )}
 
       {/*
-        一眼给结论 —— 之前状态拆在两张卡片里（开关说「已启用」、缓存说「有待处理的包」），
-        到底生效没有得自己拼，用户会来问「成功了嘛」。这里直接下判断。
+        一眼给结论。防护要三件事都成立才算数，缺一件都会漏：
+        ① 更新源黑洞  ② 每份安装都关掉「启动静默更新」  ③ 暂存目录里没有活包。
+        2026-10-08 实测漏了 ②③，结果 5.7.6 被静默装上了。
       */}
       {status?.supported && (
         disabled ? (
-          cacheActive ? (
-            <Alert variant="destructive">
-              <AlertTriangle className="size-4" />
-              <AlertDescription>
-                <span className="font-medium">防护只生效了一半。</span>
-                更新源已经指向黑洞、不会再下载新包，但缓存里还留着
-                <span className="font-medium">
-                  {" "}
-                  {status.cacheFiles.filter((f) => !f.name.includes(".disabled-") && !f.name.includes(".quarantine-")).length}{" "}
-                  个会被应用的包
-                </span>
-                {" "}—— 它们不看更新源地址，应用启动时照样可能被套用。
+          <Alert className="border-emerald-200 bg-emerald-50/60">
+            <CheckCircle2 className="size-4 text-emerald-600" />
+            <AlertDescription className="text-emerald-800">
+              <span className="font-medium">防护已完全生效。</span>
+              更新源指向黑洞、{status.installs.length} 个安装都关掉了启动静默更新、
+              暂存目录里也没有待处理的包。重启两个应用后彻底生效。
+            </AlertDescription>
+          </Alert>
+        ) : (
+          <Alert variant={cacheActive || status.installsNeedingPatch > 0 ? "destructive" : undefined}>
+            <AlertTriangle className="size-4" />
+            <AlertDescription>
+              <span className="font-medium">防护还没完全生效</span>
+              —— 下面这几项没做到就会有更新溜进来：
+              <ul className="mt-1.5 space-y-1">
+                <li>
+                  {status.envValue === status.blackhole ? "✅" : "❌"} 更新源
+                  {status.envValue === status.blackhole
+                    ? "已指向黑洞"
+                    : "没指向黑洞（新进程仍会去查更新）"}
+                </li>
+                <li>
+                  {status.installsNeedingPatch === 0 ? "✅" : "❌"}{" "}
+                  {status.installsNeedingPatch === 0 ? (
+                    "所有安装都关掉了启动静默更新"
+                  ) : (
+                    <span>
+                      还有 <span className="font-medium">{status.installsNeedingPatch}</span>{" "}
+                      个安装开着「启动静默更新」—— 已下载的包会在启动时被静默装掉，
+                      这条路<b>不看更新源地址</b>
+                    </span>
+                  )}
+                </li>
+                <li>
+                  {cacheActive ? "❌" : "✅"}{" "}
+                  {cacheActive ? "暂存目录里还有会被应用的包" : "暂存目录是干净的"}
+                </li>
+              </ul>
+              {!disabled && (
                 <span className="mt-2 flex">
-                  <Button size="sm" variant="outline" onClick={() => void clearCache()} disabled={busy || demo}>
-                    <Trash2 className="size-3.5" />
-                    立即隔离
+                  <Button size="sm" onClick={() => setConfirmOpen(true)} disabled={busy || demo}>
+                    <ShieldCheck className="size-3.5" />
+                    一键补齐
                   </Button>
                 </span>
-              </AlertDescription>
-            </Alert>
-          ) : (
-            <Alert className="border-emerald-200 bg-emerald-50/60">
-              <CheckCircle2 className="size-4 text-emerald-600" />
-              <AlertDescription className="text-emerald-800">
-                <span className="font-medium">防护已完全生效。</span>
-                更新源指向黑洞（不会下载新包），缓存里也没有待处理的包。
-                重启两个应用后彻底生效。
-              </AlertDescription>
-            </Alert>
-          )
-        ) : (
-          <Alert>
-            <AlertDescription>
-              <span className="font-medium">还没开启。</span>
-              {cacheActive
-                ? "缓存里已经有下载好的包，随时可能被应用 —— 建议打开下面的开关。"
-                : "目前 WorkBuddy 会自己检查并安装更新。"}
+              )}
             </AlertDescription>
           </Alert>
         )
@@ -263,14 +302,16 @@ export default function UpdateGuardPage() {
                   </Badge>
                 </div>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  打开后做两件事：把更新源指到黑洞（用户级环境变量{" "}
+                  打开后做三件事，<span className="font-medium text-foreground">少一件都挡不住</span>：
+                  ① 把更新源指到黑洞（用户级环境变量{" "}
                   <code className="rounded bg-muted px-1">{status?.envName ?? "WORKBUDDY_UPDATE_URL"}</code>
-                  ），并隔离缓存里已下载的包 —— 只改环境变量拦不住已经下好的包。
+                  ）；② 关掉每份安装的「启动静默更新」；③ 隔离暂存目录里已下载的包。
                 </p>
                 <p className="mt-1 text-[11px] leading-5 text-muted-foreground/80">
-                  ⚠️ 环境变量是<span className="font-medium">用户级</span>的，两个版本读的是同一个名字，
-                  所以这是<span className="font-medium">一个总开关</span>：开了就是两个版本都不更新。
-                  风险本来就来自两者共用缓存，一起关掉才是对的。
+                  ⚠️ 环境变量对<span className="font-medium">已经在跑</span>的进程无效
+                  （进程环境在创建时就固定了），所以它是全局的、也是不完整的 ——
+                  真正管住「已下载的包被静默装掉」的是第 ②项，那一项是
+                  <span className="font-medium">按版本</span>生效的。
                 </p>
               </div>
             </div>
@@ -335,8 +376,15 @@ export default function UpdateGuardPage() {
                   </Badge>
                 )}
               </div>
-              <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
-                {status?.cacheDir ?? "—"}
+              <div className="mt-1 space-y-0.5">
+                {(status?.cacheDirs ?? []).map((d) => (
+                  <div key={d} className="break-all font-mono text-[11px] text-muted-foreground">
+                    {d}
+                  </div>
+                ))}
+                {!status?.cacheDirs.length && (
+                  <div className="font-mono text-[11px] text-muted-foreground">—</div>
+                )}
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -354,7 +402,7 @@ export default function UpdateGuardPage() {
                 size="sm"
                 variant="outline"
                 onClick={() => void clearCache()}
-                disabled={busy || demo || !status?.supported || !status?.cacheExists}
+                disabled={busy || demo || !status?.supported || status.cacheFiles.length === 0}
                 title="把已下载的安装包改名隔离，不会删除文件"
               >
                 {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
@@ -375,8 +423,10 @@ export default function UpdateGuardPage() {
             <div className="mt-3 divide-y divide-border/40 rounded-lg border border-border/60">
               {status.cacheFiles.map((f) => {
                 const quarantined = f.name.includes(".disabled-") || f.name.includes(".quarantine-");
+                // 只显示最后两级，够区分是哪个暂存目录了
+                const dirTail = f.dir.split("\\").slice(-2).join("\\");
                 return (
-                  <div key={f.name} className="flex items-center gap-3 px-3 py-2">
+                  <div key={`${f.dir}|${f.name}`} className="flex items-center gap-3 px-3 py-2">
                     <span
                       className={cn(
                         "size-1.5 shrink-0 rounded-full",
@@ -392,6 +442,9 @@ export default function UpdateGuardPage() {
                         )}
                       >
                         {f.name}
+                      </div>
+                      <div className="truncate font-mono text-[11px] text-muted-foreground/70">
+                        {dirTail}
                       </div>
                       <div className="text-[11px] text-muted-foreground">{f.modified}</div>
                     </div>
@@ -410,7 +463,7 @@ export default function UpdateGuardPage() {
 
           {status && status.cacheFiles.length === 0 && (
             <p className="mt-3 rounded-lg bg-muted/50 px-3 py-2 text-[11px] text-muted-foreground">
-              {status.cacheExists ? "缓存目录是空的。" : "缓存目录还不存在 —— 说明还没下载过更新包。"}
+              暂存目录是干净的 —— 没有下载好等着被应用的包。
             </p>
           )}
         </CardContent>
@@ -447,9 +500,11 @@ export default function UpdateGuardPage() {
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>禁止两个版本自动更新？</DialogTitle>
+            <DialogTitle>开启更新防护？</DialogTitle>
             <DialogDescription>
-              会写一个用户级环境变量，并把缓存里已下载的安装包改名隔离。随时可以关掉恢复。
+              会改每份安装的 <code className="rounded bg-muted px-1">cli/product.json</code>
+              （把 <code className="rounded bg-muted px-1">startupForceAutoUpdate</code> 置为 false），
+              写一个用户级环境变量，并隔离暂存目录里已下载的安装包。随时可以关掉恢复。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 text-[13px] leading-6">
