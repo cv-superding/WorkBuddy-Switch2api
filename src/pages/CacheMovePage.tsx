@@ -630,6 +630,10 @@ export default function CacheMovePage() {
               数据会整份复制过去，原位置只留一个零占用的联接，源数据一个字节都不会删。
               <span className="font-medium">没勾的目录这次完全不碰</span>；
               国内版和国际版可以分开放到不同的盘，也可以都放同一个文件夹。
+              <br />
+              目标目录里若已经有内容（比如上次迁移中途失败留下的半份拷贝），会
+              <span className="font-medium">增量补齐、只补不删</span>
+              —— 不用先手工清空，也不会覆盖掉里面的东西。
             </p>
           </div>
 
@@ -1069,6 +1073,7 @@ export default function CacheMovePage() {
               <span>
                 复制期间不要中途启动上面列出的那几个应用（没在列表里的版本不用管，可以照常开着）。
                 源目录不会删除，只是改名成 <code>.moved-*</code> 保留，之后可以清理或回滚。
+                目标里若已经有内容（例如上次没跑完留下的），会增量补齐 —— 只补不删。
               </span>
             </div>
           </div>

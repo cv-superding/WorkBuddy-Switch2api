@@ -757,6 +757,25 @@ fn migrate_one(
         return (false, logs, None);
     }
 
+    // 目标里可能已经有东西 —— 最常见的就是「上一次迁移失败留下的半份拷贝」。
+    // 不说清楚，用户看到「目标不是空的」会以为出了故障（2026-10-06 实际发生过）。
+    // 只数顶层条目：足够说明问题，而且几乎不耗时。
+    let dst_entries = std::fs::read_dir(&dst)
+        .map(|it| it.flatten().count() as u64)
+        .unwrap_or(0);
+    if dst_entries > 0 {
+        push_log(
+            &mut logs,
+            label,
+            true,
+            format!(
+                "目标 {} 已存在（顶层 {} 项，多半是上次没完成留下的）。robocopy 按「大小 + 时间戳」增量补齐，只补不删。",
+                dst.to_string_lossy(),
+                dst_entries
+            ),
+        );
+    }
+
     emit(
         progress,
         "copy",
