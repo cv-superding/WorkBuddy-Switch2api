@@ -112,8 +112,11 @@ pub struct InstallInfo {
     pub version: Option<String>,
     /// 目录里存在哪些启动器 exe。
     pub exes: Vec<String>,
-    /// `updates.startupForceAutoUpdate` 的当前值 —— `false` 才是「已禁用启动静默更新」。
+    /// **最终生效值**：`settings.json` 的用户设置优先，其次 `product.json`。
+    /// `false` 才是「已关掉启动静默更新」。
     pub startup_update: Option<bool>,
+    /// 单独把 `settings.json`（最高优先级那层）的值带出来，便于排查「改了没生效」。
+    pub user_flag: Option<bool>,
     /// 身份与「国内版」这个档位不符时的提醒（非空即值得注意）。
     pub warning: Option<String>,
 }
@@ -136,6 +139,8 @@ pub struct GuardStatus {
     pub cache_text: String,
     /// 暂存目录里还有「会被应用」的包（未隔离的安装包）。
     pub cache_active: bool,
+    /// 暂存目录是不是已被冻结（显式 DENY 写入）。
+    pub cache_frozen: bool,
     pub installs: Vec<InstallInfo>,
     /// 还没关掉「启动静默更新」的安装目录数。
     pub installs_needing_patch: u32,
@@ -235,6 +240,20 @@ fn is_active_package(name: &str) -> bool {
 
 /// 把所有暂存目录里**未隔离**的包改名隔离掉（不动已经隔离过的）。
 fn quarantine_cache() -> Result<(Vec<String>, u64), String> {
+    // 改名 = 在父目录里新建一个目录项，会被我们自己的「拒绝写入」挡住
+    // （WD 里有 FILE_ADD_FILE）。所以冻结状态下先临时解冻，干完再冻回去。
+    let was_frozen = cache_is_frozen();
+    if was_frozen {
+        let _ = set_dirs_frozen(false);
+    }
+    let result = quarantine_cache_inner();
+    if was_frozen {
+        let _ = set_dirs_frozen(true);
+    }
+    result
+}
+
+fn quarantine_cache_inner() -> Result<(Vec<String>, u64), String> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let mut moved = Vec::new();
     let mut freed = 0u64;
@@ -261,6 +280,143 @@ fn quarantine_cache() -> Result<(Vec<String>, u64), String> {
         }
     }
     Ok((moved, freed))
+}
+
+// ---------------------------------------------------------------- 冻结暂存目录
+
+/// 冻结/解冻暂存目录：对**当前用户**显式 DENY 掉写入、建子目录、删除。
+///
+/// 🔴 **为什么这一层才是关键**（2026-10-08 从 asar 里挖出来的机制）：
+/// Windows 的「已下载就绪」判定**没有状态文件** —— 它就是
+/// **扫缓存目录里有没有 `WorkBuddy-Setup-<version>.exe`**：
+/// ```text
+/// 冷启动恢复「已下载就绪」态（Issue #99875）
+/// 扫缓存目录里的 WorkBuddy-Setup-<version>.exe，取版本最高且有效（>1MB）的一份：
+///   当前运行版本 >= 该版本 → 删该 exe，不恢复
+///   否则 → setState('ready')，冷启动直接安装
+/// ```
+/// 所以**只要让那个 exe 写不进缓存目录，装包这条路就彻底死了** ——
+/// 挡下载、挡装包，而且不碰任何 CDN（不像 hosts 屏蔽会连带搞坏技能市场/头像）。
+///
+/// 还顺带解决了「环境变量对已在运行的进程无效」这个死角。
+///
+/// 权限位怎么选（踩过坑）：
+/// - `WD`(写数据/建文件) + `AD`(追加/建子目录)，带 `(OI)(CI)` 继承 → **挡住往里放新包**，
+///   这是核心。
+/// - `DE`(删除) **只加在目录本身、不继承** → 挡住「把目录整个删掉重建」。
+///   🔴 **不能把 `DE` 也设成继承** —— 那会连**我们自己**给已下载包改名隔离
+///   （改名 = 对源文件要 DELETE 权限）都做不了，按钮会直接失败。
+/// 解冻用 `/remove:d`（只摘该账号的 DENY，不动其它 ACE）。
+fn set_dirs_frozen(freeze: bool) -> Result<Vec<String>, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = freeze;
+        Err("冻结暂存目录目前只支持 Windows。".to_string())
+    }
+    #[cfg(windows)]
+    {
+        let acct = current_account().ok_or("读不到当前用户名，没法设目录权限")?;
+        let mut done = Vec::new();
+        for dir in staging_dirs() {
+            // 目录不存在就先建个空的：否则应用自己 mkdir 时拿到的是一个「可写的新目录」。
+            if !dir.is_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+            }
+            if !dir.is_dir() {
+                continue;
+            }
+            // 先摘掉旧的 DENY，避免反复点造成 ACE 叠加、也避免残留的继承 DE 卡住改名。
+            let _ = run_icacls(&[
+                &dir,
+                Path::new("/remove:d"),
+                Path::new(&acct),
+                Path::new("/T"),
+                Path::new("/C"),
+                Path::new("/Q"),
+            ]);
+            if freeze {
+                run_icacls(&[
+                    &dir,
+                    Path::new("/deny"),
+                    Path::new(&format!("{acct}:(OI)(CI)(WD,AD)")),
+                    Path::new("/T"),
+                    Path::new("/C"),
+                    Path::new("/Q"),
+                ])?;
+                // 目录自身的删除权（不继承）
+                run_icacls(&[
+                    &dir,
+                    Path::new("/deny"),
+                    Path::new(&format!("{acct}:(DE)")),
+                    Path::new("/C"),
+                    Path::new("/Q"),
+                ])?;
+            }
+            done.push(dir.to_string_lossy().to_string());
+        }
+        Ok(done)
+    }
+}
+
+#[cfg(windows)]
+fn run_icacls(args: &[&Path]) -> Result<String, String> {
+    use std::process::Command;
+    let mut c = Command::new("icacls");
+    for a in args {
+        c.arg(a);
+    }
+    let out = c
+        .output()
+        .map_err(|e| format!("调用 icacls 失败：{e}"))?;
+    // 控制台是 GBK，非 ASCII 会乱码 —— 但我们要判断的 "(DENY)" 是 ASCII，
+    // 所以用 lossy 就够，别为了中文提示去引编码库。
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if !out.status.success() {
+        return Err(format!(
+            "icacls 返回 {}：{}",
+            out.status.code().unwrap_or(-1),
+            text.trim()
+        ));
+    }
+    Ok(text)
+}
+
+/// 当前账号 `域\用户名`，给 icacls 用（用账号名而不是 SID，省一层转换）。
+#[cfg(windows)]
+fn current_account() -> Option<String> {
+    let user = std::env::var("USERNAME").ok()?;
+    if user.trim().is_empty() {
+        return None;
+    }
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    Some(if domain.trim().is_empty() {
+        user
+    } else {
+        format!("{domain}\\{user}")
+    })
+}
+
+/// 暂存目录当前是不是已被冻结（含 DENY 项）。
+fn cache_is_frozen() -> bool {
+    #[cfg(not(windows))]
+    {
+        false
+    }
+    #[cfg(windows)]
+    {
+        let Some(acct) = current_account() else {
+            return false;
+        };
+        let dirs: Vec<_> = staging_dirs().into_iter().filter(|d| d.is_dir()).collect();
+        if dirs.is_empty() {
+            return false;
+        }
+        dirs.iter().all(|d| {
+            run_icacls(&[d, Path::new("/T"), Path::new("/C"), Path::new("/Q")])
+                .map(|t| t.to_uppercase().contains("(DENY)") && t.contains(&acct.to_uppercase()))
+                .unwrap_or(false)
+        })
+    }
 }
 
 // ---------------------------------------------------------------- 改 product.json
@@ -322,13 +478,95 @@ fn insert_flag_into_updates(text: &str) -> Option<String> {
     let after = &text[at + key.len()..];
     let brace = after.find('{')?;
     let pos = at + key.len() + brace + 1;
+    // 空对象 `{}` 不能插成 `{...,}`（尾逗号不是合法 JSON）—— 真遇到了就不插逗号。
+    let empty = text[pos..].trim_start().starts_with('}');
     let mut out = String::with_capacity(text.len() + STARTUP_UPDATE_KEY.len() + 12);
     out.push_str(&text[..pos]);
-    out.push_str(&format!("\"{STARTUP_UPDATE_KEY}\": false,"));
+    if empty {
+        out.push_str(&format!("\"{STARTUP_UPDATE_KEY}\": false"));
+    } else {
+        out.push_str(&format!("\"{STARTUP_UPDATE_KEY}\": false,"));
+    }
     out.push_str(&text[pos..]);
     // 插完必须仍是合法 JSON，否则宁可不改。
     serde_json::from_str::<Value>(&out).ok()?;
     Some(out)
+}
+
+// ---------------------------------------------------------------- 用户设置（最高优先级）
+
+/// 用户设置那一层：`<数据目录>/settings.json` 顶层的 `startupForceAutoUpdate`。
+///
+/// 🔴🔴 **只改 `product.json` 是不够的。** asar 里写明的优先级链（自高到低）：
+///
+/// ```text
+/// 1. settings.json 里用户手动设置的 startupForceAutoUpdate   ← 本函数写这一层
+/// 2. 远程实时下发的 productFeature `StartupForceAutoUpdateDefault`（服务端能压回来）
+/// 3. settings.json 里缓存的远程运营默认值 `startupForceAutoUpdateSystemDefault`
+/// 4. product.json 的 updates.startupForceAutoUpdate
+/// 5. 硬编码首次实装兜底 = true
+/// ```
+///
+/// 2026-10-08 实测：`~/.workbuddy/cache/acc-product-config-v3.json`（服务端下发缓存）
+/// 里躺着 `updates.startupForceAutoUpdate: true` —— 只改第 4 层会被它盖掉，
+/// 所以必须把第 1 层也写掉。好在 settings.json 按**数据目录**分
+/// （`~/.workbuddy` vs `~/.workbuddy-ai`），正好对上「按版本」。
+fn user_settings_path(data_dir_name: &str) -> Option<PathBuf> {
+    let name = data_dir_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(config::home_dir().join(name).join("settings.json"))
+}
+
+/// 顶层插入/翻转 `startupForceAutoUpdate`。同样是定点文本改，不重新序列化。
+fn patch_user_setting(text: &str, disable_update: bool) -> Option<String> {
+    if let Some(out) = flip_existing_flag(text, disable_update) {
+        return Some(out);
+    }
+    if !disable_update {
+        return Some(text.to_string()); // 本来就没这个键 → 恢复时什么都不做
+    }
+    let brace = text.find('{')?;
+    let pos = brace + 1;
+    let empty = text[pos..].trim_start().starts_with('}');
+    let mut out = String::with_capacity(text.len() + STARTUP_UPDATE_KEY.len() + 8);
+    out.push_str(&text[..pos]);
+    if empty {
+        out.push_str(&format!("\"{STARTUP_UPDATE_KEY}\": false"));
+    } else {
+        out.push_str(&format!("\n  \"{STARTUP_UPDATE_KEY}\": false,"));
+    }
+    out.push_str(&text[pos..]);
+    serde_json::from_str::<Value>(&out).ok()?;
+    Some(out)
+}
+
+/// 把一层配置文件改成想要的值，成功返回「是否真的动了」。
+fn apply_flag_to_file(path: &Path, disable_update: bool, what: &str) -> Result<bool, String> {
+    if !path.is_file() {
+        return Err(format!("找不到 {what}：{}", path.to_string_lossy()));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("读不了 {}：{e}", path.to_string_lossy()))?;
+    let patched = patch_user_setting(&text, disable_update).ok_or_else(|| {
+        format!("{} 里没有 {} 这个键，也没法安全插入（可能版本变了）", path.to_string_lossy(), STARTUP_UPDATE_KEY)
+    })?;
+    if patched == text {
+        return Ok(false);
+    }
+    let bak = append_suffix(path, ".bak-switch");
+    if !bak.exists() {
+        let _ = std::fs::write(&bak, &text);
+    }
+    std::fs::write(path, &patched).map_err(|e| format!("写不了 {}：{e}", path.to_string_lossy()))?;
+    Ok(true)
+}
+
+fn append_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 // ---------------------------------------------------------------- 安装目录发现
@@ -342,17 +580,32 @@ fn read_install(dir: &Path) -> Option<InstallInfo> {
     let text = std::fs::read_to_string(&pj).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
 
-    // `updates.startupForceAutoUpdate` —— 启动静默强制更新的开关（默认 true）。
-    let startup_update = v
-        .get("updates")
-        .and_then(|u| u.get(STARTUP_UPDATE_KEY))
-        .and_then(|x| x.as_bool());
-
+    // 先把身份字段读出来 —— 下面算「用户设置那一层」要用 dataFolderName 定位数据目录。
     let is_oversea = v.get("isOversea").and_then(|x| x.as_bool());
     let data_dir_name = v
         .get("dataFolderName")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
+
+    // `updates.startupForceAutoUpdate` —— 启动静默强制更新的开关（默认 true）。
+    // 这是**第 4 层**；第 1 层在数据目录的 settings.json 里（下面读）。
+    let product_flag = v
+        .get("updates")
+        .and_then(|u| u.get(STARTUP_UPDATE_KEY))
+        .and_then(|x| x.as_bool());
+
+    // 第 1 层（最高优先级）：`<数据目录>/settings.json` 顶层。
+    let user_flag = data_dir_name
+        .as_deref()
+        .and_then(user_settings_path)
+        .filter(|p| p.is_file())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|j| j.get(STARTUP_UPDATE_KEY).and_then(|x| x.as_bool()));
+
+    // 生效值：用户设置优先。
+    let startup_update = user_flag.or(product_flag);
+
     let endpoint = v.get("endpoint").and_then(|x| x.as_str()).map(|s| s.to_string());
     let auth_id = v
         .get("authentication")
@@ -405,39 +658,59 @@ fn read_install(dir: &Path) -> Option<InstallInfo> {
         version,
         exes,
         startup_update,
+        user_flag,
         warning,
     })
 }
 
-/// 把一份安装的 `updates.startupForceAutoUpdate` 改成想要的值。
+/// 把一份安装的「启动静默更新」关掉（或恢复）。
 ///
-/// 这是**按安装目录**生效的，所以能做到「只关国内版」或「两个都关」。
-/// 返回值：(是否真的改动了, 改动后的值)。改不动就 Err，让上层报给用户。
-fn apply_startup_flag(dir: &Path, disable_update: bool) -> Result<(bool, bool), String> {
+/// **两层都要写**：`product.json`（第 4 层）+ 数据目录的 `settings.json`（第 1 层）。
+/// 只写前者会被服务端下发的配置盖掉，只写后者在 settings.json 缺失时会漏。
+/// 返回「是否真的动过」。
+fn apply_startup_flag(
+    dir: &Path,
+    data_dir_name: Option<&str>,
+    disable_update: bool,
+) -> Result<bool, String> {
+    let mut changed = false;
+
+    // 第 4 层：product.json base
     let pj = dir.join(PRODUCT_JSON_REL);
-    if !pj.is_file() {
-        return Err(format!("找不到 {}", pj.to_string_lossy()));
-    }
-    let text = std::fs::read_to_string(&pj)
-        .map_err(|e| format!("读不了 {}：{e}", pj.to_string_lossy()))?;
-    let patched = patch_startup_flag(&text, disable_update).ok_or_else(|| {
-        format!(
-            "{} 里没有 {} 这个键（可能版本变了），没法用配置的方式关更新",
-            pj.to_string_lossy(),
-            STARTUP_UPDATE_KEY
-        )
-    })?;
-    if patched != text {
-        // 备份一次原文件，方便手动还原。
-        let bak = pj.with_extension("json.bak-switch");
-        if !bak.exists() {
-            let _ = std::fs::write(&bak, &text);
+    if pj.is_file() {
+        let text = std::fs::read_to_string(&pj)
+            .map_err(|e| format!("读不了 {}：{e}", pj.to_string_lossy()))?;
+        let patched = patch_startup_flag(&text, disable_update).ok_or_else(|| {
+            format!(
+                "{} 里没法安全改写 {}（可能版本变了）",
+                pj.to_string_lossy(),
+                STARTUP_UPDATE_KEY
+            )
+        })?;
+        if patched != text {
+            let bak = append_suffix(&pj, ".bak-switch");
+            if !bak.exists() {
+                let _ = std::fs::write(&bak, &text);
+            }
+            std::fs::write(&pj, &patched)
+                .map_err(|e| format!("写不了 {}：{e}", pj.to_string_lossy()))?;
+            changed = true;
         }
-        std::fs::write(&pj, &patched)
-            .map_err(|e| format!("写不了 {}：{e}", pj.to_string_lossy()))?;
-        return Ok((true, !disable_update));
     }
-    Ok((false, !disable_update))
+
+    // 第 1 层：数据目录的 settings.json（用户设置，优先级最高）
+    // 这一层没有就**跳过而不是报错** —— 用户可能还没启动过这个版本，settings.json 还没生成。
+    if let Some(name) = data_dir_name {
+        if let Some(sp) = user_settings_path(name) {
+            if sp.is_file() {
+                if apply_flag_to_file(&sp, disable_update, "用户设置").unwrap_or(false) {
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    Ok(changed)
 }
 
 /// 候选父目录 → 逐个看一级子目录里有没有产品身份文件。
@@ -704,6 +977,7 @@ pub fn status() -> GuardStatus {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
     let cache_active = cache_files.iter().any(|f| is_active_package(&f.name));
+    let cache_frozen = cache_is_frozen();
     let running = running_clients();
     let installs = discover_installs();
     // 还开着「启动静默更新」的安装数。这个是**真正**决定会不会被静默升级的开关
@@ -712,8 +986,10 @@ pub fn status() -> GuardStatus {
         .iter()
         .filter(|i| i.startup_update != Some(false))
         .count() as u32;
-    // 两项都满足才算「防护生效」：更新源黑洞 + 没有安装还开着启动静默更新。
-    let disabled = env_disabled && installs_needing_patch == 0 && !installs.is_empty();
+    // 三件都满足才算「防护生效」：更新源黑洞 + 没有安装还开着启动静默更新
+    // + 暂存目录已冻结（挡住「把新下载的包装进去」这条路）。
+    let disabled =
+        env_disabled && installs_needing_patch == 0 && cache_frozen && !installs.is_empty();
 
     GuardStatus {
         supported,
@@ -727,6 +1003,7 @@ pub fn status() -> GuardStatus {
         cache_bytes,
         cache_text: human(cache_bytes),
         cache_active,
+        cache_frozen,
         installs,
         installs_needing_patch,
         running,
@@ -755,12 +1032,9 @@ pub fn set_disabled(disabled: bool, clear_cache: bool) -> Result<Value, String> 
     // 先改配置文件：这是真正管住「启动静默更新」的那一环，失败了要如实报出来。
     for info in discover_installs() {
         let dir = PathBuf::from(&info.dir);
-        match apply_startup_flag(&dir, disabled) {
-            Ok((changed, _)) => {
-                if changed {
-                    patched.push(info.label.clone());
-                }
-            }
+        match apply_startup_flag(&dir, info.data_dir_name.as_deref(), disabled) {
+            Ok(true) => patched.push(info.label.clone()),
+            Ok(false) => {}
             Err(e) => patch_errors.push(e),
         }
     }
@@ -773,9 +1047,17 @@ pub fn set_disabled(disabled: bool, clear_cache: bool) -> Result<Value, String> 
             quarantined = moved;
             freed = bytes;
         }
+        // 最后再冻结：先把已经躺着的包清掉，再锁门（反过来的话改名会被自己挡住）。
+        if let Err(e) = set_dirs_frozen(true) {
+            patch_errors.push(format!("冻结暂存目录失败：{e}"));
+        }
     } else {
         winenv::remove(UPDATE_URL_ENV)?;
         winenv::broadcast();
+        // 关掉防护就把门打开，别留着看不懂的 ACL。
+        if let Err(e) = set_dirs_frozen(false) {
+            patch_errors.push(format!("解冻暂存目录失败：{e}"));
+        }
     }
 
     Ok(json!({
@@ -800,6 +1082,64 @@ pub fn clear_cache() -> Result<Value, String> {
         "freedText": human(freed),
         "status": status(),
     }))
+}
+
+/// 单独冻结/解冻暂存目录（不碰环境变量和配置层）。
+///
+/// 这是**与版本无关**的那一层：不管 WorkBuddy 哪个版本，只要它写不进
+/// `WorkBuddy-Setup-<version>.exe`，「冷启动装掉已下载的包」这条路就成立不了。
+pub fn set_cache_frozen(freeze: bool) -> Result<Value, String> {
+    let dirs = set_dirs_frozen(freeze)?;
+    Ok(json!({
+        "ok": true,
+        "frozen": freeze,
+        "dirs": dirs,
+        "status": status(),
+    }))
+}
+
+/// **自愈**：如果用户之前开过防护（更新源还指在黑洞上），就把该补的层补一遍。
+///
+/// 为什么需要它：**重装/升级会覆盖 `resources/`**，把 `product.json` 那一层抹掉
+/// （2026-10-08 实测：用户重装 5.6.2 后国内版被还原成 `true`、国际版的键直接消失）。
+/// 靠「开关只点一次」迟早会被抹掉，所以每次启动 Switch 都静默补一次 ——
+/// **幂等**，没被动过就什么都不写。
+///
+/// 🔴 判据是**环境变量还在黑洞上**（用户开着防护的标记）。没开防护就绝不插手，
+/// 免得把用户手动打开的更新又关掉。
+///
+/// 返回补了什么（空 = 无需补），供调用方记日志或提示；失败静默忽略，
+/// 不能因为这个影响启动。
+pub fn repair_if_enabled() -> Vec<String> {
+    if !cfg!(target_os = "windows") {
+        return Vec::new();
+    }
+    let enabled = winenv::get(UPDATE_URL_ENV)
+        .ok()
+        .flatten()
+        .map(|v| v.trim() == BLACKHOLE)
+        .unwrap_or(false);
+    if !enabled {
+        return Vec::new();
+    }
+
+    let mut done = Vec::new();
+    for info in discover_installs() {
+        let dir = PathBuf::from(&info.dir);
+        if let Ok(true) = apply_startup_flag(&dir, info.data_dir_name.as_deref(), true) {
+            done.push(format!("{}：补上了启动静默更新开关", info.label));
+        }
+    }
+    if let Ok((moved, _)) = quarantine_cache() {
+        if !moved.is_empty() {
+            done.push(format!("隔离了 {} 个已下载的更新包", moved.len()));
+        }
+    }
+    // 冻结那层也有可能被外力改掉（改权限、换目录），一并补回来。
+    if !cache_is_frozen() && set_dirs_frozen(true).is_ok() {
+        done.push("重新冻结了更新暂存目录".to_string());
+    }
+    done
 }
 
 // ---------------------------------------------------------------- 测试
@@ -883,8 +1223,9 @@ mod tests {
         assert_eq!(patch_startup_flag(&off, false).as_deref(), Some(src));
 
         // 键不存在（版本变了）→ None，上层要如实报错，不能假装成功
-        assert!(patch_startup_flag("{\"updates\":{}}", true).is_none());
         assert!(patch_startup_flag("{}", true).is_none());
+        // 但 `updates` 在、只是里面没有这个键 → 补进去（见 patch_inserts_flag_when_absent）
+        assert!(patch_startup_flag("{\"updates\":{}}", true).is_some());
     }
 
     /// 🔴 国际版实测**没有**声明这个键（`updates` 里只有 apiVersion/download/checkVersion）。
@@ -909,6 +1250,48 @@ mod tests {
         // 连 updates 都没有 → 放弃，由上层如实报错
         assert!(patch_startup_flag("{}", true).is_none());
         assert!(patch_startup_flag("{\"a\":1}", true).is_none());
+    }
+
+    /// 空的 `updates` 对象也不能插出尾逗号 —— 那会让整个 product.json 变成非法 JSON。
+    #[test]
+    fn insert_handles_empty_updates_object() {
+        let out = patch_startup_flag("{\"updates\": {}}", true).expect("空对象也要能插");
+        let v: Value = serde_json::from_str(&out).expect("必须仍是合法 JSON");
+        assert_eq!(v["updates"][STARTUP_UPDATE_KEY].as_bool(), Some(false));
+    }
+
+    /// 用户设置那一层（`settings.json`，**最高优先级**）：顶层插入 / 翻转。
+    /// 这是唯一能压住「服务端下发把开关打回 true」的位置，必须稳。
+    #[test]
+    fn patch_user_setting_handles_missing_and_existing() {
+        let src = "{\n  \"autoLaunchDesired\": true\n}";
+
+        let off = patch_user_setting(src, true).expect("应当能插入");
+        let v: Value = serde_json::from_str(&off).expect("必须仍是合法 JSON");
+        assert_eq!(v.get(STARTUP_UPDATE_KEY).and_then(|x| x.as_bool()), Some(false));
+        assert_eq!(
+            v.get("autoLaunchDesired").and_then(|x| x.as_bool()),
+            Some(true),
+            "别的键一个都不许动"
+        );
+
+        // 已有这个键 → 原值翻转
+        let on = patch_user_setting(&off, false).expect("应当能翻转回来");
+        let v2: Value = serde_json::from_str(&on).expect("仍须合法");
+        assert_eq!(v2.get(STARTUP_UPDATE_KEY).and_then(|x| x.as_bool()), Some(true));
+
+        // 空对象：插进去也不能有尾逗号
+        let empty = patch_user_setting("{}", true).expect("空对象也要能插");
+        assert_eq!(
+            serde_json::from_str::<Value>(&empty).unwrap()[STARTUP_UPDATE_KEY].as_bool(),
+            Some(false)
+        );
+
+        // 恢复 + 本来就没有这个键 → 原样返回，别擅自写 true
+        assert_eq!(patch_user_setting(src, false).as_deref(), Some(src));
+
+        // 不是 JSON → 放弃，交给上层报错
+        assert!(patch_user_setting("not json", true).is_none());
     }
 
     /// 两个暂存目录都要覆盖到：只盯 `@genieworkbuddy-desktop-updater` 是不够的，

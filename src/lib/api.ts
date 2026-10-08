@@ -163,6 +163,7 @@ const ROUTES: Record<string, Route> = {
   update_guard_status: { method: "GET", path: "/api/update-guard/status" },
   update_guard_set: { method: "POST", path: "/api/update-guard/set" },
   update_guard_clear_cache: { method: "POST", path: "/api/update-guard/clear-cache" },
+  update_guard_set_frozen: { method: "POST", path: "/api/update-guard/set-frozen" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -759,4 +760,15 @@ export function updateGuardSet(
 /** 只隔离缓存里已下载的包，不动开关。 */
 export function updateGuardClearCache(): Promise<UpdateGuardActionResult> {
   return call("update_guard_clear_cache");
+}
+
+/**
+ * 单独冻结/解冻更新暂存目录（不碰环境变量和配置层）。
+ *
+ * 冻结 = 对暂存目录显式拒绝写入。WorkBuddy 判断「有没有下好的更新」
+ * 就是看缓存目录里有没有 `WorkBuddy-Setup-<版本>.exe`，所以只要写不进去，
+ * 这条路就死了 —— 而且是**与版本无关**的一层，重装/升级都抹不掉。
+ */
+export function updateGuardSetFrozen(freeze: boolean): Promise<UpdateGuardActionResult> {
+  return call("update_guard_set_frozen", { freeze });
 }

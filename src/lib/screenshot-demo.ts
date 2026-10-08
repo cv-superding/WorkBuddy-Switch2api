@@ -533,6 +533,7 @@ function updateGuardStatus(): UpdateGuardStatus {
     cacheBytes: 1422342024,
     cacheText: "1.3 GB",
     cacheActive: true,
+    cacheFrozen: true,
     installs: [
       {
         dir: "F:\\AdobeAll\\WorkBuddy",
@@ -544,6 +545,7 @@ function updateGuardStatus(): UpdateGuardStatus {
         version: "37.10.3-24",
         exes: ["WorkBuddy.exe"],
         startupUpdate: false,
+        userFlag: false,
         warning: null,
       },
       {
@@ -556,6 +558,7 @@ function updateGuardStatus(): UpdateGuardStatus {
         version: "37.10.3-24",
         exes: ["WorkBuddyAI.exe"],
         startupUpdate: true,
+        userFlag: null,
         warning: null,
       },
     ],

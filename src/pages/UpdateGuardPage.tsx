@@ -76,6 +76,9 @@ function InstallRow({ info }: { info: UpdateGuardInstall }) {
             )}
             启动静默更新：
             {info.startupUpdate === false ? "已关闭" : "开着"}
+            {info.userFlag !== null && (
+              <span className="text-muted-foreground/70">（用户设置层已写死）</span>
+            )}
           </span>
         )}
       </div>
@@ -183,6 +186,24 @@ export default function UpdateGuardPage() {
     }
   }
 
+  /** 冻结/解冻暂存目录 —— 与版本无关的那一层。 */
+  async function toggleFrozen(freeze: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api.updateGuardSetFrozen(freeze);
+      setStatus(r.status);
+      toast.success(freeze ? "已冻结更新暂存目录" : "已解冻更新暂存目录", {
+        description: freeze
+          ? "WorkBuddy 再也写不进 WorkBuddy-Setup-*.exe —— 下载和装包两条路一起断了。"
+          : "已恢复写入权限，WorkBuddy 可以正常下载更新包了。",
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
   const header = (
     <header>
       <h1 className="text-[28px] font-semibold tracking-tight">更新防护</h1>
@@ -215,9 +236,10 @@ export default function UpdateGuardPage() {
       )}
 
       {/*
-        一眼给结论。防护要三件事都成立才算数，缺一件都会漏：
-        ① 更新源黑洞  ② 每份安装都关掉「启动静默更新」  ③ 暂存目录里没有活包。
-        2026-10-08 实测漏了 ②③，结果 5.7.6 被静默装上了。
+        一眼给结论。防护要四件事都成立才算数，缺一件都会漏：
+        ① 更新源黑洞  ② 每份安装都关掉「启动静默更新」
+        ③ 暂存目录里没有活包  ④ 暂存目录已冻结（写不进新包）。
+        2026-10-08 实测漏了 ②③，5.7.6 被静默装上了；④ 是与版本无关的兜底。
       */}
       {status?.supported && (
         disabled ? (
@@ -226,7 +248,25 @@ export default function UpdateGuardPage() {
             <AlertDescription className="text-emerald-800">
               <span className="font-medium">防护已完全生效。</span>
               更新源指向黑洞、{status.installs.length} 个安装都关掉了启动静默更新、
-              暂存目录里也没有待处理的包。重启两个应用后彻底生效。
+              暂存目录既没有待处理的包、也已经冻结（写不进新包）。
+              <span className="mt-1.5 block">
+                这套防护<span className="font-medium">写在系统里</span>
+                （注册表 + 各自的配置文件 + 目录权限），
+                <span className="font-medium">关掉 Switch、不开机自启也一样有效</span>
+                —— Switch 只是用来看状态和重新打补丁的，不是防护本身。
+              </span>
+              {status.running.length > 0 && (
+                <span className="mt-1.5 block">
+                  检测到 {status.running.join(" / ")} 正在运行 ——
+                  <span className="font-medium">重启一次</span>让它读到新配置即可
+                  （配置在启动时读取，改完不影响已经在跑的进程）。
+                </span>
+              )}
+              <span className="mt-1.5 block font-medium">
+                ⚠️ 重装或升级 WorkBuddy 之后，请回这一页重新看一眼 —— 重装会覆盖
+                <code className="rounded bg-muted px-1">resources/</code>
+                ，把配置层抹掉（目录权限那层不受影响）。
+              </span>
             </AlertDescription>
           </Alert>
         ) : (
@@ -257,6 +297,12 @@ export default function UpdateGuardPage() {
                 <li>
                   {cacheActive ? "❌" : "✅"}{" "}
                   {cacheActive ? "暂存目录里还有会被应用的包" : "暂存目录是干净的"}
+                </li>
+                <li>
+                  {status.cacheFrozen ? "✅" : "❌"}{" "}
+                  {status.cacheFrozen
+                    ? "暂存目录已冻结（写不进新包）"
+                    : "暂存目录还能写入 —— WorkBuddy 仍可能把更新包放进来"}
                 </li>
               </ul>
               {!disabled && (
@@ -375,6 +421,19 @@ export default function UpdateGuardPage() {
                     {cacheActive ? "有待处理的包" : "干净"}
                   </Badge>
                 )}
+                {status && (
+                  <Badge
+                    variant="secondary"
+                    className={cn(
+                      "h-5 border-0 px-1.5 text-[11px]",
+                      status.cacheFrozen
+                        ? "bg-emerald-50 text-emerald-700"
+                        : "bg-muted text-muted-foreground",
+                    )}
+                  >
+                    {status.cacheFrozen ? "已冻结（写不进）" : "可写入"}
+                  </Badge>
+                )}
               </div>
               <div className="mt-1 space-y-0.5">
                 {(status?.cacheDirs ?? []).map((d) => (
@@ -408,6 +467,19 @@ export default function UpdateGuardPage() {
                 {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
                 隔离已下载的包
               </Button>
+              <Button
+                size="sm"
+                variant={status?.cacheFrozen ? "ghost" : "outline"}
+                onClick={() => void toggleFrozen(!(status?.cacheFrozen ?? false))}
+                disabled={busy || demo || !status?.supported}
+                title={
+                  status?.cacheFrozen
+                    ? "解除目录的拒绝写入权限，WorkBuddy 又能正常下载更新包"
+                    : "对暂存目录拒绝写入：WorkBuddy 再也放不进 WorkBuddy-Setup-*.exe"
+                }
+              >
+                {status?.cacheFrozen ? "解冻" : "冻结目录"}
+              </Button>
             </div>
           </div>
 
@@ -417,6 +489,16 @@ export default function UpdateGuardPage() {
             隔离只是<span className="font-medium text-foreground">改名</span>（加{" "}
             <code className="rounded bg-muted px-1">.disabled-&lt;时间&gt;</code> 后缀），
             文件还在原处，随时可以改回去。
+          </p>
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+            <span className="font-medium text-foreground">冻结</span>
+            是更根本的一层：WorkBuddy 判断「有没有下好的更新」，就是
+            <span className="font-medium text-foreground">扫这个目录里有没有
+            <code className="rounded bg-muted px-1"> WorkBuddy-Setup-&lt;版本&gt;.exe</code></span>
+            （代码注释里写死的）。把目录设成拒绝写入之后，那个 exe 根本落不了地
+            —— 下载和装包两条路一起断，而且
+            <span className="font-medium text-foreground">与版本无关</span>
+            ，重装/升级都不会被抹掉。
           </p>
 
           {status && status.cacheFiles.length > 0 && (

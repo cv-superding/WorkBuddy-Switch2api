@@ -875,8 +875,10 @@ export interface UpdateGuardInstall {
   version: string | null;
   /** 目录里存在哪些启动器 exe。 */
   exes: string[];
-  /** product.json 里 `updates.startupForceAutoUpdate`，false 才是已关掉启动静默更新。 */
+  /** 最终生效值：`settings.json` 用户设置优先，其次 `product.json`。false 才是已关掉。 */
   startupUpdate: boolean | null;
+  /** 单独把最高优先级那层（settings.json）的值带出来，便于排查「改了没生效」。 */
+  userFlag: boolean | null;
   /** 身份与目录里的 exe 对不上时的提醒。 */
   warning: string | null;
 }
@@ -896,6 +898,8 @@ export interface UpdateGuardStatus {
   cacheText: string;
   /** 暂存目录里还有「会被应用」的包。 */
   cacheActive: boolean;
+  /** 暂存目录是不是已被冻结（显式拒绝写入）。这一层与版本无关。 */
+  cacheFrozen: boolean;
   installs: UpdateGuardInstall[];
   /** 还没关掉「启动静默更新」的安装数。 */
   installsNeedingPatch: number;

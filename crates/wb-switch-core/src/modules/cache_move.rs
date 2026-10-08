@@ -685,9 +685,34 @@ fn robocopy_pending(src: &Path, dst: &Path) -> Result<u64, String> {
             "robocopy 预演返回 {code}（≥8 表示列清单时就出错了）。源目录未改动。"
         ));
     }
-    // 表头/汇总已用 `/NJH /NJS` 关掉，所以「非空行数」就是待复制文件数。
+    // 🔴 **不能只数非空行**：robocopy 的 `/L` 清单里会混进**目标盘多出来的文件**，
+    // 打印出来是**目标路径**。它们本来就在目标里、永远「搬不过去」，
+    // 于是收敛判定永远不成立 —— 迁移每次都报「还有 N 个文件没搬全」。
+    //
+    // 2026-10-08 实测：整个源树复制到**空**目录时 F: 行 = 0（全是源路径）；
+    // 复制到**已存在**的目标盘时冒出 7644 行目标路径，而真正的待复制只有 166 个。
+    // 之所以会有这些「目标多出来的文件」：应用会轮转/删除缓存，
+    // 目标那份半成品副本里还留着源里已经删掉的老文件 —— 这是正常的，不该算失败。
     let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+    Ok(stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| is_under_root(l, src))
+        .count() as u64)
+}
+
+/// 判断 robocopy 列出的这一行是不是**源树里的**文件。
+///
+/// 比对时统一处理盘符大小写、结尾分隔符、以及长路径的 `\\?\` 前缀。
+fn is_under_root(line: &str, root: &Path) -> bool {
+    let line = line.trim().trim_start_matches(r"\\?\");
+    let root = root.to_string_lossy();
+    let root = root.trim_end_matches(['\\', '/']);
+    if line.len() <= root.len() {
+        return false;
+    }
+    let (head, rest) = line.split_at(root.len());
+    head.eq_ignore_ascii_case(root) && matches!(rest.as_bytes().first(), Some(b'\\') | Some(b'/'))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1728,6 +1753,25 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 🔴 回归：robocopy 的 `/L` 清单里混着**目标盘**的路径，不能算成待复制。
+    ///
+    /// 2026-10-08 实测：列表里 7810 行中 7644 行是 `F:\.WBcache\...`（目标侧），
+    /// 真正的待复制只有 166 个 —— 不筛就永远收敛不了、迁移永远报失败。
+    #[test]
+    fn pending_only_counts_paths_under_source() {
+        let src = Path::new(r"C:\Users\me\.workbuddy");
+        assert!(is_under_root(r"	C:\Users\me\.workbuddy\a\b.json", src));
+        assert!(is_under_root(r"c:\users\ME\.workbuddy\x", src), "盘符/大小写不敏感");
+        assert!(is_under_root(r"\\?\C:\Users\me\.workbuddy\x", src), "长路径前缀要能剥掉");
+
+        // 目标侧的路径必须被排除 —— 这就是那个 bug
+        assert!(!is_under_root(r"F:\.WBcache\.workbuddy\app\session\Cache\f_000427", src));
+        // 前缀相同但不是子路径（少了分隔符）也算不同
+        assert!(!is_under_root(r"C:\Users\me\.workbuddy-old\x", src));
+        // 目录本身不算文件
+        assert!(!is_under_root(r"C:\Users\me\.workbuddy", src));
     }
 
     /// 预演 0 个待复制 → 通过（目标里有源没有的残留也不管）。

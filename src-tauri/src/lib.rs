@@ -117,6 +117,19 @@ pub fn run() {
 
     let app = builder
         .setup(|app| {
+            // 更新防护自愈：只要用户之前开过防护（更新源还指在黑洞上），
+            // 每次启动就把该补的层补一遍并隔离新下载的包。
+            // 需要它是因为**重装/升级会覆盖 `resources/`**、把 product.json 那层抹掉
+            // （2026-10-08 实测：重装 5.6.2 后国内版被还原成 true、国际版的键消失）。
+            // 幂等、没被动过就不写；没开防护则完全不插手。放后台线程，别拖慢启动。
+            #[cfg(desktop)]
+            std::thread::spawn(|| {
+                let done = wb_switch_core::modules::update_guard::repair_if_enabled();
+                if !done.is_empty() {
+                    eprintln!("[update-guard] 自愈：{}", done.join("；"));
+                }
+            });
+
             #[cfg(desktop)]
             {
                 tray::setup(app)?;
@@ -205,6 +218,7 @@ pub fn run() {
             commands::update_guard_status,
             commands::update_guard_set,
             commands::update_guard_clear_cache,
+            commands::update_guard_set_frozen,
         ])
         .build(context)
         .expect("error while building tauri application");

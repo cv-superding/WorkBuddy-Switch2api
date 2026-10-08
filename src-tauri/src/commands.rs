@@ -906,6 +906,14 @@ pub async fn update_guard_clear_cache() -> Result<Value, String> {
         .map_err(|e| format!("清理更新缓存异常：{e}"))?
 }
 
+/// POST /api/update-guard/set-frozen —— 单独冻结/解冻更新暂存目录。
+#[tauri::command]
+pub async fn update_guard_set_frozen(freeze: bool) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || update_guard::set_cache_frozen(freeze))
+        .await
+        .map_err(|e| format!("冻结暂存目录异常：{e}"))?
+}
+
 /// POST /api/transfer/export —— 把选中的工作区 + 配置打成一个 zip。
 ///
 /// 打包是重 IO，可能几秒到几十秒 —— 挪到阻塞线程池，别占着 async runtime。

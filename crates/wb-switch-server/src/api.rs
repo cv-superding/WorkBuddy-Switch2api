@@ -117,6 +117,10 @@ pub fn router() -> Router {
             "/api/update-guard/clear-cache",
             post(api_update_guard_clear_cache),
         )
+        .route(
+            "/api/update-guard/set-frozen",
+            post(api_update_guard_set_frozen),
+        )
         .fallback(static_handler)
 }
 
@@ -661,6 +665,21 @@ async fn api_update_guard_clear_cache() -> Response {
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(
             format!("清理更新缓存异常：{e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+async fn api_update_guard_set_frozen(Json(body): Json<Value>) -> Response {
+    let freeze = body
+        .get("freeze")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match tokio::task::spawn_blocking(move || update_guard::set_cache_frozen(freeze)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("冻结暂存目录异常：{e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
