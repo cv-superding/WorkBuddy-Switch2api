@@ -197,13 +197,23 @@ fn link_target(p: &Path) -> Option<String> {
     })
 }
 
-/// 统计目录（文件数, 总字节）。**不跟随联接**，避免把目标盘再算一遍。
-fn scan(p: &Path) -> (u64, u64) {
+/// 统计目录（文件数, 总字节, 最新改动时间）。**不跟随联接**，避免把目标盘再算一遍。
+///
+/// 🔴 **为什么必须带上「最新改动时间」**：只比文件数和总字节**察觉不到客户端在改文件** ——
+/// 应用改写 `last-launch.json` / `epoch-marker.json` / `*.db-shm` 这类文件时尺寸往往不变，
+/// 计数一模一样，于是「客户端一直在跑、源目录一直在变」会被误判成
+/// 「源目录本身没动过，可能有文件被别的程序占用」，把用户引到错的方向上。
+///
+/// 2026-10-08 实测：12317 个待复制文件里**只有 7 个真被锁**（Chromium 的
+/// `Cookies` / `lockfile`），其余全是应用在持续改写 —— 但当时 `src_moved` 是 false，
+/// 归因完全错了。带上时间戳之后，源一被写就立刻能看出来。
+fn scan(p: &Path) -> (u64, u64, i64) {
     if !p.is_dir() {
-        return (0, 0);
+        return (0, 0, 0);
     }
     let mut files = 0u64;
     let mut bytes = 0u64;
+    let mut newest = 0i64;
     let mut stack = vec![p.to_path_buf()];
     while let Some(cur) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&cur) else {
@@ -221,12 +231,20 @@ fn scan(p: &Path) -> (u64, u64) {
             } else if ft.is_file() {
                 if let Ok(meta) = entry.metadata() {
                     bytes += meta.len();
+                    if let Ok(t) = meta.modified() {
+                        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                            let ns = d.as_nanos() as i64;
+                            if ns > newest {
+                                newest = ns;
+                            }
+                        }
+                    }
                 }
                 files += 1;
             }
         }
     }
-    (files, bytes)
+    (files, bytes, newest)
 }
 
 /// 「复制 + 校验」这一轮的结论。
@@ -446,10 +464,10 @@ fn dir_status(name: &str, label: &str, movable: bool, with_size: bool) -> CacheD
     let path = home_dir().join(name);
     let exists = path.exists();
     let is_link = exists && is_reparse(&path);
-    let (files, bytes) = if exists && with_size {
+    let (files, bytes, _) = if exists && with_size {
         scan(&path)
     } else {
-        (0, 0)
+        (0, 0, 0)
     };
     // 只看这个目录自己的持有者 —— 另一个版本的进程在跑不影响它。
     let held_by: Vec<String> = holders_of(name)
@@ -751,7 +769,7 @@ fn migrate_one(
     }
 
     emit(progress, "scan", &format!("统计 {name}"), idx, total, at(1));
-    let (mut nf, mut nb) = scan(&src);
+    let (mut nf, mut nb, mut nm) = scan(&src);
     if nf == 0 && nb == 0 {
         push_log(&mut logs, label, false, "目录为空，跳过以免误操作".to_string());
         return (false, logs, None);
@@ -791,6 +809,23 @@ fn migrate_one(
     loop {
         attempt += 1;
         if attempt > 1 {
+            // 🔴 源一直在变、而且持有者进程正开着 —— 再拷几轮也不可能收敛，
+            // 直接说清楚原因退出，别白跑两趟十几 GB 的扫描（2026-10-08 实测：
+            // 用户在复制期间把 WorkBuddy 打开了，源目录被持续改写）。
+            let holders = running_holders_for(&[name.to_string()]);
+            if !holders.is_empty() {
+                push_log(
+                    &mut logs,
+                    label,
+                    false,
+                    format!(
+                        "{} 在复制期间被打开了 —— 它一直在改写源目录，再拷也不会收敛。\
+                         请退出这个应用，并且**整个迁移过程中不要再打开它**，然后重试。源目录未改动。",
+                        holders.join(" / ")
+                    ),
+                );
+                return (false, logs, None);
+            }
             emit(
                 progress,
                 "copy",
@@ -813,8 +848,10 @@ fn migrate_one(
                 return (false, logs, None);
             }
         };
-        let (sf, sb) = scan(&src);
-        if (sf, sb) != (nf, nb) {
+        let (sf, sb, sm) = scan(&src);
+        // 文件数、总字节、**以及最新改动时间**任一变了，就说明源被写过。
+        // 带上时间戳之后，「应用改写同尺寸文件」这种情况才认得出来。
+        if (sf, sb, sm) != (nf, nb, nm) {
             src_moved = true;
         }
 
@@ -830,10 +867,11 @@ fn migrate_one(
                 }
                 nf = sf;
                 nb = sb;
+                // 这里紧跟 break，`nm` 用不上了，别再赋值（会触发 unused_assignments）。
                 // 源里已经没有、目标里还在的残留（复制期间被应用轮转/删掉的
                 // 日志、LevelDB 片段等）。它们不影响使用，但会让「两边文件数」
                 // 看着不一样，所以主动说一句，免得下次又被当成故障。
-                let (df, _) = scan(&dst);
+                let (df, _, _) = scan(&dst);
                 let extra = df.saturating_sub(sf);
                 if extra > 0 {
                     push_log(
@@ -850,6 +888,7 @@ fn migrate_one(
             CopyVerdict::Recopy => {
                 nf = sf;
                 nb = sb;
+                nm = sm;
                 continue;
             }
             CopyVerdict::SourceBusy | CopyVerdict::Mismatch => {
@@ -863,16 +902,17 @@ fn migrate_one(
                         procs.join(" / ")
                     )
                 };
-                let why = if matches!(
-                    classify_copy_result(pending, src_moved, attempt),
-                    CopyVerdict::SourceBusy
-                ) {
+                let why = if src_moved {
                     format!(
-                        "复制期间源目录被持续写入（还有 {pending} 个文件没对上），已自动重拷 {attempt} 轮仍未收敛。{hint}"
+                        "源目录在复制期间一直在被写入（文件数 / 总字节 / 最新改动时间都变过），\
+                         还有 {pending} 个文件没对上，已自动重拷 {attempt} 轮仍未收敛。\
+                         常见原因是客户端没退干净，或者复制过程中又被打开了。{hint}"
                     )
                 } else {
                     format!(
-                        "复制完成后仍有 {pending} 个文件没搬全（源目录本身没动过，可能有文件被别的程序占用）。{hint}"
+                        "文件数、总字节和最新改动时间都没变过，但仍有 {pending} 个文件搬不过去 —— \
+                         多半是其中少数文件被别的程序独占（WorkBuddy 的浏览器缓存 \
+                         `Cookies` / `lockfile` 这类）。{hint}"
                     )
                 };
                 push_log(&mut logs, label, false, format!("{why}源目录未改动。"));
@@ -987,7 +1027,7 @@ pub fn run(targets: Vec<MoveTarget>, progress: Option<&dyn Fn(Progress)>) -> Res
         }
         let dest_root = normalize_dest(&t.dest)?;
         let dst = dest_root.join(&t.name);
-        let (files, bytes) = scan(&src);
+        let (files, bytes, _) = scan(&src);
         if files == 0 && bytes == 0 {
             return Err(format!("{} 是空目录，已跳过以免误操作。", t.name));
         }
@@ -1516,7 +1556,7 @@ pub fn list_backups() -> Vec<Value> {
                 .unwrap_or(false)
         })
         .map(|p| {
-            let (files, bytes) = scan(&p);
+            let (files, bytes, _) = scan(&p);
             json!({
                 "path": p.to_string_lossy(),
                 "name": p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
@@ -1656,6 +1696,39 @@ pub fn verify() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 回归：改写**同尺寸**文件后，`scan` 必须能看出来。
+    ///
+    /// 这是 2026-10-08 那次误判的根因 —— 只比「文件数 + 总字节」时，
+    /// 应用把 `last-launch.json` / `epoch-marker.json` 这类文件反复改写
+    /// （尺寸不变）是看不出来的，于是「客户端一直在跑、源一直在变」
+    /// 被归因成「源目录本身没动过」，把用户引去了错的方向。
+    #[test]
+    fn scan_notices_same_size_rewrite() {
+        let root = std::env::temp_dir().join(format!("wb-cm-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let f = root.join("same-size.json");
+        std::fs::write(&f, b"aaaaaaaaaa").unwrap();
+
+        let (n1, b1, m1) = scan(&root);
+        assert_eq!(n1, 1, "应当数到 1 个文件");
+        assert_eq!(b1, 10, "字节数应当算对");
+        assert!(m1 > 0, "应当能取到最新改动时间");
+
+        // 等一小会再写同长度的内容：文件数、总字节都不变，只有时间戳变。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&f, b"bbbbbbbbbb").unwrap();
+
+        let (n2, b2, m2) = scan(&root);
+        assert_eq!((n2, b2), (n1, b1), "文件数与总字节本来就不该变");
+        assert!(
+            m2 > m1,
+            "同尺寸改写必须靠时间戳识别出来（{m2} 应大于 {m1}）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// 预演 0 个待复制 → 通过（目标里有源没有的残留也不管）。
     #[test]
