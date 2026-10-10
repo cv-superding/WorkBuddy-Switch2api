@@ -27,6 +27,17 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 🔴 显式打开 indexmap 1.9 的 `std` feature —— 修 `schemars 0.8.22` 的 E0107。
+#
+# 根因：tauri-build → schemars 依赖 indexmap 1.9，但只开了 `serde-1`、没开 `std`；
+# 而 indexmap 1.9.3 的 build.rs 在没有显式 `std` 时会去**探测 sysroot**，
+# 该探测在 rustc 1.98 上失败 → 走「无默认参数」的结构体分支 →
+# schemars 的 `type Map<K,V> = indexmap::IndexMap<K,V>` 少一个泛型参数 → E0107。
+# 显式声明后走 build.rs 的第一条分支，不再探测。
+#
+# ⚠️ `[dependencies]` 与 `[build-dependencies]` **两边都要写** ——
+# resolver 2 不合并普通依赖图与 build 依赖图里的 feature。
+indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -39,6 +50,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2.7.2"
+# 见上面 `[build-dependencies]` 的说明：这行是给 resolver 用的，源码里并未直接使用。
+indexmap = { version = "1.9", features = ["std"] }
 
 # 系统自启（开机静默启动）：仅桌面目标支持（macOS / Windows / Linux）。
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

@@ -10,8 +10,8 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -48,32 +48,188 @@ const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------- 配置
 
+/// 一个版本的接入点：**监听地址、鉴权 key、开关三者各自独立**。
+///
+/// 为什么必须分开：国内版（`.workbuddy` / `www.codebuddy.cn`）与国际版
+/// （`.workbuddy-ai` / `www.workbuddy.ai`）的**凭证与模型列表完全不互通** ——
+/// 上游会校验 token 的 issuer，拿国内版的号去打国际版域名必然被拒。
+/// 两边各给一个入口之后：
+/// - 客户端按**端口**区分连哪一版，不再依赖「用模型名猜版本」；
+/// - 两边各用一把 key，便于分别授权 / 撤销；
+/// - `GET /v1/models` 只列本版本的模型，不会被另一版的模型误导。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyConfig {
+pub struct Endpoint {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_listen")]
+    /// `host:port`。留空时由 [`ProxyConfig::resolved`] 补成该版本的默认端口。
+    #[serde(default)]
     pub listen: String,
-    /// 留空 = 不鉴权（仅本机监听时才建议留空）。
+    /// 留空 = 不鉴权（仅在 `127.0.0.1` 这类本机监听时才建议留空）。
     #[serde(default)]
     pub api_key: String,
-    /// 允许出站的 uid；留空 = 全部账号。
+    /// 参与**这个入口**反代的 uid；留空 = 该版本的全部账号。
+    ///
+    /// 两个入口各存一份：国内版用哪几个号和国际版用哪几个号本来就是两个独立决定，
+    /// 共用一个名单只会让人在两处改同一件事。
     #[serde(default)]
     pub accounts: Vec<String>,
 }
 
-fn default_listen() -> String {
-    "127.0.0.1:7863".to_string()
+impl Default for Endpoint {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: String::new(),
+            api_key: String::new(),
+            accounts: Vec::new(),
+        }
+    }
+}
+
+/// 国内版入口的默认监听地址（沿用 v1 的默认值，老用户升级后地址不变）。
+pub const DEFAULT_LISTEN_DOMESTIC: &str = "127.0.0.1:7863";
+/// 国际版入口的默认监听地址。
+pub const DEFAULT_LISTEN_INTERNATIONAL: &str = "127.0.0.1:7864";
+
+/// 反代配置：**两个入口彼此独立** —— 各有开关、监听地址、API Key、账号名单。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// 国内版入口。
+    #[serde(default)]
+    pub domestic: Endpoint,
+    /// 国际版入口。
+    #[serde(default)]
+    pub international: Endpoint,
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            listen: default_listen(),
-            api_key: String::new(),
-            accounts: Vec::new(),
+            domestic: Endpoint::default(),
+            international: Endpoint::default(),
         }
+    }
+}
+
+impl ProxyConfig {
+    /// 取某个版本的接入点。
+    pub fn endpoint(&self, e: Edition) -> &Endpoint {
+        match e {
+            Edition::Domestic => &self.domestic,
+            Edition::International => &self.international,
+        }
+    }
+
+    /// 同上，可变引用。
+    pub fn endpoint_mut(&mut self, e: Edition) -> &mut Endpoint {
+        match e {
+            Edition::Domestic => &mut self.domestic,
+            Edition::International => &mut self.international,
+        }
+    }
+
+    /// 把空着的监听地址补成该版本的默认端口。**读配置后必调** ——
+    /// 配置文件里写 `"domestic": {"enabled": true}` 也是合法的，端口取默认值。
+    pub fn resolved(mut self) -> Self {
+        for e in Edition::ALL {
+            let d = default_listen_of(e);
+            let ep = self.endpoint_mut(e);
+            if ep.listen.trim().is_empty() {
+                ep.listen = d.to_string();
+            }
+        }
+        self
+    }
+
+    /// 有没有任何一个入口被启用。
+    pub fn any_enabled(&self) -> bool {
+        Edition::ALL.iter().any(|&e| self.endpoint(e).enabled)
+    }
+}
+
+/// 某版本的默认监听地址。
+pub fn default_listen_of(e: Edition) -> &'static str {
+    match e {
+        Edition::Domestic => DEFAULT_LISTEN_DOMESTIC,
+        Edition::International => DEFAULT_LISTEN_INTERNATIONAL,
+    }
+}
+
+/// v1 时代的**扁平**配置：`{ enabled, listen, api_key, accounts }`。
+///
+/// 只用于读 —— 读到就迁移并立刻落盘（见 [`load_proxy_config`]）。
+#[derive(Deserialize)]
+struct LegacyConfig {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    accounts: Vec<String>,
+}
+
+/// v2 的过渡结构：已有两个入口，但账号名单还是**两边共用**的一份。
+#[derive(Deserialize, Default)]
+struct V2Endpoint {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    listen: String,
+    #[serde(default)]
+    api_key: String,
+}
+
+#[derive(Deserialize, Default)]
+struct V2Config {
+    #[serde(default)]
+    domestic: V2Endpoint,
+    #[serde(default)]
+    international: V2Endpoint,
+    #[serde(default)]
+    accounts: Vec<String>,
+}
+
+impl ProxyConfig {
+    /// v1 扁平配置 → 现行结构。
+    ///
+    /// 旧的 `listen` / `api_key` / `enabled` / `accounts` 归到**国内版**（那是 v1
+    /// 时代唯一存在的一档），国际版保持默认关闭 —— 不擅自替用户开启一个以前
+    /// 不存在的监听端口。
+    fn from_legacy(old: LegacyConfig) -> Self {
+        ProxyConfig {
+            domestic: Endpoint {
+                enabled: old.enabled.unwrap_or(false),
+                listen: old.listen.unwrap_or_default(),
+                api_key: old.api_key.unwrap_or_default(),
+                accounts: old.accounts,
+            },
+            international: Endpoint::default(),
+        }
+        .resolved()
+    }
+
+    /// v2（两边共用一份名单）→ 现行结构（各持一份）。
+    ///
+    /// 把那份名单**同时**发给两个入口即可 —— 行为完全等价，因为每个入口本来就
+    /// 只能用到属于自己版本的号，不会因为多拿到另一版的 uid 而越界。
+    fn from_v2(old: V2Config) -> Self {
+        ProxyConfig {
+            domestic: Endpoint {
+                enabled: old.domestic.enabled,
+                listen: old.domestic.listen,
+                api_key: old.domestic.api_key,
+                accounts: old.accounts.clone(),
+            },
+            international: Endpoint {
+                enabled: old.international.enabled,
+                listen: old.international.listen,
+                api_key: old.international.api_key,
+                accounts: old.accounts,
+            },
+        }
+        .resolved()
     }
 }
 
@@ -81,16 +237,55 @@ fn config_path() -> std::path::PathBuf {
     home_dir().join(".wb-switch").join(CONFIG_FILE)
 }
 
+/// 读配置。**能识别并自动迁移 v1 的扁平格式**。
 pub fn load_proxy_config() -> ProxyConfig {
     let path = config_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return ProxyConfig::default();
+        return ProxyConfig::default().resolved();
     };
-    match serde_json::from_str::<ProxyConfig>(&text) {
-        Ok(cfg) => cfg,
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
         Err(err) => {
             eprintln!("[反代] {path:?} 解析失败({err})，使用默认配置");
-            ProxyConfig::default()
+            return ProxyConfig::default().resolved();
+        }
+    };
+
+    let has_endpoints = value.get("domestic").is_some() || value.get("international").is_some();
+
+    // 现行结构：两个入口，各自的 `accounts` 在入口内部（顶层没有 `accounts`）。
+    if has_endpoints && value.get("accounts").is_none() {
+        return match serde_json::from_value::<ProxyConfig>(value) {
+            Ok(cfg) => cfg.resolved(),
+            Err(err) => {
+                eprintln!("[反代] {path:?} 结构不对({err})，使用默认配置");
+                ProxyConfig::default().resolved()
+            }
+        };
+    }
+
+    // 需要迁移：v2（两个入口 + 顶层共用名单）或 v1（完全扁平）。
+    let migrated = if has_endpoints {
+        serde_json::from_value::<V2Config>(value)
+            .map(ProxyConfig::from_v2)
+            .map_err(|e| e.to_string())
+    } else {
+        serde_json::from_value::<LegacyConfig>(value)
+            .map(ProxyConfig::from_legacy)
+            .map_err(|e| e.to_string())
+    };
+
+    match migrated {
+        Ok(cfg) => {
+            eprintln!("[反代] 检测到旧版配置，已迁移为「国内版 / 国际版」两个独立入口");
+            if let Err(e) = save_proxy_config(&cfg) {
+                eprintln!("[反代] 迁移结果写回失败：{e}");
+            }
+            cfg
+        }
+        Err(err) => {
+            eprintln!("[反代] {path:?} 无法识别({err})，使用默认配置");
+            ProxyConfig::default().resolved()
         }
     }
 }
@@ -552,16 +747,25 @@ fn build_upstream_body(incoming: &Value, degraded: &mut Vec<String>) -> Value {
 
 #[derive(Clone)]
 struct AppState {
+    /// 全局配置（主要是 `accounts` 白名单）。
     cfg: Arc<ProxyConfig>,
+    /// 🔴 **两个入口共享同一个账号池** —— 否则同一个号会在两处各维护一份失败
+    /// 冷却状态，出现「这边还在冷却、那边照用」的错乱。
     pool: Arc<Pool>,
+    /// 🔴 本实例只服务这一个版本。
+    edition: Edition,
+    /// 本实例的接入点（监听地址 + **自己的** API Key）。
+    endpoint: Arc<Endpoint>,
 }
 
 fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, Json(json!({"error": {"message": "invalid api key"}}))).into_response()
 }
 
-fn check_auth(headers: &HeaderMap, cfg: &ProxyConfig) -> bool {
-    if cfg.api_key.trim().is_empty() {
+/// 校验请求头里的 key。`api_key` 是**本入口自己的**那把，不是全局的。
+fn check_auth(headers: &HeaderMap, api_key: &str) -> bool {
+    let want = api_key.trim();
+    if want.is_empty() {
         return true;
     }
     let presented = headers
@@ -571,7 +775,7 @@ fn check_auth(headers: &HeaderMap, cfg: &ProxyConfig) -> bool {
         .trim()
         .trim_start_matches("Bearer ")
         .trim();
-    presented == cfg.api_key
+    presented == want
 }
 
 async fn healthz(State(st): State<AppState>) -> impl IntoResponse {
@@ -633,69 +837,45 @@ fn cut_text(s: &str, max: usize) -> String {
     out
 }
 
-/// 把两档的模型列表合成 OpenAI 形状：两档都有的标 `workbuddy`，
-/// 只在国内版有的标 `workbuddy-cn`，只在国际版有的标 `workbuddy-intl`。
-fn merge_edition_models(dom: &[String], intl: &[String]) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    for id in dom {
-        let both = intl.iter().any(|x| x == id);
-        out.push(json!({
-            "id": id,
-            "object": "model",
-            "owned_by": if both { "workbuddy" } else { owner_tag(Edition::Domestic) },
-        }));
-    }
-    for id in intl {
-        if dom.iter().any(|x| x == id) {
-            continue;
-        }
-        out.push(json!({
-            "id": id,
-            "object": "model",
-            "owned_by": owner_tag(Edition::International),
-        }));
-    }
-    out
-}
-
-/// `GET /v1/models` —— **两档各拉一次再合并**。
+/// `GET /v1/models` —— **只列本入口那一版的模型**。
 ///
-/// 以前只从轮转到的那个号上拉，于是列表是哪一档全看运气；现在按档分别拉，
-/// `owned_by` 会写清楚来源（`workbuddy-cn` / `workbuddy-intl` / 两档都有 = `workbuddy`）。
+/// 分开入口之后这里不再合并两档：客户端连的是国内版端口，就不该在列表里看到
+/// 国际版专有的模型（否则它挑一个发过来，只会换来一个看不懂的 400）。
 async fn list_models(State(st): State<AppState>) -> Response {
-    let (dom, intl) = tokio::join!(
-        fetch_edition_models(&st.cfg, Edition::Domestic),
-        fetch_edition_models(&st.cfg, Edition::International),
-    );
-
-    let mut errors: Vec<String> = Vec::new();
-    let mut dom_ids: Vec<String> = Vec::new();
-    let mut intl_ids: Vec<String> = Vec::new();
-    match dom {
-        Ok((ids, _, _)) => dom_ids = ids,
-        Err(e) => errors.push(format!("{}：{e}", Edition::Domestic.label())),
-    }
-    match intl {
-        Ok((ids, _, _)) => intl_ids = ids,
-        Err(e) => errors.push(format!("{}：{e}", Edition::International.label())),
-    }
-
-    if dom_ids.is_empty() && intl_ids.is_empty() {
-        return (
+    match fetch_edition_models(&st.cfg, st.edition).await {
+        Ok((ids, _, _)) => {
+            let data: Vec<Value> = ids
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "object": "model",
+                        "owned_by": owner_tag(st.edition),
+                    })
+                })
+                .collect();
+            Json(json!({"object": "list", "data": data})).into_response()
+        }
+        Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": {"message": format!("两档都没拉到模型列表 —— {}", errors.join("；"))}})),
+            Json(json!({
+                "error": {
+                    "message": format!("没有拉到{}的模型列表 —— {e}", st.edition.label()),
+                }
+            })),
         )
-            .into_response();
+            .into_response(),
     }
-
-    Json(json!({"object": "list", "data": merge_edition_models(&dom_ids, &intl_ids)})).into_response()
 }
 
 // ---------------------------------------------------------------- 取模型列表（桌面端按钮用）
 
 /// 从账号库里挑一个可用账号（必要时先刷新 token）。不参与轮转、不动失败冷却。
 async fn pick_account_of(cfg: &ProxyConfig, edition: Option<Edition>) -> Option<Value> {
-    let want = cfg.accounts.clone();
+    // 名单取自**对应入口** —— 和 `eligible_accounts` 用同一套判据，别各写一份。
+    let want = edition
+        .map(|e| cfg.endpoint(e).accounts.clone())
+        .unwrap_or_default();
     let acc = load_accounts().into_iter().find(|a| {
         a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
             && edition.map(|e| edition_of(a) == e).unwrap_or(true)
@@ -1317,7 +1497,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(incoming): Json<Value>,
 ) -> Response {
-    if !check_auth(&headers, &st.cfg) {
+    if !check_auth(&headers, &st.endpoint.api_key) {
         return unauthorized();
     }
     let want_stream = incoming
@@ -1330,21 +1510,36 @@ async fn chat_completions(
         .unwrap_or("deepseek-v4-flash")
         .to_string();
 
-    // 按 model 认版本：国内版和国际版的模型列表不一样，把国际版专属的 model
-    // 打到国内版网关上会被拒。拉过一次模型列表之后这里就能命中。
-    let route = model_edition(&model);
-    let Some(acc) = take_account(&st.pool, &st.cfg, route).await else {
-        let message = match route {
-            Some(e) if st.pool.has_edition(e) => format!(
-                "模型 `{model}` 属于{}，但该版本的账号当前都不可用（冷却中或需要重新登录）",
-                e.label()
-            ),
-            Some(e) => format!(
-                "模型 `{model}` 属于{}，但参与轮转的账号里没有{}的号",
-                e.label(),
-                e.label()
-            ),
-            None => "no available account (all cooling down or needs relogin)".to_string(),
+    // 🔴 版本防火墙：本入口只服务一个版本。模型名能唯一确定版本时（拉过一次模型
+    // 列表就会记住映射），直接拦下跨版本的请求并说清楚该连哪个端口 —— 放它过去
+    // 只会拿错版本的号去打上游，换回来一个看不懂的 4xx。
+    // 映射表里没有的模型（新模型、还没拉过列表）不拦，交给上游判定。
+    if let Some(want) = model_edition(&model) {
+        if want != st.edition {
+            let msg = format!(
+                "模型 `{model}` 属于{}，而当前入口是{}（{}）。请改用{}入口（{}）访问。",
+                want.label(),
+                st.edition.label(),
+                st.endpoint.listen,
+                want.label(),
+                st.cfg.endpoint(want).listen,
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"message": msg}})),
+            )
+                .into_response();
+        }
+    }
+
+    let Some(acc) = take_account(&st.pool, &st.cfg, Some(st.edition)).await else {
+        let message = if st.pool.has_edition(st.edition) {
+            format!(
+                "{}的账号当前都不可用（冷却中，或需要重新登录）",
+                st.edition.label()
+            )
+        } else {
+            format!("参与轮转的账号里没有{}的号", st.edition.label())
         };
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1511,16 +1706,19 @@ where
     }))
 }
 
+/// `/status` —— 报告**本入口**的情况：它是哪一版、监听在哪、这一版有哪些号。
 async fn proxy_status(State(st): State<AppState>) -> impl IntoResponse {
-    let allowed = &st.cfg.accounts;
+    let allowed = &st.endpoint.accounts;
     let items: Vec<Value> = load_accounts()
         .into_iter()
         .filter(|a| {
-            allowed.is_empty()
-                || a.get("uid")
-                    .and_then(Value::as_str)
-                    .map(|u| allowed.iter().any(|x| x == u))
-                    .unwrap_or(false)
+            // 只列属于本入口这一版的号 —— 另一版的号在这个端口上用不了。
+            edition_of(a) == st.edition
+                && (allowed.is_empty()
+                    || a.get("uid")
+                        .and_then(Value::as_str)
+                        .map(|u| allowed.iter().any(|x| x == u))
+                        .unwrap_or(false))
         })
         .map(|a| {
             json!({
@@ -1532,8 +1730,11 @@ async fn proxy_status(State(st): State<AppState>) -> impl IntoResponse {
         })
         .collect();
     Json(json!({
-        "enabled": st.cfg.enabled,
-        "listen": st.cfg.listen,
+        "edition": st.edition.key(),
+        "editionLabel": st.edition.label(),
+        "enabled": st.endpoint.enabled,
+        "listen": st.endpoint.listen,
+        "hasApiKey": !st.endpoint.api_key.trim().is_empty(),
         "accounts": items
     }))
 }
@@ -1556,42 +1757,36 @@ fn router(st: AppState) -> Router {
         .with_state(st)
 }
 
-/// 启动反代服务（阻塞，直到监听失败或进程退出）。
-pub async fn run_proxy_server(cfg: ProxyConfig) -> Result<(), String> {
-    let addr: SocketAddr = cfg.listen.parse().map_err(|_| format!("监听地址无效: {}", cfg.listen))?;
-    let accounts = eligible_accounts(&cfg);
-    if accounts.is_empty() {
-        return Err("没有可用账号：账号库为空或全部 needs_relogin".to_string());
-    }
-    let st = AppState {
-        pool: Arc::new(Pool::new(accounts)),
-        cfg: Arc::new(cfg),
-    };
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("监听 {addr} 失败: {e}"))?;
-    println!("[反代] 已启动 http://{addr}  (POST /v1/chat/completions)");
-    axum::serve(listener, router(st))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// 同上，但收到 shutdown 信号后优雅退出。
-async fn run_proxy_until(
-    cfg: ProxyConfig,
+/// 启动一个入口（阻塞，直到监听失败或进程退出）。
+///
+/// 每个入口一条独立线程 + 独立 Tokio 运行时，所以国内版与国际版互不干扰：
+/// 一边起不来不会拖累另一边。但**账号池是共享的**（由调用方传入）。
+async fn run_endpoint_until(
+    edition: Edition,
+    endpoint: Endpoint,
+    pool: Arc<Pool>,
+    cfg: Arc<ProxyConfig>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
-    let addr: SocketAddr = cfg.listen.parse().map_err(|_| format!("监听地址无效: {}", cfg.listen))?;
-    let accounts = eligible_accounts(&cfg);
-    if accounts.is_empty() {
-        let msg = "没有可用账号：账号库为空或全部 needs_relogin".to_string();
+    let addr: SocketAddr = endpoint
+        .listen
+        .parse()
+        .map_err(|_| format!("监听地址无效: {}", endpoint.listen))?;
+    // 这一版一个号都没有就别起了 —— 起来了也只会每次请求都 503。
+    if !pool.has_edition(edition) {
+        let msg = format!(
+            "没有可用的{}账号：账号库为空、都需重新登录，或不在参与名单里",
+            edition.label()
+        );
         let _ = ready.send(Err(msg.clone()));
         return Err(msg);
     }
     let st = AppState {
-        pool: Arc::new(Pool::new(accounts)),
-        cfg: Arc::new(cfg),
+        cfg,
+        pool,
+        edition,
+        endpoint: Arc::new(endpoint),
     };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -1601,7 +1796,10 @@ async fn run_proxy_until(
             return Err(msg);
         }
     };
-    println!("[反代] 已启动 http://{addr}  (POST /v1/chat/completions)");
+    println!(
+        "[反代] {} 已启动 http://{addr}  (POST /v1/chat/completions)",
+        edition.label()
+    );
     let _ = ready.send(Ok(()));
     axum::serve(listener, router(st))
         .with_graceful_shutdown(async {
@@ -1611,71 +1809,125 @@ async fn run_proxy_until(
         .map_err(|e| e.to_string())
 }
 
-/// 按配置挑出参与反代的 uid。
-fn eligible_accounts(cfg: &ProxyConfig) -> Vec<(String, Edition)> {
-    load_accounts()
-        .into_iter()
-        .filter(|a| a.get("needs_relogin").and_then(Value::as_bool) != Some(true))
-        .filter(|a| {
-            cfg.accounts.is_empty()
-                || a.get("uid")
-                    .and_then(Value::as_str)
-                    .map(|u| cfg.accounts.iter().any(|x| x == u))
-                    .unwrap_or(false)
-        })
-        .filter_map(|a| {
-            a.get("uid")
-                .and_then(Value::as_str)
-                .map(|u| (u.to_string(), edition_of(&a)))
-        })
-        .collect()
+/// 阻塞式启动**国内版**入口（留给「只用一次、不接 UI」的调用方）。
+///
+/// 桌面端请走 [`spawn_from_config`] —— 它会按配置把两个入口都起起来。
+pub async fn run_proxy_server(cfg: ProxyConfig) -> Result<(), String> {
+    let edition = Edition::Domestic;
+    let endpoint = cfg.endpoint(edition).clone();
+    let pool = Arc::new(Pool::new(eligible_accounts(&cfg)));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (ready_tx, _ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    run_endpoint_until(edition, endpoint, pool, Arc::new(cfg), shutdown_rx, ready_tx).await
 }
 
-/// 供桌面端调用：读配置，enabled 则在后台起服务。
+/// 按配置挑出参与反代的 uid（两个入口的**并集**，供两者共享的账号池使用）。
+///
+/// 每个版本的号只由**它自己那个入口**的名单决定 —— 国内版入口勾了谁就是谁，
+/// 不会受国际版入口勾选的影响。
+fn eligible_accounts(cfg: &ProxyConfig) -> Vec<(String, Edition)> {
+    let all = load_accounts();
+    let mut out: Vec<(String, Edition)> = Vec::new();
+    for edition in Edition::ALL {
+        let allowed = &cfg.endpoint(edition).accounts;
+        for a in &all {
+            if a.get("needs_relogin").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if edition_of(a) != edition {
+                continue;
+            }
+            let Some(uid) = a.get("uid").and_then(Value::as_str) else {
+                continue;
+            };
+            if !allowed.is_empty() && !allowed.iter().any(|x| x == uid) {
+                continue;
+            }
+            out.push((uid.to_string(), edition));
+        }
+    }
+    out
+}
+
+/// 供桌面端调用：读配置，把**已启用**的入口都在后台起起来。
 pub fn spawn_from_config() {
     let cfg = load_proxy_config();
-    if !cfg.enabled {
+    if !cfg.any_enabled() {
         return;
     }
-    if let Err(e) = start_proxy_server(cfg) {
-        eprintln!("[反代] 启动失败: {e}");
+    for (edition, outcome) in apply_config(&cfg) {
+        if let Err(msg) = outcome {
+            eprintln!("[反代] {} 入口启动失败: {msg}", edition.label());
+        }
     }
 }
 
 // ---------------------------------------------------------------- 生命周期
 //
 // 说明：Tauri 的 setup() 与同步 command 都跑在**主线程**，那里没有 Tokio 运行时，
-// 直接 `tokio::spawn` 会 panic。所以这里自己开一条带独立运行时的线程，
+// 直接 `tokio::spawn` 会 panic。所以这里**每个入口自己开一条带独立运行时的线程**，
 // 无论从启动流程还是从 command 调用都安全。
+//
+// 国内版与国际版各占一条，互不干扰；账号池由两者共享。
 
-static RUNNING: AtomicBool = AtomicBool::new(false);
-static HANDLE: Mutex<Option<ServerHandle>> = Mutex::new(None);
-
-struct ServerHandle {
+/// 一个入口的运行态。
+struct EndpointRuntime {
+    /// 记下来是为了状态查询 / 日志能说出「哪个地址在跑」。
+    listen: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// 反代是否正在监听。
-pub fn proxy_running() -> bool {
-    RUNNING.load(Ordering::SeqCst)
+fn runtimes() -> &'static Mutex<HashMap<Edition, EndpointRuntime>> {
+    static R: OnceLock<Mutex<HashMap<Edition, EndpointRuntime>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 启动反代（非阻塞）。返回 Err 说明已在运行或地址无效。
-pub fn start_proxy_server(cfg: ProxyConfig) -> Result<(), String> {
-    if proxy_running() {
-        return Err("反代已经在运行".to_string());
+/// 某个入口是否正在监听。
+pub fn is_running(edition: Edition) -> bool {
+    runtimes()
+        .lock()
+        .map(|m| m.contains_key(&edition))
+        .unwrap_or(false)
+}
+
+/// 有没有**任何**入口在监听。
+pub fn proxy_running() -> bool {
+    runtimes().lock().map(|m| !m.is_empty()).unwrap_or(false)
+}
+
+/// 正在监听的入口 → 它的监听地址。界面用它展示「哪几个在跑」。
+pub fn running_endpoints() -> Vec<(Edition, String)> {
+    let mut v: Vec<(Edition, String)> = runtimes()
+        .lock()
+        .map(|m| m.iter().map(|(e, r)| (*e, r.listen.clone())).collect())
+        .unwrap_or_default();
+    v.sort_by_key(|(e, _)| e.key());
+    v
+}
+
+/// 起一个入口（非阻塞）。
+fn start_endpoint(
+    edition: Edition,
+    endpoint: Endpoint,
+    pool: Arc<Pool>,
+    cfg: Arc<ProxyConfig>,
+) -> Result<(), String> {
+    if is_running(edition) {
+        return Err(format!("{}入口已经在运行", edition.label()));
     }
-    // 先探一次地址合法性，避免后台线程里默默失败。
-    cfg.listen
+    // 先探地址合法性，避免后台线程里默默失败。
+    endpoint
+        .listen
         .parse::<SocketAddr>()
-        .map_err(|_| format!("监听地址无效: {}", cfg.listen))?;
+        .map_err(|_| format!("监听地址无效: {}", endpoint.listen))?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let listen = endpoint.listen.clone();
 
     let thread = std::thread::Builder::new()
-        .name("wb-api-proxy".to_string())
+        .name(format!("wb-api-proxy-{}", edition.key()))
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1685,75 +1937,197 @@ pub fn start_proxy_server(cfg: ProxyConfig) -> Result<(), String> {
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = ready_tx.send(Err(format!("创建运行时失败: {e}")));
-                    RUNNING.store(false, Ordering::SeqCst);
                     return;
                 }
             };
             rt.block_on(async move {
-                let outcome = run_proxy_until(cfg, shutdown_rx, ready_tx).await;
-                if let Err(e) = &outcome {
-                    eprintln!("[反代] 运行结束: {e}");
+                if let Err(e) =
+                    run_endpoint_until(edition, endpoint, pool, cfg, shutdown_rx, ready_tx).await
+                {
+                    eprintln!("[反代] {} 运行结束: {e}", edition.label());
                 }
             });
-            RUNNING.store(false, Ordering::SeqCst);
-            println!("[反代] 已停止");
         })
         .map_err(|e| format!("无法启动反代线程: {e}"))?;
 
-    // 等一小会儿，确认是「已监听」还是「起不来」。
-    let started = ready_rx.recv_timeout(Duration::from_secs(5));
-    match started {
-        Ok(Ok(())) => {}
+    match ready_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(())) => {
+            if let Ok(mut m) = runtimes().lock() {
+                m.insert(
+                    edition,
+                    EndpointRuntime {
+                        listen,
+                        shutdown: Some(shutdown_tx),
+                        thread: Some(thread),
+                    },
+                );
+            }
+            Ok(())
+        }
         Ok(Err(e)) => {
+            let _ = shutdown_tx.send(());
             let _ = thread.join();
-            RUNNING.store(false, Ordering::SeqCst);
-            return Err(e);
+            Err(e)
         }
         Err(_) => {
-            // 5 秒内没回音 = 正常监听中（run_proxy_until 不会提前返回）。
+            let _ = shutdown_tx.send(());
+            Err("启动超时：10 秒内没有就绪".to_string())
         }
     }
-
-    RUNNING.store(true, Ordering::SeqCst);
-    if let Ok(mut g) = HANDLE.lock() {
-        *g = Some(ServerHandle {
-            shutdown: Some(shutdown_tx),
-            thread: Some(thread),
-        });
-    }
-    Ok(())
 }
 
-/// 停止反代。
+/// 停掉全部入口（阻塞到线程退出）。
 pub fn stop_proxy_server() {
-    let handle = match HANDLE.lock() {
-        Ok(mut g) => g.take(),
-        Err(_) => None,
+    let taken: Vec<(Edition, EndpointRuntime)> = match runtimes().lock() {
+        Ok(mut m) => m.drain().collect(),
+        Err(_) => return,
     };
-    if let Some(mut h) = handle {
-        if let Some(tx) = h.shutdown.take() {
+    for (edition, mut rt) in taken {
+        if let Some(tx) = rt.shutdown.take() {
             let _ = tx.send(());
         }
-        if let Some(th) = h.thread.take() {
+        if let Some(th) = rt.thread.take() {
             let _ = th.join();
         }
+        println!("[反代] {} 已停止", edition.label());
     }
-    RUNNING.store(false, Ordering::SeqCst);
 }
 
-/// 按当前配置重启（设置页保存时用）。
-pub fn restart_proxy_server() -> Result<(), String> {
+/// 按配置重建两个入口。返回**每个已启用版本**的启动结果。
+///
+/// 刻意做成「逐版本返回」而不是一个总的 Result：国际版没账号属于常态，
+/// 不该因此让国内版也起不来，更不该让「保存配置」这个动作整体失败。
+pub fn apply_config(cfg: &ProxyConfig) -> Vec<(Edition, Result<(), String>)> {
     stop_proxy_server();
-    let cfg = load_proxy_config();
-    if !cfg.enabled {
-        return Ok(());
+    let pool = Arc::new(Pool::new(eligible_accounts(cfg)));
+    let cfg = Arc::new(cfg.clone());
+    let mut out = Vec::new();
+    for edition in Edition::ALL {
+        let endpoint = cfg.endpoint(edition).clone();
+        if !endpoint.enabled {
+            continue; // 未启用 = 不起，也不算失败
+        }
+        let r = start_endpoint(edition, endpoint, pool.clone(), cfg.clone());
+        out.push((edition, r));
     }
-    start_proxy_server(cfg)
+    out
+}
+
+/// 兼容旧调用名：按当前配置重启。
+///
+/// 任一入口失败都会汇总进 Err（但**不影响另一个**已经起来的）。
+/// 调用方若要逐版本判断，直接用 [`apply_config`]。
+pub fn restart_proxy_server() -> Result<(), String> {
+    let cfg = load_proxy_config();
+    let errs: Vec<String> = apply_config(&cfg)
+        .into_iter()
+        .filter_map(|(e, r)| r.err().map(|m| format!("{}：{m}", e.label())))
+        .collect();
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("；"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v1 的扁平配置能自动迁移成双入口：旧的 `listen` / `api_key` / `enabled`
+    /// 归国内版，国际版保持默认关闭 —— 不擅自替用户开一个以前不存在的监听端口。
+    #[test]
+    fn legacy_flat_config_migrates_to_two_endpoints() {
+        let old: LegacyConfig = serde_json::from_str(
+            r#"{"enabled":true,"listen":"127.0.0.1:9999","api_key":"sk-old","accounts":["u1"]}"#,
+        )
+        .expect("v1 扁平配置应当能解析");
+        let cfg = ProxyConfig::from_legacy(old);
+
+        assert!(cfg.domestic.enabled);
+        assert_eq!(cfg.domestic.listen, "127.0.0.1:9999");
+        assert_eq!(cfg.domestic.api_key, "sk-old");
+        assert_eq!(cfg.domestic.accounts, vec!["u1".to_string()]);
+
+        assert!(!cfg.international.enabled, "国际版不该被自动开启");
+        assert_eq!(cfg.international.listen, DEFAULT_LISTEN_INTERNATIONAL);
+        assert!(cfg.international.api_key.is_empty());
+        assert!(cfg.international.accounts.is_empty());
+
+        assert!(cfg.any_enabled());
+    }
+
+    /// v2（两个入口 + 顶层共用名单）→ 现行结构：名单同时发给两边，行为等价。
+    #[test]
+    fn v2_shared_account_list_is_split_to_both() {
+        let old: V2Config = serde_json::from_str(
+            r#"{"domestic":{"enabled":true,"listen":"127.0.0.1:7863","api_key":"a"},
+                "international":{"enabled":true,"listen":"127.0.0.1:7864","api_key":"b"},
+                "accounts":["u1","u2"]}"#,
+        )
+        .expect("v2 配置应当能解析");
+        let cfg = ProxyConfig::from_v2(old);
+
+        assert_eq!(cfg.domestic.accounts, vec!["u1".to_string(), "u2".to_string()]);
+        assert_eq!(cfg.international.accounts, vec!["u1".to_string(), "u2".to_string()]);
+        assert_eq!(cfg.domestic.api_key, "a");
+        assert_eq!(cfg.international.api_key, "b");
+    }
+
+    /// 监听地址留空时补该版本的默认端口（国内 7863 / 国际 7864）。
+    #[test]
+    fn empty_listen_falls_back_to_edition_default() {
+        let cfg = serde_json::from_str::<ProxyConfig>(r#"{"domestic":{"enabled":true}}"#)
+            .expect("新格式应当能解析")
+            .resolved();
+
+        assert_eq!(cfg.domestic.listen, DEFAULT_LISTEN_DOMESTIC);
+        assert_eq!(cfg.international.listen, DEFAULT_LISTEN_INTERNATIONAL);
+        assert!(cfg.endpoint(Edition::Domestic).enabled);
+        assert!(!cfg.endpoint(Edition::International).enabled);
+    }
+
+    /// 两个入口的 key 与账号名单都互相独立；写回后必须仍被识别为**现行格式**
+    /// —— 否则下次读会被当旧格式再迁移一遍（迁移循环）。
+    #[test]
+    fn two_endpoints_keep_independent_key_and_accounts() {
+        let cfg = serde_json::from_str::<ProxyConfig>(
+            r#"{"domestic":{"enabled":true,"listen":"127.0.0.1:7863","api_key":"sk-cn","accounts":["u-cn"]},
+                "international":{"enabled":true,"listen":"127.0.0.1:7864","api_key":"sk-intl","accounts":["u-intl"]}}"#,
+        )
+        .expect("现行格式应当能解析")
+        .resolved();
+
+        assert_eq!(cfg.domestic.api_key, "sk-cn");
+        assert_eq!(cfg.international.api_key, "sk-intl");
+        assert_ne!(cfg.domestic.api_key, cfg.international.api_key);
+        assert_eq!(cfg.domestic.accounts, vec!["u-cn".to_string()]);
+        assert_eq!(cfg.international.accounts, vec!["u-intl".to_string()]);
+        assert!(cfg.any_enabled());
+
+        let v = serde_json::to_value(&cfg).expect("应当能序列化");
+        assert!(
+            v.get("domestic").is_some() && v.get("international").is_some(),
+            "写回的必须是现行格式"
+        );
+        assert!(v.get("listen").is_none(), "不该再写出 v1 的顶层 listen");
+        assert!(
+            v.get("accounts").is_none(),
+            "顶层不该再有 accounts —— 有的话下次读会被当 v2 再迁移一次"
+        );
+    }
+
+    /// 鉴权只看**本入口**那把 key。
+    #[test]
+    fn auth_uses_this_endpoint_key_only() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer sk-cn"));
+
+        assert!(check_auth(&h, ""), "留空 = 不鉴权");
+        assert!(check_auth(&h, "sk-cn"));
+        assert!(check_auth(&h, "  sk-cn  "), "容忍两侧空白");
+        assert!(!check_auth(&h, "sk-intl"), "另一入口的 key 不该放行");
+    }
 
     /// 版本标识解析：前端传的是 key，也容忍几个常见别名。
     #[test]
@@ -1767,27 +2141,14 @@ mod tests {
         assert_eq!(parse_edition_key(""), None);
     }
 
-    /// 合并两档：两档都有 → workbuddy；只有一档有 → 各自的 tag。
+    /// 模型归属标签：每个入口只列自己那一版，`owned_by` 要能看出是哪一版。
+    ///
+    /// （`/v1/models` 以前是「两档合并 + 同名标 workbuddy」，改成按入口分端口之后
+    /// 不再合并 —— 连国内版端口就不该在列表里看到国际版专有的模型。）
     #[test]
-    fn merging_two_editions_tags_ownership() {
-        let dom = vec!["auto".to_string(), "deepseek-v4-pro".to_string()];
-        let intl = vec!["auto".to_string(), "claude-sonnet".to_string()];
-        let merged = merge_edition_models(&dom, &intl);
-        let by: std::collections::HashMap<&str, &str> = merged
-            .iter()
-            .map(|m| {
-                (
-                    m["id"].as_str().unwrap(),
-                    m["owned_by"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(by.get("auto"), Some(&"workbuddy"), "两档都有应标成通用的");
-        assert_eq!(by.get("deepseek-v4-pro"), Some(&"workbuddy-cn"));
-        assert_eq!(by.get("claude-sonnet"), Some(&"workbuddy-intl"));
-        assert_eq!(merged.len(), 3, "同名的不能重复出现");
-        // 国内版在前，保持稳定顺序
-        assert_eq!(merged[0]["id"], "auto");
+    fn owner_tag_marks_edition() {
+        assert_eq!(owner_tag(Edition::Domestic), "workbuddy-cn");
+        assert_eq!(owner_tag(Edition::International), "workbuddy-intl");
     }
 
     /// 只有一档有号时，另一档的模型不该被路由过去。

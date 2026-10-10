@@ -195,21 +195,43 @@ export interface CheckinConfig {
 }
 
 /** OpenAI 兼容反代的配置。 */
-export interface ProxyConfig {
+/** 一个版本的接入点：开关、监听地址、API Key、账号名单**全部独立**。 */
+export interface ProxyEndpoint {
   enabled: boolean;
+  /** `host:port`。 */
   listen: string;
   /** 留空 = 不鉴权（只在监听 127.0.0.1 时才建议留空）。 */
   api_key: string;
-  /** 允许出站的 uid 列表；留空 = 全部账号。 */
+  /** 参与**这个入口**反代的 uid；留空 = 该版本的全部账号。 */
   accounts: string[];
 }
 
-export interface ProxyStatus {
-  running: boolean;
-  listen: string;
+/** 反代配置：国内版与国际版各一个独立入口，互不影响。 */
+export interface ProxyConfig {
+  /** 国内版入口（`.workbuddy` / www.codebuddy.cn）。 */
+  domestic: ProxyEndpoint;
+  /** 国际版入口（`.workbuddy-ai` / www.workbuddy.ai）。 */
+  international: ProxyEndpoint;
+}
+
+/** 某一个入口的运行状态。 */
+export interface ProxyEndpointStatus {
+  /** "domestic" | "international" */
+  edition: string;
+  label: string;
   enabled: boolean;
+  listen: string;
   hasApiKey: boolean;
+  /** 该入口的账号数（0 = 该版本的全部账号都参与）。 */
   accountCount: number;
+  /** 是否正在监听该端口。 */
+  running: boolean;
+}
+
+export interface ProxyStatus {
+  /** 有没有**任何**入口在监听。 */
+  running: boolean;
+  endpoints: ProxyEndpointStatus[];
 }
 
 /** 「获取模型ID」的结果：客户端 model 字段该填什么。 */

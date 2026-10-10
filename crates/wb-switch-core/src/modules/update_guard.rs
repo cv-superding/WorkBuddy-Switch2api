@@ -360,8 +360,19 @@ fn set_dirs_frozen(freeze: bool) -> Result<Vec<String>, String> {
 
 #[cfg(windows)]
 fn run_icacls(args: &[&Path]) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+
+    /// 不给子进程创建控制台窗口。
+    ///
+    /// 🔴 这个函数在**启动自愈**（`repair_if_enabled`）里会被调用 **5 次左右**：
+    /// 补启动静默更新开关（每个安装各一次）、隔离暂存目录的「解冻 → 改名 → 再冻」、
+    /// 以及冻结两个暂存目录。没有这个标志，用户每次打开应用都会看到一串黑框闪过 ——
+    /// 现象就是「启动时闪 5 回」。`icacls` 是控制台程序，必须显式关窗。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let mut c = Command::new("icacls");
+    c.creation_flags(CREATE_NO_WINDOW);
     for a in args {
         c.arg(a);
     }

@@ -506,7 +506,12 @@ export function getProxyConfig(): Promise<ProxyConfig> {
   return call("get_proxy_config");
 }
 
-export function saveProxyConfig(config: ProxyConfig): Promise<{ ok: boolean; running: boolean }> {
+export function saveProxyConfig(config: ProxyConfig): Promise<{
+  ok: boolean;
+  running: boolean;
+  /** 逐入口的启动结果：某个入口起不来不应让整体失败。 */
+  endpoints: Array<{ edition: string; label: string; ok: boolean; error: string | null }>;
+}> {
   return call("save_proxy_config", { config: config as unknown as Record<string, unknown> });
 }
 

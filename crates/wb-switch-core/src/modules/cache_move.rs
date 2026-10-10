@@ -1351,6 +1351,11 @@ fn remove_with_retry(p: &Path, is_dir: bool) -> std::io::Result<()> {
 /// 直到备份根。被重置的是一整个待删子树，无害。
 #[cfg(windows)]
 fn reset_acl_chain(from: &Path, stop_at: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    /// 不给子进程创建控制台窗口（`icacls` 是控制台程序，否则删缓存时会闪一串黑框）。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let mut cur = Some(from.to_path_buf());
     let mut ok = false;
     while let Some(dir) = cur {
@@ -1358,6 +1363,7 @@ fn reset_acl_chain(from: &Path, stop_at: &Path) -> bool {
             break;
         }
         let done = std::process::Command::new("icacls")
+            .creation_flags(CREATE_NO_WINDOW)
             .arg(&dir)
             .arg("/reset")
             .arg("/Q")

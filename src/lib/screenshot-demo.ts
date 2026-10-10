@@ -355,14 +355,55 @@ function rotateConfig(): AutoRotateConfig {
 
 /** 反代页的演示数据（演示/Pages 构建里也要能完整渲染这一页）。 */
 function proxyConfig(): ProxyConfig {
-  // 故意不勾「使用全部账号」：分组列表只在按组挑选时才显示，
-  // 而按版本拆组正是这一版要展示的东西。
-  const proxyUids = accounts.filter((a) => a.group === "proxy").map((a) => a.uid ?? "");
-  return { enabled: true, listen: "127.0.0.1:7863", api_key: "", accounts: proxyUids };
+  // 故意不勾「使用全部账号」：分组列表只在按组挑选时才显示。
+  // 账号**按版本各取一份** —— 国内版入口只用国内版的号，反之亦然。
+  const uidsOf = (ed: string) =>
+    accounts
+      .filter((a) => a.group === "proxy" && (a.edition ?? "domestic") === ed)
+      .map((a) => a.uid ?? "");
+  return {
+    // 两个入口都开着，且端口 / key / 账号名单各不相同 —— 演示「完全独立」。
+    domestic: {
+      enabled: true,
+      listen: "127.0.0.1:7863",
+      api_key: "",
+      accounts: uidsOf("domestic"),
+    },
+    international: {
+      enabled: true,
+      listen: "127.0.0.1:7864",
+      api_key: "sk-intl-demo",
+      accounts: uidsOf("international"),
+    },
+  };
 }
 
 function proxyStatus(): ProxyStatus {
-  return { running: true, listen: "127.0.0.1:7863", enabled: true, hasApiKey: false, accountCount: 11 };
+  const n = (ed: string) =>
+    accounts.filter((a) => a.group === "proxy" && (a.edition ?? "domestic") === ed).length;
+  return {
+    running: true,
+    endpoints: [
+      {
+        edition: "domestic",
+        label: "国内版",
+        enabled: true,
+        listen: "127.0.0.1:7863",
+        hasApiKey: false,
+        accountCount: n("domestic"),
+        running: true,
+      },
+      {
+        edition: "international",
+        label: "国际版",
+        enabled: true,
+        listen: "127.0.0.1:7864",
+        hasApiKey: true,
+        accountCount: n("international"),
+        running: true,
+      },
+    ],
+  };
 }
 
 function proxyUsage(): ProxyUsage {

@@ -24,6 +24,8 @@ import {
   EDITIONS,
   type AccountMeta,
   type ProxyConfig,
+  type ProxyEndpoint,
+  type ProxyEndpointStatus,
   type ProxyModels,
   type ProxyStatus,
   type ProxyUsage,
@@ -86,6 +88,96 @@ function groupAccounts(accounts: AccountMeta[]): AccountGroup[] {
 }
 
 /** 一行里显示的版本徽标（分组本身已经按版本拆了就不用再标）。 */
+/** 本页那个入口的配置区：版本标识 + 开关、监听地址、API Key。
+ *
+ * 刻意**不带自己的外框** —— 它渲染在页面那张 `Card` 里面，再套一层边框只会
+ * 显得嵌套。分隔线由各行自己给，和页面里其它设置行保持一致。
+ */
+function EndpointSection({
+  edition,
+  endpoint,
+  status,
+  onChange,
+}: {
+  edition: "domestic" | "international";
+  endpoint: ProxyEndpoint;
+  status?: ProxyEndpointStatus;
+  onChange: (next: ProxyEndpoint) => void;
+}) {
+  const label = edition === "domestic" ? "国内版" : "国际版";
+  const hint =
+    edition === "domestic"
+      ? "使用 .workbuddy 的账号 · www.codebuddy.cn"
+      : "使用 .workbuddy-ai 的账号 · www.workbuddy.ai";
+  const listenPlaceholder = edition === "domestic" ? "127.0.0.1:7863" : "127.0.0.1:7864";
+
+  return (
+    <>
+      <div className="mx-4 flex items-center justify-between gap-3 border-b border-border/50 py-3 sm:mx-5">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <Label htmlFor={`proxy-enabled-${edition}`} className="text-[13px] leading-4">
+              启用{label}接口
+            </Label>
+            {status?.running ? (
+              <Badge
+                variant="secondary"
+                className="h-5 shrink-0 border-0 px-1.5 text-[10px] leading-5 text-emerald-600"
+              >
+                监听中
+              </Badge>
+            ) : null}
+          </div>
+          <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">{hint}</p>
+        </div>
+        <Switch
+          id={`proxy-enabled-${edition}`}
+          checked={endpoint.enabled}
+          onCheckedChange={(v) => onChange({ ...endpoint, enabled: v })}
+          aria-label={`启用${label}反代`}
+        />
+      </div>
+
+      <div className="mx-4 flex flex-col items-stretch justify-between gap-2 border-b border-border/50 py-3 sm:mx-5 sm:flex-row sm:items-center">
+        <div className="min-w-0 flex-1">
+          <Label htmlFor={`proxy-listen-${edition}`} className="text-[13px] leading-4">
+            监听地址
+          </Label>
+          <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
+            建议保持 127.0.0.1；只有受信任的内网才改成 0.0.0.0
+          </p>
+        </div>
+        <Input
+          id={`proxy-listen-${edition}`}
+          value={endpoint.listen}
+          onChange={(e) => onChange({ ...endpoint, listen: e.target.value })}
+          className="h-8 w-full sm:w-56"
+          placeholder={listenPlaceholder}
+        />
+      </div>
+
+      <div className="mx-4 flex flex-col items-stretch justify-between gap-2 border-b border-border/50 py-3 sm:mx-5 sm:flex-row sm:items-center">
+        <div className="min-w-0 flex-1">
+          <Label htmlFor={`proxy-key-${edition}`} className="text-[13px] leading-4">
+            API Key
+          </Label>
+          <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
+            留空 = 不鉴权；设置后客户端需带 Authorization: Bearer &lt;key&gt;
+          </p>
+        </div>
+        <Input
+          id={`proxy-key-${edition}`}
+          type="password"
+          value={endpoint.api_key}
+          onChange={(e) => onChange({ ...endpoint, api_key: e.target.value })}
+          className="h-8 w-full sm:w-56"
+          placeholder="留空 = 不鉴权"
+        />
+      </div>
+    </>
+  );
+}
+
 function editionLabelOf(a: AccountMeta): string {
   return EDITIONS.find((e) => e.value === (a.edition ?? "domestic"))?.label ?? "国内版";
 }
@@ -126,7 +218,12 @@ function bucketRow(name: string, b: UsageBucket) {
   );
 }
 
-export default function ApiProxyPage() {
+export default function ApiProxyPage({
+  edition,
+}: {
+  /** 本页服务哪一版。国内版与国际版是**两个独立页面**，各有自己的监听地址与 API Key。 */
+  edition: "domestic" | "international";
+}) {
   const [params] = useSearchParams();
   const [cfg, setCfg] = useState<ProxyConfig | null>(null);
   const [st, setSt] = useState<ProxyStatus | null>(null);
@@ -170,7 +267,15 @@ export default function ApiProxyPage() {
     setMsg(null);
     try {
       const res = await api.saveProxyConfig(cfg);
-      setMsg({ type: "ok", text: res.running ? "已保存，反代正在运行" : "已保存，反代当前未运行" });
+      // 本页只管自己这一版 —— 另一版的结果不该在这里报（那边有它自己的页面）。
+      const mine = res.endpoints.find((e) => e.edition === edition);
+      if (mine && !mine.ok) {
+        setMsg({ type: "err", text: `已保存，但${mine.label}入口未启动：${mine.error}` });
+      } else if (mine?.ok) {
+        setMsg({ type: "ok", text: `已保存，${mine.label}入口已启动` });
+      } else {
+        setMsg({ type: "ok", text: "已保存（本入口未启用）" });
+      }
       setSt(await api.getProxyStatus());
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
@@ -180,13 +285,10 @@ export default function ApiProxyPage() {
   }
 
   function toggleAccount(uid: string, on: boolean) {
-    setCfg((prev) => {
-      if (!prev) return prev;
-      const next = new Set(prev.accounts);
-      if (on) next.add(uid);
-      else next.delete(uid);
-      return { ...prev, accounts: Array.from(next) };
-    });
+    const next = new Set(ep?.accounts ?? []);
+    if (on) next.add(uid);
+    else next.delete(uid);
+    patchEndpoint({ accounts: Array.from(next) });
   }
 
   /** 拉一次可用模型列表：优先问本机反代，拿不到再直连上游。 */
@@ -194,7 +296,8 @@ export default function ApiProxyPage() {
     setLoadingModels(true);
     setMsg(null);
     try {
-      const res = await api.getProxyModels();
+      // 只拉本页这一版的模型 —— 另一版的模型在这个入口上用不了，列出来只会误导。
+      const res = await api.getProxyModels(edition);
       setModels(res);
       setModelsOpen(true);
     } catch (e) {
@@ -214,8 +317,34 @@ export default function ApiProxyPage() {
     }
   }
 
-  const allAccounts = (cfg?.accounts.length ?? 0) === 0;
-  const groups = groupAccounts(accounts);
+  const label = edition === "domestic" ? "国内版" : "国际版";
+  /** 本页服务的那一个入口。 */
+  const ep = cfg?.[edition];
+  const epStatus = st?.endpoints.find((e) => e.edition === edition);
+  /** 本页只关心**这一版**的账号 —— 另一版的号在这个入口上根本用不了。 */
+  const editionAccounts = accounts.filter((a) => (a.edition ?? "domestic") === edition);
+  const allAccounts = (ep?.accounts.length ?? 0) === 0;
+  const groups = groupAccounts(editionAccounts);
+
+  /** 改本页那个入口的字段。
+   *
+   * 两个入口是独立的，写回时必须指明改的是哪一边。用 `{ ...cfg, [edition]: ... }`
+   * 这种计算属性在 TS 里会退化成索引签名、丢掉类型，所以显式分两支写。
+   */
+  function patchEndpoint(patch: Partial<ProxyEndpoint>) {
+    setCfg((prev) =>
+      prev
+        ? {
+            ...prev,
+            domestic: edition === "domestic" ? { ...prev.domestic, ...patch } : prev.domestic,
+            international:
+              edition === "international"
+                ? { ...prev.international, ...patch }
+                : prev.international,
+          }
+        : prev,
+    );
+  }
 
   async function onResetUsage() {
     setResettingUsage(true);
@@ -233,9 +362,9 @@ export default function ApiProxyPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
       <header className="mb-8 sm:mb-10">
-        <h1 className="text-[28px] font-semibold tracking-tight">API 反代</h1>
+        <h1 className="text-[28px] font-semibold tracking-tight">{label} API 反代</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          把 Switch 里的账号包装成本机 OpenAI 兼容接口（<code className="rounded bg-muted px-1 py-0.5">/v1/chat/completions</code>），任何支持 OpenAI SDK 的客户端都能用。
+          把 Switch 里的{label}账号包装成本机 OpenAI 兼容接口（<code className="rounded bg-muted px-1 py-0.5">/v1/chat/completions</code>），任何支持 OpenAI SDK 的客户端都能用。
         </p>
       </header>
 
@@ -243,53 +372,12 @@ export default function ApiProxyPage() {
         <CardContent className="space-y-0 p-0">
           {cfg ? (
             <>
-              <div className="mx-4 flex items-center justify-between gap-3 border-b border-border/50 py-3 sm:mx-5">
-                <div className="min-w-0 flex-1">
-                  <Label htmlFor="proxy-enabled" className="text-[13px] leading-4">启用 OpenAI 兼容接口</Label>
-                  <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
-                    保存后立即生效；Switch 启动时也会按配置自动拉起
-                  </p>
-                </div>
-                <Switch
-                  id="proxy-enabled"
-                  checked={cfg.enabled}
-                  onCheckedChange={(v) => setCfg({ ...cfg, enabled: v })}
-                  aria-label="启用 OpenAI 兼容接口"
-                />
-              </div>
-
-              <div className="mx-4 flex flex-col items-stretch justify-between gap-2 border-b border-border/50 py-3 sm:mx-5 sm:flex-row sm:items-center">
-                <div className="min-w-0 flex-1">
-                  <Label htmlFor="proxy-listen" className="text-[13px] leading-4">监听地址</Label>
-                  <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
-                    建议保持 127.0.0.1；只有受信任的内网才改成 0.0.0.0
-                  </p>
-                </div>
-                <Input
-                  id="proxy-listen"
-                  value={cfg.listen}
-                  onChange={(e) => setCfg({ ...cfg, listen: e.target.value })}
-                  className="h-8 w-full sm:w-56"
-                  placeholder="127.0.0.1:7863"
-                />
-              </div>
-
-              <div className="mx-4 flex flex-col items-stretch justify-between gap-2 border-b border-border/50 py-3 sm:mx-5 sm:flex-row sm:items-center">
-                <div className="min-w-0 flex-1">
-                  <Label htmlFor="proxy-key" className="text-[13px] leading-4">API Key</Label>
-                  <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
-                    留空 = 不鉴权；设置后客户端需带 Authorization: Bearer &lt;key&gt;
-                  </p>
-                </div>
-                <Input
-                  id="proxy-key"
-                  type="password"
-                  value={cfg.api_key}
-                  onChange={(e) => setCfg({ ...cfg, api_key: e.target.value })}
-                  className="h-8 w-full sm:w-56"
-                  placeholder="留空 = 不鉴权"
-                />
-              </div>
+              <EndpointSection
+                edition={edition}
+                endpoint={cfg[edition]}
+                status={epStatus}
+                onChange={patchEndpoint}
+              />
 
               <div className="mx-4 flex items-center justify-between gap-3 border-b border-border/50 py-3 sm:mx-5">
                 <div className="min-w-0 flex-1">
@@ -302,9 +390,8 @@ export default function ApiProxyPage() {
                   id="proxy-all"
                   checked={allAccounts}
                   onCheckedChange={(v) =>
-                    setCfg({
-                      ...cfg,
-                      accounts: v ? [] : accounts.map((a) => a.uid ?? "").filter(Boolean),
+                    patchEndpoint({
+                      accounts: v ? [] : editionAccounts.map((a) => a.uid ?? "").filter(Boolean),
                     })
                   }
                   aria-label="使用全部账号"
@@ -315,16 +402,21 @@ export default function ApiProxyPage() {
                 <div className="mx-4 my-3 space-y-3 sm:mx-5">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-xs text-muted-foreground">
-                      参与轮转 <span className="font-medium text-foreground">{cfg.accounts.length}</span> / {accounts.length} 个账号
+                      参与轮转 <span className="font-medium text-foreground">{ep?.accounts.length ?? 0}</span> / {editionAccounts.length} 个账号
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
                       className="h-8"
                       onClick={() =>
-                        setCfg({ ...cfg, accounts: accounts.filter((a) => a.group === "proxy").map((a) => a.uid ?? "").filter(Boolean) })
+                        patchEndpoint({
+                          accounts: editionAccounts
+                            .filter((a) => a.group === "proxy")
+                            .map((a) => a.uid ?? "")
+                            .filter(Boolean),
+                        })
                       }
-                      disabled={!accounts.some((a) => a.group === "proxy")}
+                      disabled={!editionAccounts.some((a) => a.group === "proxy")}
                     >
                       <Users className="size-3.5" />
                       只选「反代API」分组
@@ -361,7 +453,7 @@ export default function ApiProxyPage() {
                                 ) : null}
                               </div>
                               <Switch
-                                checked={cfg.accounts.includes(uid)}
+                                checked={(ep?.accounts ?? []).includes(uid)}
                                 onCheckedChange={(v) => toggleAccount(uid, v)}
                                 disabled={!uid}
                                 aria-label="参与反代"
@@ -384,13 +476,13 @@ export default function ApiProxyPage() {
 
               <div className={cn("mx-4 flex items-center justify-between gap-3 py-3 sm:mx-5", allAccounts && "border-t border-border/50")}>
                 <div className="min-w-0 flex-1 text-xs leading-5 text-muted-foreground/80">
-                  {st?.running ? (
+                  {epStatus?.running ? (
                     <>
                       运行中 · OpenAI 基址{" "}
-                      <code className="rounded bg-muted px-1 py-0.5">http://{st.listen}/v1</code>
+                      <code className="rounded bg-muted px-1 py-0.5">http://{epStatus.listen}/v1</code>
                     </>
                   ) : (
-                    <>未运行{cfg.enabled ? "（点击保存后启动）" : ""}</>
+                    <>未运行{ep?.enabled ? "（点击保存后启动）" : ""}</>
                   )}
                 </div>
                 <div className="flex shrink-0 items-center gap-2">

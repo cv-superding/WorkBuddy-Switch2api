@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from "react-router-dom";
-import { ArrowLeftRight, ArrowUp, HardDrive, MessagesSquare, Network, Settings, ShieldCheck, Sparkles, User } from "lucide-react";
+import { ArrowLeftRight, ArrowUp, Globe, HardDrive, MessagesSquare, Network, Settings, ShieldCheck, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -94,6 +94,8 @@ const PAGE_LABELS: Record<string, string | undefined> = {
   "/token-stats": "Token 统计",
   "/credit-stats": "积分统计",
   "/api-proxy": "API 反代",
+  "/api-proxy/domestic": "国内版 API 反代",
+  "/api-proxy/international": "国际版 API 反代",
   "/cache-move": "缓存迁移",
   "/update-guard": "更新防护",
   "/settings": "设置",
@@ -174,7 +176,7 @@ function Layout() {
             积分统计
           </NavLink>
           <NavLink
-            to="/api-proxy"
+            to="/api-proxy/domestic"
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
@@ -185,7 +187,21 @@ function Layout() {
             }
           >
             <Network className="size-4" />
-            API 反代
+            国内版 API 反代
+          </NavLink>
+          <NavLink
+            to="/api-proxy/international"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <Globe className="size-4" />
+            国际版 API 反代
           </NavLink>
           <NavLink
             to="/transfer"
@@ -277,7 +293,10 @@ export default function App() {
             <Route path="/" element={<AccountsPage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
             <Route path="/token-stats" element={<TokenStatsPage />} />
-            <Route path="/api-proxy" element={<ApiProxyPage />} />
+            {/* 国内版 / 国际版各一个独立入口：凭证、模型列表、账号名单都互不相通 */}
+            <Route path="/api-proxy" element={<Navigate to="/api-proxy/domestic" replace />} />
+            <Route path="/api-proxy/domestic" element={<ApiProxyPage edition="domestic" />} />
+            <Route path="/api-proxy/international" element={<ApiProxyPage edition="international" />} />
             <Route path="/transfer" element={<TransferPage />} />
             <Route path="/cache-move" element={<CacheMovePage />} />
             <Route path="/update-guard" element={<UpdateGuardPage />} />

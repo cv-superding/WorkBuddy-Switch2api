@@ -659,32 +659,58 @@ pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Res
 
 // ------------------------------------------------------------------ API 反代
 
-/// 读取反代配置（enabled / listen / api_key / accounts）。
+/// 读取反代配置（国内版 / 国际版双入口 + 账号白名单）。
 #[tauri::command]
 pub fn get_proxy_config() -> Result<Value, String> {
     serde_json::to_value(proxy::load_proxy_config()).map_err(|e| e.to_string())
 }
 
-/// 保存反代配置并立即生效（关→开、开→关、改地址都在这里完成）。
+/// 保存反代配置并立即生效（启用/停用、改地址、改 key 都在这里完成）。
+///
+/// 返回**逐版本**的启动结果：某个入口起不来（最常见的是「那一版没有账号」）
+/// 不该让整个保存动作失败，更不该连累另一个入口。
 #[tauri::command]
 pub fn save_proxy_config(config: Value) -> Result<Value, String> {
     let cfg: proxy::ProxyConfig =
         serde_json::from_value(config).map_err(|e| format!("配置格式不正确：{e}"))?;
     proxy::save_proxy_config(&cfg)?;
-    proxy::restart_proxy_server()?;
-    Ok(json!({ "ok": true, "running": proxy::proxy_running() }))
+    let outcomes: Vec<Value> = proxy::apply_config(&cfg)
+        .iter()
+        .map(|(edition, r)| {
+            json!({
+                "edition": edition.key(),
+                "label": edition.label(),
+                "ok": r.is_ok(),
+                "error": r.as_ref().err(),
+            })
+        })
+        .collect();
+    Ok(json!({ "ok": true, "running": proxy::proxy_running(), "endpoints": outcomes }))
 }
 
-/// 反代运行状态：是否在监听 + 当前生效配置。
+/// 反代运行状态：哪几个入口在监听、各自生效的配置是什么。
 #[tauri::command]
 pub fn get_proxy_status() -> Value {
     let cfg = proxy::load_proxy_config();
+    let endpoints: Vec<Value> = wb_switch_core::modules::edition::Edition::ALL
+        .iter()
+        .map(|&e| {
+            let ep = cfg.endpoint(e);
+            json!({
+                "edition": e.key(),
+                "label": e.label(),
+                "enabled": ep.enabled,
+                "listen": ep.listen,
+                "hasApiKey": !ep.api_key.trim().is_empty(),
+                // 该入口自己的账号数（0 = 该版本的全部账号都参与）
+                "accountCount": ep.accounts.len(),
+                "running": proxy::is_running(e),
+            })
+        })
+        .collect();
     json!({
         "running": proxy::proxy_running(),
-        "listen": cfg.listen,
-        "enabled": cfg.enabled,
-        "hasApiKey": !cfg.api_key.is_empty(),
-        "accountCount": cfg.accounts.len(),
+        "endpoints": endpoints,
     })
 }
 
