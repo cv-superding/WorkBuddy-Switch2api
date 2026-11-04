@@ -224,6 +224,13 @@ export interface ProxyConfig {
   domestic: ProxyEndpoint;
   /** 国际版入口（`.workbuddy-ai` / www.workbuddy.ai）。 */
   international: ProxyEndpoint;
+  /**
+   * 反代**出网**代理（反代请求上游时走它），形如 `http://127.0.0.1:7897`。
+   *
+   * 留空 = 直连，并且会显式关掉「跟随系统环境变量代理」。
+   * 字段名与后端 serde 保持一致（snake_case），否则保存时会被丢掉。
+   */
+  upstream_proxy?: string | null;
 }
 
 /** 某一个入口的运行状态。 */

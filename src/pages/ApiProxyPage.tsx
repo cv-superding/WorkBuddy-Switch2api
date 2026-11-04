@@ -430,6 +430,37 @@ export default function ApiProxyPage({
                 onChange={patchEndpoint}
               />
 
+              {/* 出网代理：反代请求上游时走它。留空 = 直连（且不跟随系统环境变量代理）。
+                  社区实现（buddy-proxy / workbuddy2api-hub）都做了「固定出口」，
+                  直连线路一抖就会整片 502，这里给一个显式出口开关。 */}
+              <div className="mx-4 border-b border-border/50 py-3 sm:mx-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13px] font-medium leading-4">出网代理</div>
+                    <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
+                      反代请求上游时走这个代理。<span className="font-medium text-foreground">留空 = 直连</span>
+                      ，且不会跟随系统环境变量里的 HTTP_PROXY。
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 shrink-0"
+                    onClick={() =>
+                      setCfg({ ...cfg, upstream_proxy: "http://127.0.0.1:7897" })
+                    }
+                  >
+                    填 7897
+                  </Button>
+                </div>
+                <Input
+                  className="mt-2 h-8 font-mono text-xs"
+                  value={cfg.upstream_proxy ?? ""}
+                  onChange={(e) => setCfg({ ...cfg, upstream_proxy: e.target.value })}
+                  placeholder="http://127.0.0.1:7897（留空则直连）"
+                />
+              </div>
+
               <div className="mx-4 flex items-center justify-between gap-3 border-b border-border/50 py-3 sm:mx-5">
                 <div className="min-w-0 flex-1">
                   <div className="text-[13px] font-medium leading-4">使用全部账号</div>

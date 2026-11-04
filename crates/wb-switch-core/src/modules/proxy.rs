@@ -536,6 +536,18 @@ pub struct ProxyConfig {
     /// 国际版入口。
     #[serde(default)]
     pub international: Endpoint,
+    /// 反代**出网**代理：反代请求上游时走的代理，形如 `http://127.0.0.1:7897`。
+    ///
+    /// 留空 = **直连**（并且会显式关掉 reqwest 的“跟随环境变量代理”，
+    /// 避免 GUI 从 shell 继承了 `HTTP_PROXY` 却没人知道）。
+    /// `direct` / `none` 也视为直连，方便临时关掉。
+    ///
+    /// 为什么需要它：反代原来硬编码直连，直连线路一抖就整片 502
+    /// （`error sending request for url (...)`），而用户本机往往已经有可用的
+    /// 梯子。社区实现（buddy-proxy / workbuddy2api-hub）都做了「按号/按池固定出口」，
+    /// 这里先提供**全局出口**这一档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -543,11 +555,49 @@ impl Default for ProxyConfig {
         Self {
             domestic: Endpoint::default(),
             international: Endpoint::default(),
+            upstream_proxy: None,
         }
     }
 }
 
 impl ProxyConfig {
+    /// 实际生效的出网代理地址（`None` = 直连）。
+    ///
+    /// 优先级：配置文件 → 环境变量 `WB_UPSTREAM_PROXY`。
+    /// `""` / `direct` / `none` 都按直连处理，方便临时关掉而不用删字段。
+    pub fn effective_upstream_proxy(&self) -> Option<String> {
+        let raw = self
+            .upstream_proxy
+            .clone()
+            .or_else(|| std::env::var("WB_UPSTREAM_PROXY").ok())?;
+        let v = raw.trim().to_string();
+        if v.is_empty() || v.eq_ignore_ascii_case("direct") || v.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// 给上游请求用的 client builder 套上出网策略。
+    ///
+    /// 🔴 未配置时必须显式 `.no_proxy()`：reqwest 默认会读 `HTTP_PROXY` /
+    /// `HTTPS_PROXY` / `ALL_PROXY` 环境变量。GUI 应用从 shell 启动时会继承这些变量，
+    /// 于是「我明明没配代理」却实际走了代理，行为不可预期、排查极难。
+    /// 显式声明直连，配置说了算。
+    pub fn apply_upstream_proxy(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match self.effective_upstream_proxy() {
+            Some(url) => match reqwest::Proxy::all(&url) {
+                Ok(p) => builder.proxy(p),
+                // 地址写错不该让整个入口起不来：退回直连并留一条日志。
+                Err(e) => {
+                    eprintln!("[反代] 出网代理地址无效，已退回直连：{url} ({e})");
+                    builder.no_proxy()
+                }
+            },
+            None => builder.no_proxy(),
+        }
+    }
+
     /// 取某个版本的接入点。
     pub fn endpoint(&self, e: Edition) -> &Endpoint {
         match e {
@@ -643,6 +693,8 @@ impl ProxyConfig {
                 ..Endpoint::default()
             },
             international: Endpoint::default(),
+            // 旧配置没有出网代理概念 → 保持直连，不擅自改网络行为。
+            upstream_proxy: None,
         }
         .resolved()
     }
@@ -667,6 +719,8 @@ impl ProxyConfig {
                 accounts: old.accounts,
                 ..Endpoint::default()
             },
+            // v2 也没有出网代理字段 → 直连。
+            upstream_proxy: None,
         }
         .resolved()
     }
@@ -2120,8 +2174,8 @@ async fn fetch_edition_models(
         )
     })?;
     let url = models_url(&acc);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+    let client = cfg
+        .apply_upstream_proxy(reqwest::Client::builder().timeout(Duration::from_secs(20)))
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.get(&url);
@@ -2924,7 +2978,7 @@ async fn chat_completions(
         edition: st.edition,
     };
 
-    let client = match reqwest::Client::builder().build() {
+    let client = match st.cfg.apply_upstream_proxy(reqwest::Client::builder()).build() {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -4191,6 +4245,33 @@ mod tests {
             pool.next_uid_of(Some(Edition::Domestic), None).as_deref(),
             Some("u1"),
             "成功出字后应复位"
+        );
+    }
+
+    /// 出网代理的取值口径：空 / direct / none 一律视为直连。
+    ///
+    /// 这条不能想当然：如果 `""` 被当成「有一个空的代理地址」交给 reqwest，
+    /// 要么建 client 失败，要么静默退回环境变量代理 —— 两种都很难查。
+    #[test]
+    fn upstream_proxy_blank_means_direct() {
+        // 环境变量优先级低于配置；这里只测配置本身的解析口径。
+        let mut cfg = ProxyConfig::default();
+        assert_eq!(cfg.effective_upstream_proxy(), None, "默认必须是直连");
+
+        for blank in ["", "   ", "direct", "NONE"] {
+            cfg.upstream_proxy = Some(blank.to_string());
+            assert_eq!(
+                cfg.effective_upstream_proxy(),
+                None,
+                "{blank:?} 应视为直连"
+            );
+        }
+
+        cfg.upstream_proxy = Some("  http://127.0.0.1:7897  ".to_string());
+        assert_eq!(
+            cfg.effective_upstream_proxy().as_deref(),
+            Some("http://127.0.0.1:7897"),
+            "正常地址应去掉首尾空白后返回"
         );
     }
 
