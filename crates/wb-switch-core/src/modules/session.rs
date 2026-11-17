@@ -150,6 +150,117 @@ fn nonempty_text(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 规范化工作目录：反斜杠转正斜杠、去尾斜杠、盘符大写。
+///
+/// 客户端所有路径比对都是字符串精确匹配，写法不一致会被当成两个不同目录。
+fn normalize_workspace_path(raw: &str) -> String {
+    let mut s = raw.trim().replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 2 && chars[1] == ':' && chars[0].is_ascii_lowercase() {
+        let mut owned = chars;
+        owned[0] = owned[0].to_ascii_uppercase();
+        s = owned.into_iter().collect();
+    }
+    s
+}
+
+/// 分组短名：普通目录取末段；一次性时间戳工作区命名为 `临时 MM-DD HH:mm`。
+fn workspace_short_name(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let prefix = path.strip_suffix(base).unwrap_or("");
+    let shape_ok = base.len() == 19
+        && base.as_bytes().iter().enumerate().all(|(i, c)| match i {
+            4 | 7 | 10 | 13 | 16 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        });
+    if shape_ok && prefix.to_ascii_lowercase().ends_with("/workbuddy/") {
+        return format!(
+            "临时 {} {}:{}",
+            &base[5..10],
+            &base[11..13],
+            &base[14..16]
+        );
+    }
+    base.to_string()
+}
+
+/// 补齐 `workspace-display-names.json`：把会话里出现过、但映射表缺失的工作目录补进去。
+///
+/// 客户端取名顺序是 `spaces.name` → 本文件 → 完整 `cwd`。分组走「按目录聚合」后，
+/// 新目录若不在本文件里，侧栏会直接显示 `C:/Users/.../xxx` 这类完整路径。
+/// 随切换增量补齐，不改动已有条目。
+///
+/// 只处理两种确定安全的输入：文件不存在（按当前格式新建），或已是 `{workspaces:{...}}`
+/// 结构（增量追加）。其余情况一律跳过不写，避免改坏旧版本或其他工具写入的格式。
+fn sync_workspace_display_names(conn: &Connection, db: &Path) -> Result<Value, String> {
+    let Some(dir) = db.parent() else {
+        return Ok(json!({ "added": 0, "total": 0 }));
+    };
+    let file = dir.join("workspace-display-names.json");
+
+    // 结构不认识时直接跳过，一个字节都不写，避免遮蔽原有映射。
+    let mut root: Value = if file.exists() {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return Ok(json!({ "added": 0, "total": 0, "skipped": "unreadable" }));
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+            return Ok(json!({ "added": 0, "total": 0, "skipped": "unparsable" }));
+        };
+        if !parsed.get("workspaces").is_some_and(Value::is_object) {
+            return Ok(json!({ "added": 0, "total": 0, "skipped": "unknown-shape" }));
+        }
+        parsed
+    } else {
+        json!({ "version": 1, "workspaces": {} })
+    };
+
+    let obj = root.as_object_mut().ok_or("display names root not object")?;
+    obj.entry("version").or_insert(json!(1));
+    let workspaces = obj
+        .get_mut("workspaces")
+        .and_then(Value::as_object_mut)
+        .ok_or("display names workspaces not object")?;
+    let before = workspaces.len();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT cwd FROM sessions \
+             WHERE COALESCE(deleted_at, -1) < 0 AND cwd IS NOT NULL AND cwd <> ''",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+
+    let now = now_ms();
+    for raw in rows.flatten() {
+        let path = normalize_workspace_path(&raw);
+        if path.is_empty() || workspaces.contains_key(&path) {
+            continue;
+        }
+        workspaces.insert(
+            path.clone(),
+            json!({
+                "id": &path,
+                "path": &path,
+                "displayName": workspace_short_name(&path),
+                "updatedAt": now,
+            }),
+        );
+    }
+
+    let total = workspaces.len();
+    let added = total - before;
+    if added > 0 {
+        let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+        std::fs::write(&file, body).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({ "added": added, "total": total }))
+}
+
 /// WorkBuddy 侧栏展示名：优先 custom_title（用户改名 / 定时任务名），否则 title。
 fn session_display_title(title: Option<String>, custom_title: Option<String>) -> String {
     nonempty_text(custom_title)
@@ -544,18 +655,35 @@ const SQL_IS_CLAW: &str = "(LOWER(cwd) LIKE '%\\claw' OR LOWER(cwd) LIKE '%/claw
 /// 与 `copy_sessions_for_switch`（复制成新 id，越切越多）不同，本路径**不新增任何行**，
 /// 因此可以放心地在每次切换时执行。
 ///
+/// 同时把「分组」的 `user_id` 对齐到目标账号 —— 新版客户端按账号隔离分组，
+/// 不对齐会导致切号后分组整体不可见。会话本身仍保持无主，不产生副本。
+///
 /// Claw 工作区绑定 IM 渠道账号，跳过不动。
 pub fn share_sessions_for_switch() -> Result<Value, String> {
-    share_sessions_for_switch_for(Edition::Domestic)
+    share_sessions_for_switch_for(Edition::Domestic, None)
 }
 
 /// 指定档位的「多账号共享」（两个档位都有独立会话库，各自处理）。
-pub fn share_sessions_for_switch_for(edition: Edition) -> Result<Value, String> {
-    share_sessions_in(&workbuddy_db_path_for(edition))
+///
+/// `target_acc` 是切换的目标账号。切换流程里认证文件尚未写入，
+/// 此时 `current_user_uid_for` 拿到的还是**旧账号**，所以必须由调用方显式传入。
+/// 传 `None` 时回退到读认证文件（用于切换完成之后再对齐的场景）。
+pub fn share_sessions_for_switch_for(
+    edition: Edition,
+    target_acc: Option<&Value>,
+) -> Result<Value, String> {
+    let uid = target_acc
+        .and_then(|v| v.get("uid"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| current_user_uid_for(edition))
+        .ok_or_else(|| "无法确定目标账号 uid".to_string())?;
+    share_sessions_in(&workbuddy_db_path_for(edition), &uid)
 }
 
-/// `share_sessions_for_switch` 的实现（可传入 db 路径，便于单测）。
-fn share_sessions_in(db: &Path) -> Result<Value, String> {
+/// `share_sessions_for_switch` 的实现（可传入 db 路径与目标 uid，便于单测）。
+fn share_sessions_in(db: &Path, target_uid: &str) -> Result<Value, String> {
     if !db.is_file() {
         return Err(format!("找不到 {db:?}"));
     }
@@ -580,6 +708,33 @@ fn share_sessions_in(db: &Path) -> Result<Value, String> {
     );
     let shared = conn.execute(&sql_share, []).map_err(|e| e.to_string())?;
 
+    // 分组（spaces）归属对齐。
+    //
+    // 新版客户端把分组独立成表，列表查询按账号隔离：
+    //     WHERE user_id = <当前账号> AND status = 'active' AND deleted_at < 0
+    // 切号后必须把 user_id 跟到目标账号，否则分组整体不可见。
+    //
+    // 不要清空 sessions.space_id，也不要软删分组 —— 分组详情页的条件是
+    //     space_id = ? AND is_playground = 0 AND (user_id = <当前账号> OR user_id = '')
+    // 无主会话仍能进分组，只有侧栏计数走严格 JOIN（user_id 相等）会得到 0。
+    //
+    // 旧版客户端没有 spaces 表，跳过。
+    let spaces_reassigned = if table_exists(&conn, "spaces") {
+        let now = now_ms();
+        conn.execute(
+            "UPDATE spaces SET user_id = ?1, updated_at = ?2 \
+             WHERE deleted_at < 0 AND user_id <> ?1",
+            rusqlite::params![target_uid, now],
+        )
+        .unwrap_or(0) as i64
+    } else {
+        0
+    };
+
+    // 新目录若不在显示名映射里，分组标题会退化成完整路径。
+    let display_names = sync_workspace_display_names(&conn, db)
+        .unwrap_or_else(|e| json!({ "error": e }));
+
     let sql_claw = format!(
         "SELECT COUNT(*) FROM sessions WHERE deleted_at IS NULL AND user_id <> '' AND {SQL_IS_CLAW}"
     );
@@ -589,6 +744,8 @@ fn share_sessions_in(db: &Path) -> Result<Value, String> {
         "total": alive,
         "shared": shared as i64,
         "skippedClaw": skipped_claw,
+        "spacesReassigned": spaces_reassigned,
+        "displayNames": display_names,
     }))
 }
 
@@ -695,7 +852,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let report = share_sessions_in(&db).unwrap();
+        let report = share_sessions_in(&db, "uid-b").unwrap();
         assert_eq!(report["shared"], 1, "只应共享未删除的非 Claw 会话: {report}");
         assert_eq!(report["skippedClaw"], 1, "Claw 应被跳过: {report}");
 
@@ -716,7 +873,52 @@ mod tests {
     #[test]
     fn share_sessions_missing_db_is_err_not_panic() {
         let db = temp_db("share-missing");
-        assert!(share_sessions_in(&db).is_err());
+        assert!(share_sessions_in(&db, "uid-b").is_err());
+    }
+
+    /// 切号后分组归属应跟到目标账号，但会话保持无主、绑定关系不得丢。
+    /// 回归点：早期实现软删分组并清空 space_id，会导致侧栏分组整体消失。
+    #[test]
+    fn share_sessions_reassigns_space_owner_keeping_bindings() {
+        let db = temp_db("share-spaces");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, user_id TEXT, cwd TEXT, title TEXT,
+                created_at INTEGER, updated_at INTEGER, deleted_at INTEGER,
+                space_id TEXT);
+             CREATE TABLE spaces (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                name TEXT NOT NULL, primary_folder_path TEXT, create_folder_path TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0, sort_order INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                transport TEXT NOT NULL DEFAULT 'local',
+                conversation_origin TEXT, source_kind TEXT,
+                deleted_at INTEGER NOT NULL DEFAULT -1,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+             INSERT INTO spaces VALUES
+                ('sp1','uid-old','dev','proj',NULL,NULL,0,NULL,'active','local',NULL,'user',-1,1,1);
+             INSERT INTO sessions VALUES ('s1','uid-old','C:/proj','t',1,1,NULL,'sp1');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = share_sessions_in(&db, "uid-new").unwrap();
+        assert_eq!(report["spacesReassigned"], 1, "分组应被改归属: {report}");
+
+        let conn = Connection::open(&db).unwrap();
+        let sess_uid: String = conn
+            .query_row("SELECT user_id FROM sessions WHERE id='s1'", [], |r| r.get(0))
+            .unwrap();
+        let sess_space: String = conn
+            .query_row("SELECT space_id FROM sessions WHERE id='s1'", [], |r| r.get(0))
+            .unwrap();
+        let space_uid: String = conn
+            .query_row("SELECT user_id FROM spaces WHERE id='sp1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sess_uid, "", "会话应保持无主，才能跨账号共享");
+        assert_eq!(sess_space, "sp1", "分组绑定不能被清掉");
+        assert_eq!(space_uid, "uid-new", "分组归属应跟到目标账号");
     }
 
     #[test]

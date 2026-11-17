@@ -104,10 +104,11 @@ pub fn switch_account_in_edition(
         }
         if share_sessions {
             if session_capable {
-                // 路径 C：把 user_id 置空 → 任何账号登录都能看到同一份，不产生副本。
+                // 路径 C：把会话 user_id 置空 → 任何账号登录都能看到同一份，不产生副本；
+                // 同时把「分组」归属对齐到目标账号（认证文件还没写，必须显式传入）。
                 progress("正在把会话设为多账号共享…");
                 session_report = Some(
-                    match session::share_sessions_for_switch_for(edition) {
+                    match session::share_sessions_for_switch_for(edition, Some(&acc)) {
                         Ok(r) => r,
                         Err(e) => json!({"error": e}),
                     },
