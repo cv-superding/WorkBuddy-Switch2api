@@ -179,6 +179,10 @@ export interface SwitchResult {
     total: number;
     shared: number;
     skippedClaw: number;
+    /** 归属被改写到目标账号的分组数（新版 spaces 按账号隔离，切号后需跟着走） */
+    spacesReassigned?: number;
+    /** 显示名映射的补齐结果：本次新增几条、合计几条 */
+    displayNames?: { added: number; total: number; error?: string };
     error?: string;
   };
   sessionCopy?: {
